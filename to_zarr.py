@@ -18,8 +18,8 @@ install()
 console = Console()
 
 # Second bars are appended last so every other zarr column keeps its position from the HSI layout
-FREQS = ["1", "2", "3", "4", "5", "10", "15", "20", "30", "60", "day", "1s", "15s"]
-PARQUET_FREQS = ["1", "2", "3", "4", "5", "10", "15", "20", "30", "60", "day"]
+FREQS = ["1", "5", "10", "15", "30", "60", "day", "1s", "15s"]
+PARQUET_FREQS = ["1", "5", "10", "15", "30", "60", "day"]
 
 def to_unix_epoch(ts: pd.Series) -> pd.Series:
     """

@@ -1,15 +1,14 @@
 import argparse
+from pathlib import Path
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pc
-import pyarrow.compute as pc
 import pyarrow.parquet as pq
-import yaml
-from pathlib import Path
-from rich import print
 import rich.traceback
+import yaml
+from rich import print
 
 rich.traceback.install()
 
@@ -83,6 +82,38 @@ def splice_roll(table, block_file):
     return pa.concat_tables([block, new_rows])
 
 
+def apply_news_flags(out, session_date):
+    """
+    Applies news flags in-place to the output DataFrame.
+    """
+    for ev_type in ['fomc', 'nfp', 'cpi', 'ppi', 'gdp']:
+        flag_col = f'news_{ev_type}'
+        out[flag_col] = 0
+        if ev_type in NEWS_EVENTS:
+            starts, ends = NEWS_EVENTS[ev_type]
+            # Find windows that overlap this session
+            s_end = session_date + pd.Timedelta(hours=23)
+            # Window overlaps session if: start < session_end AND end > session_start
+            # Using binary search since arrays are sorted
+            idx_start = np.searchsorted(ends, session_date, side='right')
+            idx_end = np.searchsorted(starts, s_end, side='left')
+
+            ts_vals = out['ts'].values
+
+            for i in range(idx_start, idx_end):
+                w_start = starts[i]
+                w_end = ends[i]
+
+                # ticks inside [w_start, w_end)
+                tick_start = np.searchsorted(ts_vals, w_start, side='left')
+                tick_end = np.searchsorted(ts_vals, w_end, side='left')
+
+                if tick_end > tick_start:
+                    out.iloc[tick_start:tick_end, out.columns.get_loc(flag_col)] = 1
+
+        # Cast to int8 for memory efficiency
+        out[flag_col] = out[flag_col].astype('int8')
+
 def to_ticks(table, session_date, pdt_code):
     """One raw single-contract session -> merged ticks with columns ts, price, volume, pdt_code.
 
@@ -117,41 +148,16 @@ def to_ticks(table, session_date, pdt_code):
     # Add 8-hour sessions: 1 (Asian), 2 (Europe), 3 (US)
     out['session'] = ((time_since_midnight.dt.components.hours // 8) + 1).astype('int8')
 
-    # Add hour column directly from the un-shifted wall clock
-    # to maintain the true New York trading hour (0-23)
-    out['hour'] = df['ts_event'].dt.tz_convert("America/New_York").dt.hour.values.astype('int8')
+    # The `out` dataframe was the result of a groupby, so we map the unshifted wall clock back.
+    # The simplest way is to map the timezone back from our shifted `ts` directly on `out`.
+    # ts is tz-naive +6h from NY. So ts - 6h = naive NY time.
+    out['hour'] = (out['ts'] - SHIFT).dt.hour.astype('int8')
 
     # Floor to seconds and store as integer Unix timestamps directly to avoid datetime overhead in step 2
     out['ts'] = out['ts'].dt.floor('s').astype('datetime64[s]')
 
     # Add news flags
-    for ev_type in ['fomc', 'nfp', 'cpi', 'ppi', 'gdp']:
-        flag_col = f'news_{ev_type}'
-        out[flag_col] = 0
-        if ev_type in NEWS_EVENTS:
-            starts, ends = NEWS_EVENTS[ev_type]
-            # Find windows that overlap this session
-            s_end = session_date + pd.Timedelta(hours=23)
-            # Window overlaps session if: start < session_end AND end > session_start
-            # Using binary search since arrays are sorted
-            idx_start = np.searchsorted(ends, session_date, side='right')
-            idx_end = np.searchsorted(starts, s_end, side='left')
-
-            ts_vals = out['ts'].values
-
-            for i in range(idx_start, idx_end):
-                w_start = starts[i]
-                w_end = ends[i]
-
-                # ticks inside [w_start, w_end)
-                tick_start = np.searchsorted(ts_vals, w_start, side='left')
-                tick_end = np.searchsorted(ts_vals, w_end, side='left')
-
-                if tick_end > tick_start:
-                    out.iloc[tick_start:tick_end, out.columns.get_loc(flag_col)] = 1
-
-        # Cast to int8 for memory efficiency
-        out[flag_col] = out[flag_col].astype('int8')
+    apply_news_flags(out, session_date)
 
     cols = ['ts', 'price', 'volume', 'rth', 'session', 'hour', 'news_fomc', 'news_nfp', 'news_cpi', 'news_ppi', 'news_gdp']
     return pa.Table.from_pandas(out[cols], preserve_index=False)
@@ -228,7 +234,7 @@ def main():
             writer.close()
 
     out_size = out_file.stat().st_size
-    print(f"\nConcat Summary:")
+    print("\nConcat Summary:")
     print(f"Files processed: {len(files)}")
     print(f"Roll days spliced with an open block: {spliced}")
     print(f"Raw rows: {raw_rows:,} -> merged ticks: {total_rows:,}")

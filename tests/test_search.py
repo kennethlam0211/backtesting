@@ -22,9 +22,8 @@ def build_test_array(prices, ts_start="2023-01-01 09:30:00", tick_ms=1000):
     df = pd.DataFrame({'price': prices}, index=ts)
 
     freq_map = {
-        '1': '1min', '2': '2min', '3': '3min',
-        '4': '4min', '5': '5min', '10': '10min', '15': '15min',
-        '20': '20min', '30': '30min', '60': '60min', 'day': 'D', '1s': '1s', '15s': '15s'
+        '1': '1min', '5': '5min', '10': '10min', '15': '15min',
+        '30': '30min', '60': '60min', 'day': 'D', '1s': '1s', '15s': '15s'
     }
     offset_map = {}
 
@@ -152,9 +151,8 @@ def test_search_random_property():
         df = pd.DataFrame({'price': prices}, index=ts_vals)
 
         freq_map = {
-            '1': '1min', '2': '2min', '3': '3min',
-            '4': '4min', '5': '5min', '10': '10min', '15': '15min',
-            '20': '20min', '30': '30min', '60': '60min', 'day': 'D', '1s': '1s', '15s': '15s'
+            '1': '1min', '5': '5min', '10': '10min', '15': '15min',
+            '30': '30min', '60': '60min', 'day': 'D', '1s': '1s', '15s': '15s'
         }
         offset_map = {}
 

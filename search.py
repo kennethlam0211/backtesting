@@ -4,13 +4,9 @@ from numba import njit
 col_names = [
     'start_ind','ts','price','volume',
     'high_1', 'low_1','next_ind_1',
-    'high_2', 'low_2','next_ind_2',
-    'high_3', 'low_3','next_ind_3',
-    'high_4', 'low_4','next_ind_4',
     'high_5', 'low_5','next_ind_5',
     'high_10', 'low_10','next_ind_10',
     'high_15', 'low_15','next_ind_15',
-    'high_20', 'low_20','next_ind_20',
     'high_30', 'low_30', 'next_ind_30',
     'high_60', 'low_60','next_ind_60',
     'high_day', 'low_day','next_ind_day',
@@ -21,7 +17,7 @@ col_names = [
 col_to_ind_dict = {col_name: index for index, col_name in enumerate(col_names)}
 
 # Largest bars first, so a clean day/hour is skipped in one step.
-freqs = ['day', '60', '30', '20', '15', '10', '5', '4', '3', '2', '1', '15s', '1s']
+freqs = ['day', '60', '30', '15', '10', '5', '1', '15s', '1s']
 JUMP_COLS = np.array([
     (col_to_ind_dict[f'next_ind_{f}'], col_to_ind_dict[f'high_{f}'], col_to_ind_dict[f'low_{f}'])
     for f in freqs
