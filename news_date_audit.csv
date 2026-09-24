@@ -1,0 +1,55 @@
+event,yaml_date,actual_date,actual_time_et,action,note,source_url
+fomc,2020-03-03,2020-03-03,10:00,move,"Emergency meeting, not standard 14:00 time",https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+fomc,2020-03-15,2020-03-15,17:00,move,"Emergency meeting, not standard 14:00 time",https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+fomc,2025-08-22,,,remove,"Jackson Hole speech, not FOMC statement release",https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+nfp,2025-10-03,,,remove,Date not found in official source,https://www.bls.gov/bls/news-release/empsit.htm
+nfp,2025-11-07,2025-11-20,08:30,move,Actual date differs from yaml,https://www.bls.gov/bls/news-release/empsit.htm
+nfp,2025-12-05,2025-12-16,08:30,move,Actual date differs from yaml,https://www.bls.gov/bls/news-release/empsit.htm
+nfp,,2026-03-06,08:30,add,Missing from yaml,https://www.bls.gov/bls/news-release/empsit.htm
+nfp,,2026-04-03,08:30,add,Missing from yaml,https://www.bls.gov/bls/news-release/empsit.htm
+nfp,,2026-05-08,08:30,add,Missing from yaml,https://www.bls.gov/bls/news-release/empsit.htm
+nfp,,2026-06-05,08:30,add,Missing from yaml,https://www.bls.gov/bls/news-release/empsit.htm
+nfp,,2026-07-02,08:30,add,Missing from yaml,https://www.bls.gov/bls/news-release/empsit.htm
+nfp,,2026-08-07,08:30,add,Missing from yaml,https://www.bls.gov/bls/news-release/empsit.htm
+nfp,,2026-09-04,08:30,add,Missing from yaml,https://www.bls.gov/bls/news-release/empsit.htm
+cpi,2025-09-10,2025-09-11,08:30,move,Actual date differs from yaml,https://www.bls.gov/bls/news-release/cpi.htm
+cpi,2025-10-14,2025-10-24,08:30,move,Actual date differs from yaml,https://www.bls.gov/bls/news-release/cpi.htm
+cpi,2025-11-12,,,remove,Date not found in official source,https://www.bls.gov/bls/news-release/cpi.htm
+cpi,2025-12-10,2025-12-18,08:30,move,Actual date differs from yaml,https://www.bls.gov/bls/news-release/cpi.htm
+cpi,2026-02-11,2026-02-13,08:30,move,Actual date differs from yaml,https://www.bls.gov/bls/news-release/cpi.htm
+cpi,,2026-03-11,08:30,add,Missing from yaml,https://www.bls.gov/bls/news-release/cpi.htm
+cpi,,2026-04-10,08:30,add,Missing from yaml,https://www.bls.gov/bls/news-release/cpi.htm
+cpi,,2026-05-12,08:30,add,Missing from yaml,https://www.bls.gov/bls/news-release/cpi.htm
+cpi,,2026-06-10,08:30,add,Missing from yaml,https://www.bls.gov/bls/news-release/cpi.htm
+cpi,,2026-07-14,08:30,add,Missing from yaml,https://www.bls.gov/bls/news-release/cpi.htm
+cpi,,2026-08-12,08:30,add,Missing from yaml,https://www.bls.gov/bls/news-release/cpi.htm
+cpi,,2026-09-11,08:30,add,Missing from yaml,https://www.bls.gov/bls/news-release/cpi.htm
+ppi,2020-01-14,2020-01-15,08:30,move,Actual date differs from yaml,https://www.bls.gov/bls/news-release/ppi.htm
+ppi,2020-02-13,2020-02-19,08:30,move,Actual date differs from yaml,https://www.bls.gov/bls/news-release/ppi.htm
+ppi,2020-05-12,2020-05-13,08:30,move,Actual date differs from yaml,https://www.bls.gov/bls/news-release/ppi.htm
+ppi,2020-06-10,2020-06-11,08:30,move,Actual date differs from yaml,https://www.bls.gov/bls/news-release/ppi.htm
+ppi,2020-09-11,2020-09-10,08:30,move,Actual date differs from yaml,https://www.bls.gov/bls/news-release/ppi.htm
+ppi,2020-11-10,2020-11-13,08:30,move,Actual date differs from yaml,https://www.bls.gov/bls/news-release/ppi.htm
+ppi,2020-12-10,2020-12-11,08:30,move,Actual date differs from yaml,https://www.bls.gov/bls/news-release/ppi.htm
+ppi,2021-01-14,2021-01-15,08:30,move,Actual date differs from yaml,https://www.bls.gov/bls/news-release/ppi.htm
+ppi,2025-07-15,2025-07-16,08:30,move,Actual date differs from yaml,https://www.bls.gov/bls/news-release/ppi.htm
+ppi,2025-09-11,2025-09-10,08:30,move,Actual date differs from yaml,https://www.bls.gov/bls/news-release/ppi.htm
+ppi,2025-10-09,,,remove,Date not found in official source,https://www.bls.gov/bls/news-release/ppi.htm
+ppi,2025-11-13,2025-11-25,08:30,move,Actual date differs from yaml,https://www.bls.gov/bls/news-release/ppi.htm
+ppi,2025-12-11,2025-12-19,08:30,move,Actual date differs from yaml,https://www.bls.gov/bls/news-release/ppi.htm
+ppi,,2026-01-14,08:30,add,Missing from yaml,https://www.bls.gov/bls/news-release/ppi.htm
+ppi,,2026-02-27,08:30,add,Missing from yaml,https://www.bls.gov/bls/news-release/ppi.htm
+ppi,,2026-03-18,08:30,add,Missing from yaml,https://www.bls.gov/bls/news-release/ppi.htm
+ppi,,2026-04-14,08:30,add,Missing from yaml,https://www.bls.gov/bls/news-release/ppi.htm
+ppi,,2026-05-13,08:30,add,Missing from yaml,https://www.bls.gov/bls/news-release/ppi.htm
+ppi,,2026-06-11,08:30,add,Missing from yaml,https://www.bls.gov/bls/news-release/ppi.htm
+ppi,,2026-07-15,08:30,add,Missing from yaml,https://www.bls.gov/bls/news-release/ppi.htm
+ppi,,2026-08-13,08:30,add,Missing from yaml,https://www.bls.gov/bls/news-release/ppi.htm
+ppi,,2026-09-10,08:30,add,Missing from yaml,https://www.bls.gov/bls/news-release/ppi.htm
+gdp,2026-01-22,2026-01-29,08:30,move,Actual date differs from yaml,https://www.bea.gov/news/archive
+gdp,2026-02-20,2026-02-26,08:30,move,Actual date differs from yaml,https://www.bea.gov/news/archive
+gdp,2026-03-13,2026-03-26,08:30,move,Actual date differs from yaml,https://www.bea.gov/news/archive
+gdp,2026-04-09,,,remove,Date not found in official source,https://www.bea.gov/news/archive
+gdp,2026-08-26,2026-08-27,08:30,move,Actual date differs from yaml,https://www.bea.gov/news/archive
+gdp,,2025-10-30,08:30,add,Missing from yaml,https://www.bea.gov/news/archive
+gdp,,2025-11-26,08:30,add,Missing from yaml,https://www.bea.gov/news/archive

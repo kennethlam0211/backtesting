@@ -1,0 +1,357 @@
+import argparse
+import datetime
+import os
+import time
+from collections import deque
+from concurrent.futures import ProcessPoolExecutor
+
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import zarr
+from rich.console import Console
+from rich.traceback import install
+from zarr.codecs import BloscCodec
+
+install()
+console = Console()
+
+# Second bars are appended last so every other zarr column keeps its position from the HSI layout
+FREQS = ["1", "2", "3", "4", "5", "10", "15", "20", "30", "60", "day", "1s", "15s"]
+PARQUET_FREQS = ["1", "2", "3", "4", "5", "10", "15", "20", "30", "60", "day"]
+
+def to_unix_epoch(ts: pd.Series) -> pd.Series:
+    """
+    Converts naive datetimes to absolute Unix timestamps (in integer seconds)
+    without unwinding or changing the timezone. We just treat the shifted clock
+    as absolute time for storage.
+    """
+    return (ts.astype('datetime64[ns]').astype('int64') // 1_000_000_000)
+
+def process_session(session_df: pd.DataFrame, session_date: datetime.date) -> tuple[pd.DataFrame, dict[str, np.ndarray], int]:
+    """
+    Process one session of tick data using vectorized numpy arrays.
+    Returns:
+        tick_res: DataFrame with 'ts', 'price', 'volume' and start_ind
+        resampled_res: dictionary mapping freq string to structured numpy array of OHLCV bars
+        sess_len: number of merged rows
+    """
+    # Ticks arrive already merged from step 1, ts in whole seconds; work in ns internally
+    merged_ts = session_df['ts'].values.astype('datetime64[ns]').astype(np.int64)
+    merged_vol = session_df['volume'].values.astype(np.int64)
+
+    # Extract news flags from tick data
+    merged_fomc = session_df.get('news_fomc', pd.Series(np.zeros(len(session_df)))).values.astype(np.int8)
+    merged_nfp = session_df.get('news_nfp', pd.Series(np.zeros(len(session_df)))).values.astype(np.int8)
+    merged_cpi = session_df.get('news_cpi', pd.Series(np.zeros(len(session_df)))).values.astype(np.int8)
+    merged_ppi = session_df.get('news_ppi', pd.Series(np.zeros(len(session_df)))).values.astype(np.int8)
+    merged_gdp = session_df.get('news_gdp', pd.Series(np.zeros(len(session_df)))).values.astype(np.int8)
+
+    # Extract RTH and session from tick data
+    merged_rth = session_df.get('rth', pd.Series(np.zeros(len(session_df)))).values.astype(bool)
+    merged_session = session_df.get('session', pd.Series(np.zeros(len(session_df)))).values.astype(np.int8)
+    merged_hour = session_df.get('hour', pd.Series(np.zeros(len(session_df)))).values.astype(np.int8)
+
+    sess_len = len(merged_ts)
+
+    # Price storage: price is already multiplied by 100 in step 1, so it arrives as an exact integer
+    merged_price = session_df['price'].values.astype(np.int64)
+
+    tick_res = pd.DataFrame({
+        'ts': to_unix_epoch(session_df['ts']),  # zarr stores ts as whole seconds in true UTC
+        'price': merged_price,
+        'start_ind': np.full(sess_len, -1, dtype=np.int64)
+    })
+
+    resampled_res = {}
+
+    # Define midnight in ns for bar alignment
+    # A session starts 00:00 on its date (step 1 put the Globex reopen there); bar edges count from it
+    day0 = pd.Timestamp(session_date).value
+
+    # For zarr columns, initialize arrays filled with zeros
+    zarr_cols = {}
+    for freq in FREQS:
+        zarr_cols[f'high_{freq}'] = np.zeros(sess_len, dtype=np.int64)
+        zarr_cols[f'low_{freq}'] = np.zeros(sess_len, dtype=np.int64)
+        zarr_cols[f'next_ind_{freq}'] = np.zeros(sess_len, dtype=np.int64)
+
+    for freq in FREQS:
+        if freq == "day":
+            bar_key = np.zeros(sess_len, dtype=np.int64)
+            f_ns = 24 * 3600 * 1_000_000_000
+        elif freq.endswith("s"):  # second bars, e.g. "1s", "15s"
+            f_ns = int(freq[:-1]) * 1_000_000_000
+            bar_key = (merged_ts - day0) // f_ns
+        else:
+            f_ns = int(freq) * 60_000_000_000
+            bar_key = (merged_ts - day0) // f_ns
+
+        # Find boundaries of bars
+        is_bar_start = np.r_[True, bar_key[1:] != bar_key[:-1]]
+        starts = np.flatnonzero(is_bar_start)
+        ends = np.r_[starts[1:], sess_len]
+        num_bars = len(starts)
+
+        if num_bars == 0:
+            resampled_res[freq] = np.zeros(0, dtype=[
+                ('start_ind', 'i8'), ('ts', 'i8'), ('open', 'i8'),
+                ('high', 'i8'), ('low', 'i8'), ('close', 'i8'),
+                ('volume', 'i8'), ('avg_px', 'f8'), ('hl', '?'), ('rth', '?'),
+                ('hour', 'i8')
+            ])
+            continue
+
+        bar_labels = day0 + bar_key[starts] * f_ns
+
+        # Vectorized aggregation
+        bar_high = np.maximum.reduceat(merged_price, starts)
+        bar_low = np.minimum.reduceat(merged_price, starts)
+        bar_vol = np.add.reduceat(merged_vol, starts)
+        bar_open = merged_price[starts]
+        bar_close = merged_price[ends - 1]
+
+        # Aggregate news flags (if any tick in the bar is 1, the bar gets 1)
+        bar_fomc = np.maximum.reduceat(merged_fomc, starts)
+        bar_nfp = np.maximum.reduceat(merged_nfp, starts)
+        bar_cpi = np.maximum.reduceat(merged_cpi, starts)
+        bar_ppi = np.maximum.reduceat(merged_ppi, starts)
+        bar_gdp = np.maximum.reduceat(merged_gdp, starts)
+
+        # Aggregate RTH (if any tick in the bar is in RTH, the bar gets True)
+        bar_rth = np.maximum.reduceat(merged_rth, starts)
+
+        # Aggregate session (take the session of the bar's first tick)
+        bar_session = merged_session[starts]
+
+        # Aggregate hour (take the hour of the bar's first tick)
+        bar_hour = merged_hour[starts]
+
+        # hl calculation
+        bar_hl = np.zeros(num_bars, dtype=bool)
+        for i in range(num_bars):
+            s, e = starts[i], ends[i]
+            p = merged_price[s:e]
+            h_idx = np.argmax(p)
+            l_idx = np.argmin(p)
+            if h_idx < l_idx:
+                bar_hl[i] = True
+            else:
+                bar_hl[i] = False
+
+
+
+        # Populate Zarr columns (local indices)
+        zarr_cols[f'high_{freq}'][starts] = bar_high
+        zarr_cols[f'low_{freq}'][starts] = bar_low
+        zarr_cols[f'next_ind_{freq}'][starts] = ends # local next_ind
+
+        if freq == "1":
+            tick_res.loc[starts, 'start_ind'] = starts # local start_ind
+
+        # Create structured array
+        dtype_list = [
+            ('start_ind', 'i8'), ('ts', 'i8'), ('open', 'i8'),
+            ('high', 'i8'), ('low', 'i8'), ('close', 'i8'),
+            ('volume', 'i8'), ('hl', '?'), ('rth', '?'),
+            ('session', 'i1'), ('hour', 'i8'),
+            ('news_fomc', 'i1'), ('news_nfp', 'i1'), ('news_cpi', 'i1'), ('news_ppi', 'i1'), ('news_gdp', 'i1')
+        ]
+
+        struct_arr = np.zeros(num_bars, dtype=dtype_list)
+        struct_arr['start_ind'] = starts # local start_ind
+        struct_arr['ts'] = bar_labels
+        struct_arr['open'] = bar_open
+        struct_arr['high'] = bar_high
+        struct_arr['low'] = bar_low
+        struct_arr['close'] = bar_close
+        struct_arr['volume'] = bar_vol
+        struct_arr['hl'] = bar_hl
+        struct_arr['rth'] = bar_rth # RTH bool from raw data
+        struct_arr['session'] = bar_session # 1=Asian, 2=Europe, 3=US
+        struct_arr['hour'] = bar_hour
+        struct_arr['news_fomc'] = bar_fomc
+        struct_arr['news_nfp'] = bar_nfp
+        struct_arr['news_cpi'] = bar_cpi
+        struct_arr['news_ppi'] = bar_ppi
+        struct_arr['news_gdp'] = bar_gdp
+
+        resampled_res[freq] = struct_arr
+
+    for col_name, col_data in zarr_cols.items():
+        tick_res[col_name] = col_data
+
+    # console.print(f"Session {session_date} processed, rows: {len(session_df)} -> {sess_len}")
+
+    return tick_res, resampled_res, sess_len
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--limit", type=int, default=None, help="Process only first N sessions")
+    parser.add_argument("--out", type=str, default="./data/zarr", help="Output directory")
+    parser.add_argument("--start", type=str, default=None, help="Skip to date YYYY-MM-DD")
+    parser.add_argument("--src", type=str, default="./data/ES_trades_concat.parquet", help="Step 1 output")
+    args = parser.parse_args()
+
+    os.makedirs(args.out, exist_ok=True)
+
+    pf = pq.ParquetFile(args.src)
+
+    current_session = None
+    buffer = []
+
+    sessions_processed = 0
+    t_start_all = time.monotonic()
+
+    max_workers = min(24, os.cpu_count() or 4)
+    executor = ProcessPoolExecutor(max_workers=max_workers)
+
+    in_flight = deque()
+
+    zarr_path = os.path.join(args.out, 'tick.zarr')
+    col_names = ['start_ind', 'ts', 'price']
+    for f in FREQS:
+        col_names.extend([f'high_{f}', f'low_{f}', f'next_ind_{f}'])
+
+    tick_zarr = None
+    global_offset = 0
+    # Bars go to one parquet per freq, written as they come (flushed ~1M rows at a time) so RAM stays flat
+    bar_writers = {}
+    bar_buffers = {f: [] for f in PARQUET_FREQS}
+
+    def flush_bars(f):
+        if not bar_buffers.get(f):
+            return
+        df = pd.DataFrame(np.concatenate(bar_buffers[f]))
+        # Convert bar_labels (ns shifted time) back to proper datetimes, then to absolute unix seconds
+        shifted_ts = pd.to_datetime(df['ts'], unit='ns')
+        df['ts'] = to_unix_epoch(shifted_ts)
+        table = pa.Table.from_pandas(df, preserve_index=False)
+        if f not in bar_writers:
+            bar_writers[f] = pq.ParquetWriter(os.path.join(args.out, f'{f}_ohlcv.parquet'), table.schema, compression='zstd')
+        bar_writers[f].write_table(table)
+        bar_buffers[f] = []
+
+    def write_result(future):
+        nonlocal tick_zarr, global_offset
+        tick_res, resampled_res, sess_len = future.result()
+
+        # Apply global offset to local indices
+        # We stored -1 for non-first rows in start_ind, and 0 for non-first rows in next_ind
+
+        start_mask = tick_res['start_ind'] != -1
+        tick_res.loc[start_mask, 'start_ind'] += global_offset
+        tick_res.loc[~start_mask, 'start_ind'] = 0
+
+        for f in FREQS:
+            next_col = f'next_ind_{f}'
+            tick_res[next_col] = np.where(tick_res[next_col] > 0, tick_res[next_col] + global_offset, 0)
+
+            # Apply to OHLCV start_ind
+            if f in PARQUET_FREQS and len(resampled_res[f]) > 0:
+                resampled_res[f]['start_ind'] += global_offset
+                bar_buffers[f].append(resampled_res[f])
+                if sum(len(b) for b in bar_buffers[f]) >= 1_000_000:
+                    flush_bars(f)
+
+        tick_arr = tick_res[col_names].values.astype(np.int64)
+
+        if tick_zarr is None:
+            compressor = BloscCodec(cname='zstd', clevel=5, shuffle='bitshuffle')
+            tick_zarr = zarr.create_array(
+                store=zarr_path,
+                shape=(0, len(col_names)),
+                chunks=(1000000, len(col_names)),
+                dtype='i8',
+                compressors=[compressor],
+                overwrite=True
+            )
+            tick_zarr.attrs['column_names'] = col_names
+
+        tick_zarr.append(tick_arr)
+        global_offset += sess_len
+
+    def submit_session(sess_df, sess_date):
+        nonlocal sessions_processed
+
+        start_time = sess_df['ts'].min()
+        end_time = sess_df['ts'].max()
+
+        print(f"Found session {sess_date}: {len(sess_df)} rows, {start_time} to {end_time}")
+
+        open_ts = pd.Timestamp(sess_date)
+        assert open_ts <= start_time and end_time < open_ts + pd.Timedelta(hours=23), f"ticks outside session {sess_date}: {start_time} .. {end_time}"
+
+        future = executor.submit(process_session, sess_df, sess_date)
+        in_flight.append(future)
+
+        # Keep at most ~2x max_workers in flight to bound RAM usage
+        while len(in_flight) >= max_workers * 2:
+            write_result(in_flight.popleft())
+
+        sessions_processed += 1
+
+    start_date = pd.Timestamp(args.start) if args.start else None
+
+    # We iterate chunks
+    for batch in pf.iter_batches(columns=['ts', 'price', 'volume']):
+        df_batch = batch.to_pandas()
+
+        if start_date is not None:
+            if df_batch['ts'].max() < start_date:
+                continue
+            df_batch = df_batch[df_batch['ts'] >= start_date].copy()
+            if df_batch.empty:
+                continue
+
+
+        # ts is already New York + 6h from step 1, so its calendar date is the session
+        df_batch['session_date'] = df_batch['ts'].dt.date
+
+        for sess_date, group in df_batch.groupby('session_date'):
+            if current_session is None:
+                current_session = sess_date
+
+            if sess_date != current_session:
+                sess_df = pd.concat(buffer, ignore_index=True)
+                submit_session(sess_df, current_session)
+
+                if args.limit and sessions_processed >= args.limit:
+                    break
+
+                buffer = [group]
+                current_session = sess_date
+            else:
+                buffer.append(group)
+
+        if args.limit and sessions_processed >= args.limit:
+            break
+
+    if buffer and (not args.limit or sessions_processed < args.limit):
+        sess_df = pd.concat(buffer, ignore_index=True)
+        submit_session(sess_df, current_session)
+
+    # Drain remaining futures
+    while in_flight:
+        write_result(in_flight.popleft())
+
+    for f in PARQUET_FREQS:
+        flush_bars(f)
+    for w in bar_writers.values():
+        w.close()
+
+    t_end_all = time.monotonic()
+
+    print("="*40)
+    print(f"Total rows processed: {global_offset}")
+    if sessions_processed > 0:
+        time_per_session = (t_end_all - t_start_all) / sessions_processed
+        print(f"Time per session: {time_per_session:.2f}s")
+        print(f"Extrapolated full run (approx 1684 sessions): {time_per_session * 1684 / 60:.2f} mins")
+
+    executor.shutdown()
+
+if __name__ == '__main__':
+    main()
