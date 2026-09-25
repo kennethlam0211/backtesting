@@ -14,6 +14,7 @@ import reference.preprocessing_pandas as ref
 from data_pipeline import data_preprocessing as dp
 from data_pipeline import raw_data_preprocessing as step1
 from data_pipeline import to_dat as step2
+from params import UD_PIVOTS
 from stop_search.params import PARQUET_FREQS
 
 SESSIONS = ["2024-03-04", "2024-03-05", "2024-03-06"]
@@ -89,6 +90,46 @@ def test_features_match_the_pandas_reference(data_dir):
         np.testing.assert_allclose(new[f"{col}_1"].to_numpy(float)[100:], old[f"{col}_1"].to_numpy(float)[100:],
                                    rtol=0, atol=1e-6, equal_nan=True, err_msg=col)
     assert (old["20_U_1"].iloc[100:] > 0).any()  # the U/D levels were really compared
+
+
+def reference_live_std(merged, bars, freq):
+    """
+    The reference's unit_std(raw_20 + [close_1]) at every 1-min row: raw_20 holds the last 21 closes of the
+    bars shown so far, and unit_std keeps the last 20 of the list, so 19 closes plus the current 1-min close.
+    """
+    length = 24 * 3600 if freq == "day" else int(freq) * 60
+    closes = np.minimum(bars["ts"] + length, bars["ts"] // 86400 * 86400 + 23 * 3600).to_numpy()
+    shown = np.searchsorted(closes, merged["ts"].to_numpy() + 60, side="right") - 1
+    px = bars["close"].to_numpy(float)
+    return np.array([np.std((list(px[max(0, k - 20):k + 1]) + [c])[-20:]) if k >= 0 else np.nan
+                     for k, c in zip(shown, merged["close_1"].to_numpy(float))])
+
+
+@pytest.mark.parametrize("freq", ["15", "60"])
+def test_higher_freq_ud_follows_the_reference(data_dir, merged, freq):
+    bars = pd.read_parquet(data_dir / f"{freq}_ohlcv.parquet").sort_values("ts").reset_index(drop=True)
+    std = reference_live_std(merged, bars, freq)
+    np.testing.assert_allclose(merged[f"20_std_live_{freq}"].to_numpy(float), std, rtol=1e-9, atol=1e-6, equal_nan=True)
+
+    # UD(df, 20, freq) = UD_cal on close_1 with that std; equal once the start has passed (see the U/D note above)
+    old = ref.UD_cal(pd.DataFrame({"close_1": merged["close_1"], f"20_std_{freq}": std}), "close_1", 20, freq)
+    start = 300
+    for col in [f"20_U_{freq}", f"20_D_{freq}", f"20_UD_flag_{freq}"]:
+        np.testing.assert_allclose(merged[col].to_numpy(float)[start:], old[col].to_numpy(float)[start:],
+                                   rtol=0, atol=1e-6, equal_nan=True, err_msg=col)
+    assert merged[f"20_U_{freq}"].iloc[start:].notna().sum() > 3  # real pivots were compared
+
+
+@pytest.mark.parametrize("freq", ["1", "15", "60"])
+def test_last_pivots(merged, freq):
+    u, d = merged[f"20_U_{freq}"].to_numpy(float), merged[f"20_D_{freq}"].to_numpy(float)
+    seen = []
+    for i in range(len(merged)):
+        seen += [x for x in (d[i], u[i]) if not np.isnan(x)]
+        want = (seen[::-1] + [np.nan] * UD_PIVOTS)[:UD_PIVOTS]
+        got = [merged[f"20_UD_last{k + 1}_{freq}"].iloc[i] for k in range(UD_PIVOTS)]
+        np.testing.assert_array_equal(got, want, err_msg=f"row {i}")
+    assert len(seen) > UD_PIVOTS
 
 
 def test_bollinger_bands_are_2_sigma(data_dir):

@@ -202,13 +202,21 @@ python -m data_pipeline.data_preprocessing --data-dir data/processed_2024 --out 
 |---|---|
 | Reads | `{--data-dir}/{freq}_ohlcv.parquet` for every freq in `params.FREQS` (default folder: step 2's default output) |
 | Writes | `--out` (default `training_data.parquet` in `--data-dir`): one row per 1-min bar, with every freq's bars and features as columns suffixed `_{freq}` |
-| Features | Per freq, window 20: SMA, std, Bollinger bands (2 sigma), ATR (Wilder, 14), SMA-RSI (14), FVG, bar-to-bar moves `HO HH HL HC`, `bar_score` (`params.NORM_FACTOR`), U/D levels |
+| Features | Per freq, window 20: SMA, std, Bollinger bands (2 sigma), ATR (Wilder, 14), SMA-RSI (14), FVG, bar-to-bar moves `HO HH HL HC`, `bar_score` (`params.NORM_FACTOR`), and U/D (below) |
+| U/D | For every freq (1, 15, 60, day), as the reference: a zigzag on the **1-min closes**, reversing when price moves more than that freq's std from the last extreme. For a higher freq that is its live std, `20_std_live_{freq}`: the last 19 closes shown so far plus the current 1-min close, so the levels move every minute. Columns `20_U_{freq}`, `20_D_{freq}` (the level on the bar where it is confirmed, else NaN), `20_UD_flag_{freq}`, and the last `params.UD_PIVOTS` (5) pivots, U and D in one sequence: `20_UD_last1_{freq}` (newest) … `20_UD_last5_{freq}`, in ticks, NaN until there are enough |
 
 The polars version of `reference/preprocessing_pandas.py`. It gives the same values
-(`tests/test_data_preprocessing.py` checks this), with two deliberate differences:
+(`tests/test_data_preprocessing.py` checks this, U/D included), with these differences:
 - Bollinger bands are 2 sigma; the reference used 4.
 - U/D no longer peeks 10 bars ahead to choose its starting side. The levels differ from the reference
   for the first bars only, until the state first resets (about 35 bars at most).
+- Pivots: the last 5 (`params.UD_PIVOTS`) as plain prices in ticks, with no lookback limit. The reference
+  kept the last 20 within a lookback window, zero-padded, and also a copy minus `ref_px` over `NORM_FACTOR`.
+- Other higher-freq indicators (std, ATR, SMA-RSI, Bollinger) are those of the last closed bar. The
+  reference recomputed them every minute with the current 1-min close as the forming bar's close; so far
+  only the std is ported that way (`20_std_live_{freq}`, for U/D).
+- The start of the data is kept. The reference dropped it until the slowest freq had a full pivot list
+  (`take_away_burnout_period`).
 
 **No look-ahead.** A higher-freq bar appears on the 1-min row during which it closes, and stays until the
 next one closes. The 15-min bar 10:00–10:14:59 appears on the 10:14 row, and the day bar on the session's

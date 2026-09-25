@@ -5,9 +5,12 @@ Bar features for the RL agent: the polars version of reference/preprocessing_pan
     python -m data_pipeline.data_preprocessing --data-dir data/processed_2024 --out data/features_2024.parquet
 
 Reads {data-dir}/{freq}_ohlcv.parquet for every freq in params.FREQS and adds, per freq (window 20): SMA, std,
-Bollinger bands (2 sigma), ATR, SMA-RSI, FVG, bar-to-bar moves, bar score and the U/D levels. Every higher
-freq is then joined onto the 1-min bars: a bar appears on the 1-min row during which it closes and stays
-until the next one closes, so a row holds nothing from the future once that 1-min bar has closed.
+Bollinger bands (2 sigma), ATR, SMA-RSI, FVG, bar-to-bar moves and bar score. Every higher freq is then
+joined onto the 1-min bars: a bar appears on the 1-min row during which it closes and stays until the next
+one closes, so a row holds nothing from the future once that 1-min bar has closed.
+U/D, as the reference: for every freq on the 1-min closes, with that freq's std as the reversal threshold
+(for a higher freq its live std: the last 19 closes shown so far plus the current 1-min close), with the
+flag and the last params.UD_PIVOTS pivots.
 Prices are in ticks (x4), like the bar files.
 """
 import argparse
@@ -19,7 +22,7 @@ import polars as pl
 from numba import njit
 
 from data_pipeline.to_dat import DEFAULT_OUT as DATA_DIR
-from params import FREQS, NORM_FACTOR
+from params import FREQS, NORM_FACTOR, UD_PIVOTS
 
 # A session is [00:00, 23:00) on the shifted clock (New York + 6h): no bar runs past 23:00
 SESSION_SECONDS = 23 * 3600
@@ -84,19 +87,59 @@ def _calc_ud_levels(px, kv):
     return U_out, D_out, flag_out
 
 
-def calc_ud_levels_polars(df: pl.DataFrame, window: int) -> pl.DataFrame:
-    """Wrapper to run the Numba UD level calculation inside Polars."""
-    px = df['close'].to_numpy().astype(np.float64)
-    # The first window-1 bars have no std: NaN, so every comparison with it is False, as in the reference
-    kv = df[f'{window}_std'].to_numpy().astype(np.float64)
+@njit(cache=True)
+def _last_pivots(u, d, n):
+    """
+    For each bar, the last n U/D pivots known at that bar (U and D in one sequence, as the reference's
+    get_UD_targets), most recent first, NaN while there are fewer. u / d are _calc_ud_levels' shifted
+    outputs, so they only hold levels already known at their bar.
+    """
+    out = np.full((len(u), n), np.nan)
+    last = np.full(n, np.nan)
+    for i in range(len(u)):
+        for level in (d[i], u[i]):  # both on one bar is rare; then U counts as the newer
+            if not np.isnan(level):
+                last[1:] = last[:-1].copy()
+                last[0] = level
+        out[i] = last
+    return out
 
+
+def ud_columns(px, kv, window, suffix=""):
+    """
+    U/D levels, flag and the last UD_PIVOTS pivots (`{window}_UD_last1` is the newest) of the price series px,
+    with kv as the reversal threshold. Missing kv (the start of the data) stays NaN: every comparison with it
+    is False, as in the reference.
+    """
+    px = np.asarray(px, dtype=np.float64)
+    kv = np.asarray(kv, dtype=np.float64)
     u, d, flag = _calc_ud_levels(px, kv)
+    pivots = _last_pivots(u, d, UD_PIVOTS)
+    return [
+        pl.Series(f"{window}_U{suffix}", u),
+        pl.Series(f"{window}_D{suffix}", d),
+        pl.Series(f"{window}_UD_flag{suffix}", flag),
+        *[pl.Series(f"{window}_UD_last{k + 1}{suffix}", pivots[:, k]) for k in range(UD_PIVOTS)],
+    ]
 
-    return df.with_columns([
-        pl.Series(f"{window}_U", u),
-        pl.Series(f"{window}_D", d),
-        pl.Series(f"{window}_UD_flag", flag)
-    ])
+
+def calc_ud_levels_polars(df: pl.DataFrame, window: int) -> pl.DataFrame:
+    """U/D of a bar series on its own closes, threshold its window std (the 1-min bars)."""
+    return df.with_columns(ud_columns(df['close'].to_numpy(), df[f'{window}_std'].to_numpy(), window))
+
+
+def live_std(df: pl.DataFrame, freq: str) -> np.ndarray:
+    """
+    The reference's live std of a higher freq at every 1-min row (unit_std): the std (ddof 0) of the last
+    window-1 closes of the freq's bars shown so far and the current 1-min close, the close of the bar still
+    forming. Built from the joined mean / M2 / count of those closes plus the one current close.
+    """
+    n = df[f'_live_n_{freq}'].to_numpy().astype(np.float64)
+    mean = df[f'_live_mean_{freq}'].to_numpy().astype(np.float64)
+    m2 = df[f'_live_m2_{freq}'].to_numpy().astype(np.float64)
+    close = df['close_1'].to_numpy().astype(np.float64)
+    total = n + 1
+    return np.sqrt((m2 + (close - mean) ** 2 * n / total) / total)
 
 
 class DataPreprocessor:
@@ -202,11 +245,19 @@ class DataPreprocessor:
         # Add indicators
         lf = self.add_technical_indicators(lf, window=20)
 
-        # Collect to DataFrame because UD levels requires Numba (can't be lazy)
-        df = lf.collect()
-
-        # Calculate stateful UD levels
-        df = calc_ud_levels_polars(df, window=20)
+        if freq == '1':
+            # Collect to DataFrame because UD levels requires Numba (can't be lazy)
+            df = calc_ud_levels_polars(lf.collect(), window=20)
+        else:
+            # Higher freqs: U/D runs later on the 1-min closes (see build_merged_dataset). Here only what its
+            # live std needs: mean, M2 and count of the last window-1 closes (fewer at the start, as the reference)
+            k = 20 - 1
+            count = pl.min_horizontal(pl.int_range(1, pl.len() + 1), pl.lit(k)).cast(pl.Float64)
+            df = lf.with_columns([
+                count.alias('_live_n'),
+                pl.col('close').rolling_mean(k, min_samples=1).alias('_live_mean'),
+                (pl.col('close').rolling_var(k, min_samples=1, ddof=0) * count).alias('_live_m2'),
+            ]).collect()
 
         # Rename columns to have frequency suffix (except ts and join keys)
         rename_dict = {col: f"{col}_{freq}" for col in df.columns if col not in ['ts', 'start_ind', 'rth', 'session', 'hour']}
@@ -242,6 +293,12 @@ class DataPreprocessor:
                 on='ts',
                 strategy='backward'
             )
+
+            # U/D of this freq as the reference (UD with px_col='close_1'): on the 1-min closes, with this
+            # freq's live std as the reversal threshold, so its levels and pivots move every minute
+            std = live_std(df_1m, freq)
+            df_1m = df_1m.with_columns([pl.Series(f'20_std_live_{freq}', std), *ud_columns(df_1m['close_1'], std, 20, f'_{freq}')])
+            df_1m = df_1m.drop([f'_live_n_{freq}', f'_live_mean_{freq}', f'_live_m2_{freq}'])
 
         return df_1m
 

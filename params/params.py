@@ -22,6 +22,8 @@ FREQS = ['1','15','60','day']
 
 BEGIN_DATE = datetime.datetime(2023, 1, 1, 0, 0, 0)
 
+UD_PIVOTS = 5  # last U/D pivots kept per freq (data_pipeline/data_preprocessing.py)
+
 
 
 
