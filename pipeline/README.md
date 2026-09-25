@@ -25,6 +25,11 @@ params/news_events.yaml ─────────────┘
 
 Each step reads the previous step's output, so after changing an earlier step, rerun every step after it.
 
+**For now this is the one-time initial build of the whole history.** Every run rebuilds its outputs
+from scratch (step 1 rewrites its parquet file, step 2 rewrites `tick.dat` and every bar file); nothing
+is appended. To add new sessions, put the new raw files in `raw_data/` and rerun all the steps.
+Incremental daily updates are not supported yet.
+
 ## 1. `raw_data_preprocessing.py` — raw trades to one tick file
 
 ```bash
