@@ -4,6 +4,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 import datetime
 import multiprocessing
+import subprocess
 import pickle
 from concurrent.futures import ProcessPoolExecutor
 
@@ -138,7 +139,7 @@ def test_arrays_match_single_calls(data, freq):
     hi = p0 + 25 * rng.integers(0, 80, len(starts))
     lo = p0 - 25 * rng.integers(0, 80, len(starts))
     sides = first_hit(data, freq, starts, hi, lo)
-    assert sides.dtype == np.int8
+    assert sides.dtype == np.int64  # safe for P&L arithmetic (sides * tp)
     assert sides.tolist() == [first_hit(data, freq, int(s), int(h), int(l)) for s, h, l in zip(starts, hi, lo)]
 
 
@@ -254,3 +255,77 @@ def test_owner_class_works_in_worker_processes(dat_file):
         results = list(pool.map(_label_in_worker, [bt, bt], ['1', '15']))
     assert np.array_equal(results[0], bt.label('1', 1000, 500))
     assert np.array_equal(results[1], bt.label('15', 1000, 500))
+
+
+def test_float_levels_are_exact(data):
+    rng = np.random.default_rng(3)
+    starts = rng.choice(np.flatnonzero(data[:, NEXT['1']]), size=1500)
+    p0 = data[starts, PRICE_COL].astype(float)
+    upper = p0 + 25 * rng.integers(0, 40, len(starts)) + rng.uniform(-24, 24, len(starts))
+    lower = p0 - 25 * rng.integers(0, 40, len(starts)) + rng.uniform(-24, 24, len(starts))
+    want = [tick_scan(data, s, data[s, NEXT['1']], u, l) for s, u, l in zip(starts, upper, lower)]
+    assert first_hit(data, '1', starts, upper, lower).tolist() == want
+    assert first_hit(data, '1', int(starts[0]), float(upper[0]), float(lower[0])) == want[0]
+
+
+def test_inf_means_no_level_and_nan_raises(data):
+    starts = np.flatnonzero(data[:, NEXT['60']])[:200]
+    p0 = data[starts, PRICE_COL]
+    only_lower = first_hit(data, '60', starts, np.inf, p0 - 2500)
+    assert set(only_lower.tolist()) <= {0, -1}
+    assert only_lower.tolist() == [tick_scan(data, s, data[s, NEXT['60']], np.inf, l) for s, l in zip(starts, p0 - 2500)]
+    with pytest.raises(ValueError):
+        first_hit(data, '60', starts, np.where(np.arange(len(starts)) == 5, np.nan, p0 + 2500.0), p0 - 2500)
+
+
+def test_cut_or_negative_rows_raise_instead_of_reading_outside(data):
+    day0, day1 = np.flatnonzero(data[:, NEXT['day']])[:2]
+    cut = data[:day1 - 100]  # ends inside the first session: its day bar points past the end
+    p0 = data[day0, PRICE_COL]
+    with pytest.raises(ValueError):
+        first_hit(cut, 'day', int(day0), int(p0) + 10**7, int(p0) - 10**7)
+    with pytest.raises(ValueError):
+        first_hit(cut, 'day', np.array([day0]), p0 + 10**7, p0 - 10**7)
+    with pytest.raises(ValueError):
+        first_hit(data, '1', -1, int(p0) + 2500, int(p0) - 2500)
+    with pytest.raises(ValueError):
+        first_hit(data, '1', np.array([-1, 0]), p0 + 2500, p0 - 2500)
+
+
+def test_bar_starts_cache_is_read_only(data):
+    starts = TickData(data).bar_starts('1')
+    with pytest.raises(ValueError):
+        starts += 1
+
+
+def test_child_table_cycles_raise(data):
+    for bad in ({**CHILD, '1s': '1s'}, {**CHILD, '5': '5'}):
+        with pytest.raises(ValueError):
+            TickData(data, child=bad)
+
+
+def test_params_import_does_not_load_numba():
+    code = "import sys; from tick_data.params import FREQS, DAT_COLS; assert 'numba' not in sys.modules"
+    subprocess.run([sys.executable, '-c', code], check=True, cwd=os.path.join(os.path.dirname(__file__), '..'))
+
+
+def test_pickle_uses_absolute_path_and_memmap_file(data, dat_file, tmp_path, monkeypatch):
+    monkeypatch.chdir(dat_file.parent)
+    ticks = TickData.load(dat_file.name)  # relative path
+    assert os.path.isabs(ticks.path)
+    monkeypatch.chdir(tmp_path)  # a worker with another working directory
+    assert np.array_equal(pickle.loads(pickle.dumps(ticks)).data, data)
+    # built from load_dat: the memmap knows its file, so pickling still carries only the path
+    assert len(pickle.dumps(TickData(load_dat(dat_file)))) < 10_000
+    # a slice of the memmap is not the whole file: pickled with its ticks
+    part = load_dat(dat_file)[:100]
+    assert np.array_equal(pickle.loads(pickle.dumps(TickData(part))).data, part)
+
+
+def test_unpickle_refuses_a_changed_file(data, tmp_path):
+    path = tmp_path / 'tick.dat'
+    data.tofile(path)
+    blob = pickle.dumps(TickData.load(path))
+    data[:10].tofile(path)  # to_dat.py wrote a new tick.dat
+    with pytest.raises(ValueError):
+        pickle.loads(blob)

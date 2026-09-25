@@ -23,6 +23,20 @@ def brute_force_search(data: np.ndarray, start_idx: int, end_idx: int, upper: in
     return 0
 
 
+def make_queries(data, freq, num_queries=10_000, seed=42):
+    """
+    Random entries on the first tick of `freq` bars, each with an upper and a lower level 10 to 50 pts
+    from the entry price (price is x100). Shared with run_benchmark_mismatch.py so both scripts check
+    exactly the same queries. Returns (starts, bar ends, uppers, lowers).
+    """
+    next_col = DAT_COLS.index(f'next_ind_{freq}')
+    rng = np.random.default_rng(seed)
+    starts = rng.choice(np.flatnonzero(data[:, next_col]), size=num_queries)
+    ends = data[starts, next_col]
+    prices = data[starts, PRICE_COL]
+    return starts, ends, prices + rng.integers(1000, 5000, num_queries), prices - rng.integers(1000, 5000, num_queries)
+
+
 def main():
     freq = sys.argv[1] if len(sys.argv) > 1 else '1'  # bar size the entries sit on, e.g. 1, 15, 60, day
 
@@ -36,18 +50,8 @@ def main():
     data = load_dat(memmap_path)
     console.print(f"[green]Array contains {data.shape[0]:,} ticks.[/green]")
 
-    # Entries sit on the first tick of a bar; each search looks only inside that bar
-    next_col = DAT_COLS.index(f'next_ind_{freq}')
-    bar_starts = np.flatnonzero(data[:, next_col])
-
-    np.random.seed(42)
     NUM_QUERIES = 10_000
-    start_indices = np.random.choice(bar_starts, size=NUM_QUERIES)
-    end_indices = data[start_indices, next_col]
-    start_prices = data[start_indices, PRICE_COL]
-    # Target TP and SL (e.g., +/- 10 to 50 points, remembering price is x100)
-    uppers = start_prices + np.random.randint(1000, 5000, size=NUM_QUERIES)
-    lowers = start_prices - np.random.randint(1000, 5000, size=NUM_QUERIES)
+    start_indices, end_indices, uppers, lowers = make_queries(data, freq, NUM_QUERIES)
 
     console.print(f"\n[yellow]Running {NUM_QUERIES:,} Brute Force tick-by-tick searches on {freq} bars...[/yellow]")
     t0 = time.perf_counter()

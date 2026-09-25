@@ -4,7 +4,8 @@ import sys
 import numpy as np
 from rich.console import Console
 
-from tick_data import first_hit, load_dat, DAT_COLS, PRICE_COL
+from tick_data import first_hit, load_dat, PRICE_COL
+from benchmark_search import make_queries
 
 console = Console()
 
@@ -29,36 +30,28 @@ def main():
         return
 
     data = load_dat(memmap_path)
-    next_col = DAT_COLS.index(f'next_ind_{freq}')
-    bar_starts = np.flatnonzero(data[:, next_col])
+    # The same queries benchmark_search.py runs, so a mismatch it reports can be replayed here
+    starts, ends, uppers, lowers = make_queries(data, freq)
+    array_sides = first_hit(data, freq, starts, uppers, lowers)
 
-    np.random.seed(42)
-    NUM_QUERIES = 10_000
-    start_indices = np.random.choice(bar_starts, size=NUM_QUERIES)
-
-    queries = []
-    for idx in start_indices:
-        start_price = data[idx, PRICE_COL]
-        tp_offset = np.random.randint(1000, 5000)
-        sl_offset = np.random.randint(1000, 5000)
-        queries.append((int(idx), int(start_price + tp_offset), int(start_price - sl_offset)))
-
-    for idx, tp, sl in queries:
-        end_idx = int(data[idx, next_col])
+    for q, (idx, end_idx, tp, sl) in enumerate(zip(starts.tolist(), ends.tolist(), uppers.tolist(), lowers.tolist())):
         hit_idx, bf_side = brute_force_search(data, idx, end_idx, tp, sl)
-        stop_side = first_hit(data, freq, idx, tp, sl)
+        single_side = first_hit(data, freq, idx, tp, sl)
+        array_side = int(array_sides[q])
 
-        if bf_side != stop_side:
+        if not bf_side == single_side == array_side:
             print("\n" + "="*50)
             print("MISMATCH FOUND!")
             print(f"Input Parameters:")
+            print(f"  query: {q}")
             print(f"  freq: {freq}")
             print(f"  start_idx: {idx} (bar ends at {end_idx})")
             print(f"  upper: {tp}")
             print(f"  lower: {sl}")
             print(f"\nResults:")
-            print(f"  Brute Force returned: {bf_side} (tick {hit_idx})")
-            print(f"  first_hit returned: {stop_side}")
+            print(f"  Brute Force returned:         {bf_side} (tick {hit_idx})")
+            print(f"  first_hit returned:           {single_side}")
+            print(f"  first_hit on arrays returned: {array_side}")
 
             last = min(end_idx, (hit_idx if hit_idx is not None else end_idx) + 2, idx + 200)
             print("\nData Subset (start_idx up to the first hit, at most 200 ticks):")
@@ -73,7 +66,7 @@ def main():
             print("="*50 + "\n")
             return
 
-    console.print(f"[green]No mismatch in {NUM_QUERIES:,} queries on {freq} bars.[/green]")
+    console.print(f"[green]No mismatch in {len(starts):,} queries on {freq} bars (single calls and arrays).[/green]")
 
 
 if __name__ == "__main__":
