@@ -11,8 +11,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from to_dat import FREQS, DAT_COLS, process_session
-from search_stop import search_stop, load_dat, TickData, CHILD, PRICE_COL
+from to_dat import process_session
+from tick_data import first_hit, load_dat, TickData, CHILD, DAT_COLS, FREQS, PRICE_COL
 
 NEXT = {f: DAT_COLS.index(f'next_ind_{f}') for f in FREQS}
 HIGH = {f: DAT_COLS.index(f'high_{f}') for f in FREQS}
@@ -89,7 +89,7 @@ def test_matches_tick_scan(data, freq):
             hi = p0 + 25 * int(rng.integers(0, 80))
             lo = p0 - 25 * int(rng.integers(0, 80))
             want = tick_scan(data, i, data[i, NEXT[freq]], hi, lo)
-            assert search_stop(data, hi, lo, freq, i) == want, f"{freq} bar at row {i}, levels {hi}/{lo}"
+            assert first_hit(data, freq, i, hi, lo) == want, f"{freq} bar at row {i}, levels {hi}/{lo}"
             sides.append(want)
     assert {1, -1} <= set(sides)
 
@@ -100,7 +100,7 @@ def test_both_levels_in_one_second_walks_ticks(data):
     assert len(both) > 50
     for i in both:
         hi, lo = data[i, HIGH['1s']], data[i, LOW['1s']]
-        assert search_stop(data, hi, lo, '1s', i) == tick_scan(data, i, data[i, NEXT['1s']], hi, lo)
+        assert first_hit(data, '1s', i, hi, lo) == tick_scan(data, i, data[i, NEXT['1s']], hi, lo)
 
 
 def test_clean_bar_is_skipped_even_if_a_later_bar_hits(data):
@@ -110,14 +110,14 @@ def test_clean_bar_is_skipped_even_if_a_later_bar_hits(data):
             break
     else:
         pytest.fail("no 5-min bar with a later hit")
-    assert search_stop(data, hi, lo, '5', i) == 0
+    assert first_hit(data, '5', i, hi, lo) == 0
 
 
 def test_start_must_be_first_tick_of_the_bar(data):
     i = int(np.flatnonzero(data[:, NEXT['60']] == 0)[0])
     p0 = data[i, PRICE_COL]
     with pytest.raises(ValueError):
-        search_stop(data, p0 + 100_000, p0 - 100_000, '60', i)
+        first_hit(data, '60', i, p0 + 100_000, p0 - 100_000)
 
 
 def test_inconsistent_summaries_raise(data):
@@ -127,7 +127,7 @@ def test_inconsistent_summaries_raise(data):
     p0 = bad[i, PRICE_COL]
     bad[i, HIGH['1']], bad[i, LOW['1']] = p0 + 100_000, p0 - 100_000
     with pytest.raises(ValueError):
-        search_stop(bad, p0 + 50_000, p0 - 50_000, '1', i)
+        first_hit(bad, '1', i, p0 + 50_000, p0 - 50_000)
 
 
 @pytest.mark.parametrize('freq', list(CHILD))
@@ -137,34 +137,34 @@ def test_arrays_match_single_calls(data, freq):
     p0 = data[starts, PRICE_COL]
     hi = p0 + 25 * rng.integers(0, 80, len(starts))
     lo = p0 - 25 * rng.integers(0, 80, len(starts))
-    sides = search_stop(data, hi, lo, freq, starts)
+    sides = first_hit(data, freq, starts, hi, lo)
     assert sides.dtype == np.int8
-    assert sides.tolist() == [search_stop(data, int(h), int(l), freq, int(s)) for s, h, l in zip(starts, hi, lo)]
+    assert sides.tolist() == [first_hit(data, freq, int(s), int(h), int(l)) for s, h, l in zip(starts, hi, lo)]
 
 
 def test_one_entry_gives_int_and_scalars_broadcast(data):
     starts = np.flatnonzero(data[:, NEXT['15']])[:300]
     p0 = int(data[starts[0], PRICE_COL])
-    side = search_stop(data, np.int64(p0 + 2500), p0 - 2500, '15', starts[0])
+    side = first_hit(data, '15', starts[0], np.int64(p0 + 2500), p0 - 2500)
     assert type(side) is int
     # the same two levels for every entry
-    sides = search_stop(data, p0 + 2500, p0 - 2500, '15', starts)
-    assert sides.tolist() == [search_stop(data, p0 + 2500, p0 - 2500, '15', int(s)) for s in starts]
-    assert search_stop(data, p0 + 2500, p0 - 2500, '15', starts[:0]).shape == (0,)
+    sides = first_hit(data, '15', starts, p0 + 2500, p0 - 2500)
+    assert sides.tolist() == [first_hit(data, '15', int(s), p0 + 2500, p0 - 2500) for s in starts]
+    assert first_hit(data, '15', starts[:0], p0 + 2500, p0 - 2500).shape == (0,)
     with pytest.raises(ValueError):
-        search_stop(data, np.array([p0, p0]), p0 - 2500, '15', starts[:3])  # lengths 2 and 3
+        first_hit(data, '15', starts[:3], np.array([p0, p0]), p0 - 2500)  # lengths 2 and 3
 
 
 def test_arrays_reject_bad_starts_and_broken_summaries(data):
     starts = np.flatnonzero(data[:, NEXT['1']])[:500]
     p0 = data[starts, PRICE_COL]
     with pytest.raises(ValueError):
-        search_stop(data, p0 + 2500, p0 - 2500, '1', starts + 1)  # rows after a bar start
+        first_hit(data, '1', starts + 1, p0 + 2500, p0 - 2500)  # rows after a bar start
     bad = data.copy()
     i = starts[10]
     bad[i, HIGH['1']], bad[i, LOW['1']] = p0[10] + 100_000, p0[10] - 100_000
     with pytest.raises(ValueError):
-        search_stop(bad, p0 + 50_000, p0 - 50_000, '1', starts)
+        first_hit(bad, '1', starts, p0 + 50_000, p0 - 50_000)
 
 
 def test_load_dat_reads_to_dat_layout(data, tmp_path):
@@ -174,7 +174,7 @@ def test_load_dat_reads_to_dat_layout(data, tmp_path):
     assert mm.shape == data.shape
     i = int(np.flatnonzero(mm[:, NEXT['60']])[3])
     p0 = mm[i, PRICE_COL]
-    assert search_stop(mm, p0 + 2500, p0 - 2500, '60', i) == tick_scan(data, i, data[i, NEXT['60']], p0 + 2500, p0 - 2500)
+    assert first_hit(mm, '60', i, p0 + 2500, p0 - 2500) == tick_scan(data, i, data[i, NEXT['60']], p0 + 2500, p0 - 2500)
 
     with open(path, 'ab') as f:
         f.write(b'\0' * 8)
@@ -185,8 +185,8 @@ def test_load_dat_reads_to_dat_layout(data, tmp_path):
 def test_zero_d_arrays_count_as_one_entry(data):
     i = int(np.flatnonzero(data[:, NEXT['5']])[7])
     p0 = data[i, PRICE_COL]
-    side = search_stop(data, np.array(p0 + 2500), np.array(p0 - 2500), '5', np.array(i))
-    assert type(side) is int and side == search_stop(data, int(p0) + 2500, int(p0) - 2500, '5', i)
+    side = first_hit(data, '5', np.array(i), np.array(p0 + 2500), np.array(p0 - 2500))
+    assert type(side) is int and side == first_hit(data, '5', i, int(p0) + 2500, int(p0) - 2500)
 
 
 class Backtester:
@@ -198,7 +198,7 @@ class Backtester:
     def label(self, freq, tp, sl):
         starts = self.ticks.bar_starts(freq)
         entry = self.ticks.price(starts)
-        return self.ticks.search_stop(entry + tp, entry - sl, freq, starts)
+        return self.ticks.first_hit(freq, starts, entry + tp, entry - sl)
 
 
 def _label_in_worker(bt, freq):
@@ -221,9 +221,9 @@ def test_tickdata_matches_function(data):
         assert ticks.bar_starts(freq) is starts  # cached
         assert np.array_equal(ticks.bar_end(freq, starts), data[starts, NEXT[freq]])
         entry = ticks.price(starts)
-        want = search_stop(data, entry + 1000, entry - 500, freq, starts)
-        assert np.array_equal(ticks.search_stop(entry + 1000, entry - 500, freq, starts), want)
-        assert ticks.search_stop(int(entry[0]) + 1000, int(entry[0]) - 500, freq, int(starts[0])) == want[0]
+        want = first_hit(data, freq, starts, entry + 1000, entry - 500)
+        assert np.array_equal(ticks.first_hit(freq, starts, entry + 1000, entry - 500), want)
+        assert ticks.first_hit(freq, int(starts[0]), int(entry[0]) + 1000, int(entry[0]) - 500) == want[0]
 
 
 def test_tickdata_rejects_child_tables_that_do_not_tile(data):

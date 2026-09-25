@@ -5,21 +5,20 @@ import time
 import numpy as np
 from rich.console import Console
 
-from to_dat import DAT_COLS
-from search_stop import search_stop, load_dat, PRICE_COL
+from tick_data import first_hit, load_dat, DAT_COLS, PRICE_COL
 
 console = Console()
 
 
-def brute_force_search(data: np.ndarray, start_idx: int, end_idx: int, target_high: int, target_low: int):
+def brute_force_search(data: np.ndarray, start_idx: int, end_idx: int, upper: int, lower: int):
     """
     Naive tick-by-tick scan of the same bar. Simulates a traditional backtester stepping through every row.
     """
     for i in range(start_idx, end_idx):
         price = data[i, PRICE_COL]
-        if price >= target_high:
+        if price >= upper:
             return 1
-        if price <= target_low:
+        if price <= lower:
             return -1
     return 0
 
@@ -47,30 +46,30 @@ def main():
     end_indices = data[start_indices, next_col]
     start_prices = data[start_indices, PRICE_COL]
     # Target TP and SL (e.g., +/- 10 to 50 points, remembering price is x100)
-    target_highs = start_prices + np.random.randint(1000, 5000, size=NUM_QUERIES)
-    target_lows = start_prices - np.random.randint(1000, 5000, size=NUM_QUERIES)
+    uppers = start_prices + np.random.randint(1000, 5000, size=NUM_QUERIES)
+    lowers = start_prices - np.random.randint(1000, 5000, size=NUM_QUERIES)
 
     console.print(f"\n[yellow]Running {NUM_QUERIES:,} Brute Force tick-by-tick searches on {freq} bars...[/yellow]")
     t0 = time.perf_counter()
-    bf_results = [brute_force_search(data, s, e, h, l) for s, e, h, l in zip(start_indices, end_indices, target_highs, target_lows)]
+    bf_results = [brute_force_search(data, s, e, h, l) for s, e, h, l in zip(start_indices, end_indices, uppers, lowers)]
     bf_time = time.perf_counter() - t0
     console.print(f"Brute Force took: [red]{bf_time:.4f} seconds[/red] ({(bf_time/NUM_QUERIES)*1000:.3f} ms per query)")
 
     # Warm up Numba JIT (run once so compilation time isn't counted in the benchmark)
-    search_stop(data, int(target_highs[0]), int(target_lows[0]), freq, int(start_indices[0]))
-    search_stop(data, target_highs[:1], target_lows[:1], freq, start_indices[:1])
+    first_hit(data, freq, int(start_indices[0]), int(uppers[0]), int(lowers[0]))
+    first_hit(data, freq, start_indices[:1], uppers[:1], lowers[:1])
 
-    console.print(f"\n[yellow]Running {NUM_QUERIES:,} search_stop calls, one entry each...[/yellow]")
+    console.print(f"\n[yellow]Running {NUM_QUERIES:,} first_hit calls, one entry each...[/yellow]")
     t0 = time.perf_counter()
-    single_results = [search_stop(data, int(h), int(l), freq, int(s)) for s, h, l in zip(start_indices, target_highs, target_lows)]
+    single_results = [first_hit(data, freq, int(s), int(h), int(l)) for s, h, l in zip(start_indices, uppers, lowers)]
     single_time = time.perf_counter() - t0
-    console.print(f"search_stop took: [green]{single_time:.4f} seconds[/green] ({(single_time/NUM_QUERIES)*1000:.3f} ms per query)")
+    console.print(f"first_hit took: [green]{single_time:.4f} seconds[/green] ({(single_time/NUM_QUERIES)*1000:.3f} ms per query)")
 
-    console.print(f"\n[yellow]Running {NUM_QUERIES:,} searches in one search_stop call on arrays...[/yellow]")
+    console.print(f"\n[yellow]Running {NUM_QUERIES:,} searches in one first_hit call on arrays...[/yellow]")
     t0 = time.perf_counter()
-    batch_results = search_stop(data, target_highs, target_lows, freq, start_indices).tolist()
+    batch_results = first_hit(data, freq, start_indices, uppers, lowers).tolist()
     batch_time = time.perf_counter() - t0
-    console.print(f"search_stop on arrays took: [green]{batch_time:.4f} seconds[/green] ({(batch_time/NUM_QUERIES)*1000:.4f} ms per query)")
+    console.print(f"first_hit on arrays took: [green]{batch_time:.4f} seconds[/green] ({(batch_time/NUM_QUERIES)*1000:.4f} ms per query)")
 
     # Verify correctness
     mismatches = sum(b != s or b != p for b, s, p in zip(bf_results, single_results, batch_results))
@@ -79,7 +78,7 @@ def main():
     else:
         console.print(f"\n[bold red]ERROR: {mismatches} results did not match! Run run_benchmark_mismatch.py {freq}[/bold red]")
 
-    console.print(f"\n[bold cyan]search_stop is {bf_time / single_time:.1f}x (one entry per call) and {bf_time / batch_time:.1f}x (arrays) FASTER than Brute Force![/bold cyan]")
+    console.print(f"\n[bold cyan]first_hit is {bf_time / single_time:.1f}x (one entry per call) and {bf_time / batch_time:.1f}x (arrays) FASTER than Brute Force![/bold cyan]")
 
 
 if __name__ == "__main__":

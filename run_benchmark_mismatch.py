@@ -4,18 +4,17 @@ import sys
 import numpy as np
 from rich.console import Console
 
-from to_dat import DAT_COLS
-from search_stop import search_stop, load_dat, PRICE_COL
+from tick_data import first_hit, load_dat, DAT_COLS, PRICE_COL
 
 console = Console()
 
 
-def brute_force_search(data: np.ndarray, start_idx: int, end_idx: int, target_high: int, target_low: int):
+def brute_force_search(data: np.ndarray, start_idx: int, end_idx: int, upper: int, lower: int):
     for i in range(start_idx, end_idx):
         price = data[i, PRICE_COL]
-        if price >= target_high:
+        if price >= upper:
             return i, 1
-        if price <= target_low:
+        if price <= lower:
             return i, -1
     return None, 0
 
@@ -47,7 +46,7 @@ def main():
     for idx, tp, sl in queries:
         end_idx = int(data[idx, next_col])
         hit_idx, bf_side = brute_force_search(data, idx, end_idx, tp, sl)
-        stop_side = search_stop(data, tp, sl, freq, idx)
+        stop_side = first_hit(data, freq, idx, tp, sl)
 
         if bf_side != stop_side:
             print("\n" + "="*50)
@@ -55,11 +54,11 @@ def main():
             print(f"Input Parameters:")
             print(f"  freq: {freq}")
             print(f"  start_idx: {idx} (bar ends at {end_idx})")
-            print(f"  target_high: {tp}")
-            print(f"  target_low: {sl}")
+            print(f"  upper: {tp}")
+            print(f"  lower: {sl}")
             print(f"\nResults:")
             print(f"  Brute Force returned: {bf_side} (tick {hit_idx})")
-            print(f"  search_stop returned: {stop_side}")
+            print(f"  first_hit returned: {stop_side}")
 
             last = min(end_idx, (hit_idx if hit_idx is not None else end_idx) + 2, idx + 200)
             print("\nData Subset (start_idx up to the first hit, at most 200 ticks):")

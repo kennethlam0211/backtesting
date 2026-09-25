@@ -3,13 +3,7 @@ import os
 import numpy as np
 from numba import njit, prange
 
-from to_dat import DAT_COLS
-
-# Each bar size -> the next smaller size that divides it evenly. Bars are aligned to the session open,
-# so a bar's first row is also the first row of its first child, and its children tile it exactly.
-# None: a 1s bar holding both levels is walked tick by tick.
-CHILD = {'day': '60', '60': '30', '30': '10', '10': '5', '15': '5',
-         '5': '1', '1': '15s', '15s': '1s', '1s': None}
+from .params import CHILD, DAT_COLS
 
 
 def _seconds(freq):
@@ -53,7 +47,7 @@ BROKEN = 2
 
 
 @njit(cache=True)
-def _search_stop(data, ind, chain, price_col, target_high, target_low):
+def _first_hit_one(data, ind, chain, price_col, upper, lower):
     depth = chain.shape[0]
     ends = np.empty(depth, dtype=np.int64)  # ends[k]: end of the parent bar whose children level k scans
     ends[0] = data[ind, chain[0, 0]]
@@ -64,11 +58,11 @@ def _search_stop(data, ind, chain, price_col, target_high, target_low):
         nxt = data[ind, chain[k, 0]]
         if nxt == 0:
             return BROKEN  # sub-bar missing
-        hit_high = data[ind, chain[k, 1]] >= target_high
-        hit_low = data[ind, chain[k, 2]] <= target_low
-        if hit_high != hit_low:
-            return 1 if hit_high else -1
-        if not hit_high:
+        hit_upper = data[ind, chain[k, 1]] >= upper
+        hit_lower = data[ind, chain[k, 2]] <= lower
+        if hit_upper != hit_lower:
+            return 1 if hit_upper else -1
+        if not hit_upper:
             if k == 0:
                 return 0  # nothing inside the entry bar: skip
             ind = nxt  # next bar of the same size, still inside the parent
@@ -78,43 +72,51 @@ def _search_stop(data, ind, chain, price_col, target_high, target_low):
         else:
             for t in range(ind, nxt):  # both inside a 1s bar: walk its ticks
                 price = data[t, price_col]
-                if price >= target_high:
+                if price >= upper:
                     return 1
-                if price <= target_low:
+                if price <= lower:
                     return -1
             return BROKEN  # a 1s bar held a level but none of its ticks did
 
 
-def _run(data, chain, price_col, freq, target_high, target_low, start_idx):
-    if isinstance(start_idx, _INT) and isinstance(target_high, _INT) and isinstance(target_low, _INT):
+@njit(parallel=True, cache=True)
+def _first_hit_many(data, starts, chain, price_col, upper, lower):
+    out = np.empty(len(starts), dtype=np.int8)
+    for q in prange(len(starts)):
+        out[q] = _first_hit_one(data, starts[q], chain, price_col, upper[q], lower[q])
+    return out
+
+
+def _first_hit(data, chain, price_col, freq, start_idx, upper, lower):
+    if isinstance(start_idx, _INT) and isinstance(upper, _INT) and isinstance(lower, _INT):
         start_idx = int(start_idx)
         if data[start_idx, chain[0, 0]] == 0:
             raise ValueError(f"row {start_idx} is not the first tick of a {freq} bar")
-        side = int(_search_stop(data, start_idx, chain, price_col, int(target_high), int(target_low)))
+        side = int(_first_hit_one(data, start_idx, chain, price_col, int(upper), int(lower)))
         if side == BROKEN:
             raise ValueError(f"bar summaries of the {freq} bar at row {start_idx} contradict its ticks")
         return side
 
     try:
-        starts, highs, lows = np.broadcast_arrays(*(np.asarray(a, dtype=np.int64) for a in (start_idx, target_high, target_low)))
+        starts, uppers, lowers = np.broadcast_arrays(*(np.asarray(a, dtype=np.int64) for a in (start_idx, upper, lower)))
     except ValueError:
-        raise ValueError("start_idx, target_high and target_low must broadcast to one 1-D shape") from None
+        raise ValueError("start_idx, upper and lower must broadcast to one 1-D shape") from None
     if starts.ndim == 0:  # 0-d arrays: one entry
-        return _run(data, chain, price_col, freq, int(highs), int(lows), int(starts))
+        return _first_hit(data, chain, price_col, freq, int(starts), int(uppers), int(lowers))
     if starts.ndim != 1:
-        raise ValueError("start_idx, target_high and target_low must broadcast to one 1-D shape")
-    starts, highs, lows = (np.ascontiguousarray(a) for a in (starts, highs, lows))
+        raise ValueError("start_idx, upper and lower must broadcast to one 1-D shape")
+    starts, uppers, lowers = (np.ascontiguousarray(a) for a in (starts, uppers, lowers))
     not_start = data[starts, chain[0, 0]] == 0
     if not_start.any():
         raise ValueError(f"{not_start.sum()} start rows are not the first tick of a {freq} bar, e.g. row {starts[not_start][0]}")
-    sides = _search_stop_many(data, starts, chain, price_col, highs, lows)
+    sides = _first_hit_many(data, starts, chain, price_col, uppers, lowers)
     broken = sides == BROKEN
     if broken.any():
         raise ValueError(f"bar summaries contradict the ticks for {broken.sum()} entries, e.g. the {freq} bar at row {starts[broken][0]}")
     return sides
 
 
-def search_stop(data, target_high, target_low, freq, start_idx):
+def first_hit(data, freq, start_idx, upper, lower):
     """
     Which level each entry's `freq` bar touches first, looking only inside that bar.
 
@@ -128,15 +130,15 @@ def search_stop(data, target_high, target_low, freq, start_idx):
 
     Args:
         data: tick.dat as an int64 array (see load_dat).
-        target_high: upper level(s), price x100 (4000.25 -> 400025); hit when price >= target_high.
-        target_low: lower level(s), price x100; hit when price <= target_low.
         freq: bar size to look inside, shared by all entries: 'day', '60', '30', '15', '10', '5',
             '1', '15s' or '1s'.
         start_idx: entry row(s); each must be the first tick of a `freq` bar.
+        upper: upper level(s), price x100 (4000.25 -> 400025); hit when price >= upper.
+        lower: lower level(s), price x100; hit when price <= lower.
 
     Returns:
-         1  target_high is hit first (a long's take-profit, a short's stop)
-        -1  target_low is hit first (a long's stop, a short's take-profit)
+         1  upper is hit first (a long's take-profit, a short's stop)
+        -1  lower is hit first (a long's stop, a short's take-profit)
          0  neither is hit inside the bar (skip)
         An int for one entry, an int8 array for many.
 
@@ -146,30 +148,21 @@ def search_stop(data, target_high, target_low, freq, start_idx):
 
     Example:
         import numpy as np
-        from search_stop import search_stop, load_dat, PRICE_COL
-        from to_dat import DAT_COLS
+        from tick_data import first_hit, load_dat, DAT_COLS, PRICE_COL
 
         data = load_dat('data/zarr/tick.dat')
         starts = np.flatnonzero(data[:, DAT_COLS.index('next_ind_1')])  # first tick of every 1-min bar
         entry = data[starts, PRICE_COL]
 
         # one entry: +10 pts / -5 pts inside the first minute
-        side = search_stop(data, entry[0] + 1000, entry[0] - 500, '1', starts[0])
+        side = first_hit(data, '1', starts[0], entry[0] + 1000, entry[0] - 500)
         # side == 1: +10 came first; -1: -5 came first; 0: neither within that minute
 
         # every minute at once, same offsets from each entry price
-        sides = search_stop(data, entry + 1000, entry - 500, '1', starts)
+        sides = first_hit(data, '1', starts, entry + 1000, entry - 500)
         print((sides == 1).mean(), (sides == -1).mean(), (sides == 0).mean())  # share of each outcome
     """
-    return _run(data, CHAINS[freq], PRICE_COL, freq, target_high, target_low, start_idx)
-
-
-@njit(parallel=True, cache=True)
-def _search_stop_many(data, starts, chain, price_col, target_high, target_low):
-    out = np.empty(len(starts), dtype=np.int8)
-    for q in prange(len(starts)):
-        out[q] = _search_stop(data, starts[q], chain, price_col, target_high[q], target_low[q])
-    return out
+    return _first_hit(data, CHAINS[freq], PRICE_COL, freq, start_idx, upper, lower)
 
 
 def load_dat(path, n_cols=len(DAT_COLS)):
@@ -193,7 +186,7 @@ class TickData:
     threads do not survive fork).
 
     Example:
-        from search_stop import TickData
+        from tick_data import TickData
 
         class Backtester:
             def __init__(self, path):
@@ -202,7 +195,7 @@ class TickData:
             def label(self, freq, tp, sl):
                 starts = self.ticks.bar_starts(freq)              # first tick of every `freq` bar (cached)
                 entry = self.ticks.price(starts)
-                return self.ticks.search_stop(entry + tp, entry - sl, freq, starts)  # 1 / -1 / 0 each
+                return self.ticks.first_hit(freq, starts, entry + tp, entry - sl)  # 1 / -1 / 0 each
 
         bt = Backtester('data/zarr/tick.dat')
         sides = bt.label('1', 1000, 500)                          # +10 / -5 pts on every 1-min bar
@@ -240,13 +233,13 @@ class TickData:
         """End row (exclusive) of the `freq` bar(s) starting at start_idx."""
         return self.data[start_idx, self._chains[freq][0, 0]]
 
-    def search_stop(self, target_high, target_low, freq, start_idx):
+    def first_hit(self, freq, start_idx, upper, lower):
         """
-        search_stop on these ticks (arguments and errors as the module-level search_stop).
-        Returns 1 if target_high is hit first, -1 if target_low is, 0 if neither is hit inside the bar;
+        first_hit on these ticks (arguments and errors as the module-level first_hit).
+        Returns 1 if upper is hit first, -1 if lower is, 0 if neither is hit inside the bar;
         an int for one entry, an int8 array for many.
         """
-        return _run(self.data, self._chains[freq], self.price_col, freq, target_high, target_low, start_idx)
+        return _first_hit(self.data, self._chains[freq], self.price_col, freq, start_idx, upper, lower)
 
     def __getstate__(self):
         state = self.__dict__.copy()
