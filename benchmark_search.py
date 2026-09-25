@@ -24,25 +24,20 @@ def brute_force_search(data: np.ndarray, start_idx: int, target_high: int, targe
 def main():
     # We'll use a memory-mapped NumPy array instead of loading 2.7GB into RAM at once.
     # To do this safely, we will extract the Zarr array directly to a binary memmap file.
-    import tempfile
     import os
 
-    console.print("[cyan]Converting Zarr to Memory-Mapped NumPy array (one-time setup)...[/cyan]")
-    memmap_path = 'data/zarr/tick_memmap.dat'
-
-    data_zarr = zarr.open('data/zarr/tick.zarr', mode='r')
-    num_ticks = data_zarr.shape[0]
-    num_cols = data_zarr.shape[1]
+    console.print("[cyan]Opening memory-mapped .dat array...[/cyan]")
+    memmap_path = 'data/zarr_test/tick.dat'
 
     if not os.path.exists(memmap_path):
-        # Create it by iterating in chunks so we don't blow up RAM
-        fp = np.memmap(memmap_path, dtype='i8', mode='w+', shape=(num_ticks, num_cols))
-        chunk_size = 10_000_000
-        for start in range(0, num_ticks, chunk_size):
-            end = min(start + chunk_size, num_ticks)
-            fp[start:end] = data_zarr[start:end]
-            console.print(f"  Converted {end:,} / {num_ticks:,} rows...")
-        fp.flush()
+        console.print(f"[red]Could not find test data at {memmap_path}[/red]")
+        return
+
+    num_cols = len(col_to_ind_dict)
+
+    # Calculate rows from file size
+    file_size = os.path.getsize(memmap_path)
+    num_ticks = file_size // (num_cols * 8) # 8 bytes per int64
 
     # Open the memmap in read-only mode
     data = np.memmap(memmap_path, dtype='i8', mode='r', shape=(num_ticks, num_cols))
