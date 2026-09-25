@@ -3,12 +3,16 @@ import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import datetime
+import multiprocessing
+import pickle
+from concurrent.futures import ProcessPoolExecutor
+
 import numpy as np
 import pandas as pd
 import pytest
 
 from to_dat import FREQS, DAT_COLS, process_session
-from search_stop import search_stop, load_dat, CHILD, PRICE_COL
+from search_stop import search_stop, load_dat, TickData, CHILD, PRICE_COL
 
 NEXT = {f: DAT_COLS.index(f'next_ind_{f}') for f in FREQS}
 HIGH = {f: DAT_COLS.index(f'high_{f}') for f in FREQS}
@@ -183,3 +187,70 @@ def test_zero_d_arrays_count_as_one_entry(data):
     p0 = data[i, PRICE_COL]
     side = search_stop(data, np.array(p0 + 2500), np.array(p0 - 2500), '5', np.array(i))
     assert type(side) is int and side == search_stop(data, int(p0) + 2500, int(p0) - 2500, '5', i)
+
+
+class Backtester:
+    """Stand-in for the class that owns a TickData."""
+
+    def __init__(self, ticks):
+        self.ticks = ticks
+
+    def label(self, freq, tp, sl):
+        starts = self.ticks.bar_starts(freq)
+        entry = self.ticks.price(starts)
+        return self.ticks.search_stop(entry + tp, entry - sl, freq, starts)
+
+
+def _label_in_worker(bt, freq):
+    return bt.label(freq, 1000, 500)
+
+
+@pytest.fixture(scope='module')
+def dat_file(data, tmp_path_factory):
+    path = tmp_path_factory.mktemp('dat') / 'tick.dat'
+    data.tofile(path)
+    return path
+
+
+def test_tickdata_matches_function(data):
+    ticks = TickData(data)
+    assert len(ticks) == len(data)
+    for freq in CHILD:
+        starts = ticks.bar_starts(freq)
+        assert np.array_equal(starts, np.flatnonzero(data[:, NEXT[freq]]))
+        assert ticks.bar_starts(freq) is starts  # cached
+        assert np.array_equal(ticks.bar_end(freq, starts), data[starts, NEXT[freq]])
+        entry = ticks.price(starts)
+        want = search_stop(data, entry + 1000, entry - 500, freq, starts)
+        assert np.array_equal(ticks.search_stop(entry + 1000, entry - 500, freq, starts), want)
+        assert ticks.search_stop(int(entry[0]) + 1000, int(entry[0]) - 500, freq, int(starts[0])) == want[0]
+
+
+def test_tickdata_rejects_child_tables_that_do_not_tile(data):
+    with pytest.raises(ValueError):
+        TickData(data, child={**CHILD, '15': '10'})
+    with pytest.raises(ValueError):
+        TickData(data, child={**CHILD, '5': '2'})
+
+
+def test_tickdata_pickles_by_path(data, dat_file):
+    ticks = TickData.load(dat_file)
+    ticks.bar_starts('1')
+    blob = pickle.dumps(Backtester(ticks))
+    assert len(blob) < 10_000 < data.nbytes  # the path, not the ticks
+    bt = pickle.loads(blob)
+    assert isinstance(bt.ticks.data, np.memmap)
+    assert np.array_equal(bt.label('1', 1000, 500), Backtester(TickData(data)).label('1', 1000, 500))
+
+
+def test_in_memory_tickdata_pickles_with_its_ticks(data):
+    ticks = pickle.loads(pickle.dumps(TickData(data)))
+    assert np.array_equal(ticks.data, data)
+
+
+def test_owner_class_works_in_worker_processes(dat_file):
+    bt = Backtester(TickData.load(dat_file))
+    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context('spawn')) as pool:
+        results = list(pool.map(_label_in_worker, [bt, bt], ['1', '15']))
+    assert np.array_equal(results[0], bt.label('1', 1000, 500))
+    assert np.array_equal(results[1], bt.label('15', 1000, 500))
