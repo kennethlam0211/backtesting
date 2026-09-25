@@ -14,7 +14,9 @@ FEATURES = ['fvg','std','atr','sma_rsi','sma','bbands','price_session']
 
 UNIT_TAS = ['std','atr','UD','sma_rsi','bbands','bband_targets']
 
-DATA_PATH = r'C:\Users\kennethlam\Desktop\small_projects\data_cleaning\IB_trading\IB_trading\users\LCW\RL_trading\dow\data'
+TICK_DATA_PATH = '~/Desktop/projects/backtesting/data/processed/tick.dat'
+
+DATA_PATH = '~/Desktop/projects/backtesting/data/processed'
 
 FREQS = ['1','15','60','720']
 
