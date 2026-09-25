@@ -13,7 +13,7 @@ import pandas as pd
 import pytest
 
 from to_dat import process_session
-from tick_data import first_hit, load_dat, TickData, CHILD, DAT_COLS, FREQS, PRICE_COL
+from tick_data import first_hit, first_hit_many, load_dat, TickData, CHILD, DAT_COLS, FREQS, PRICE_COL
 
 NEXT = {f: DAT_COLS.index(f'next_ind_{f}') for f in FREQS}
 HIGH = {f: DAT_COLS.index(f'high_{f}') for f in FREQS}
@@ -138,7 +138,7 @@ def test_arrays_match_single_calls(data, freq):
     p0 = data[starts, PRICE_COL]
     hi = p0 + rng.integers(0, 80, len(starts))
     lo = p0 - rng.integers(0, 80, len(starts))
-    sides = first_hit(data, freq, starts, hi, lo)
+    sides = first_hit_many(data, freq, starts, hi, lo)
     assert sides.dtype == np.int8
     assert sides.tolist() == [first_hit(data, freq, int(s), int(h), int(l)) for s, h, l in zip(starts, hi, lo)]
 
@@ -149,23 +149,23 @@ def test_one_entry_gives_int_and_scalars_broadcast(data):
     side = first_hit(data, '15', starts[0], np.int64(p0 + 100), p0 - 100)
     assert type(side) is int
     # the same two levels for every entry
-    sides = first_hit(data, '15', starts, p0 + 100, p0 - 100)
+    sides = first_hit_many(data, '15', starts, p0 + 100, p0 - 100)
     assert sides.tolist() == [first_hit(data, '15', int(s), p0 + 100, p0 - 100) for s in starts]
-    assert first_hit(data, '15', starts[:0], p0 + 100, p0 - 100).shape == (0,)
+    assert first_hit_many(data, '15', starts[:0], p0 + 100, p0 - 100).shape == (0,)
     with pytest.raises(ValueError):
-        first_hit(data, '15', starts[:3], np.array([p0, p0]), p0 - 100)  # lengths 2 and 3
+        first_hit_many(data, '15', starts[:3], np.array([p0, p0]), p0 - 100)  # lengths 2 and 3
 
 
 def test_arrays_reject_bad_starts_and_broken_summaries(data):
     starts = np.flatnonzero(data[:, NEXT['1']])[:500]
     p0 = data[starts, PRICE_COL]
     with pytest.raises(ValueError):
-        first_hit(data, '1', starts + 1, p0 + 100, p0 - 100)  # rows after a bar start
+        first_hit_many(data, '1', starts + 1, p0 + 100, p0 - 100)  # rows after a bar start
     bad = data.copy()
     i = starts[10]
     bad[i, HIGH['1']], bad[i, LOW['1']] = p0[10] + 4000, p0[10] - 4000
     with pytest.raises(ValueError):
-        first_hit(bad, '1', starts, p0 + 2000, p0 - 2000)
+        first_hit_many(bad, '1', starts, p0 + 2000, p0 - 2000)
 
 
 def test_load_dat_reads_to_dat_layout(data, tmp_path):
@@ -199,7 +199,7 @@ class Backtester:
     def label(self, freq, tp, sl):
         starts = self.ticks.bar_starts(freq)
         entry = self.ticks.price(starts)
-        return self.ticks.first_hit(freq, starts, entry + tp, entry - sl)
+        return self.ticks.first_hit_many(freq, starts, entry + tp, entry - sl)
 
 
 def _label_in_worker(bt, freq):
@@ -222,8 +222,8 @@ def test_tickdata_matches_function(data):
         assert ticks.bar_starts(freq) is starts  # cached
         assert np.array_equal(ticks.bar_end(freq, starts), data[starts, NEXT[freq]])
         entry = ticks.price(starts)
-        want = first_hit(data, freq, starts, entry + 40, entry - 20)
-        assert np.array_equal(ticks.first_hit(freq, starts, entry + 40, entry - 20), want)
+        want = first_hit_many(data, freq, starts, entry + 40, entry - 20)
+        assert np.array_equal(ticks.first_hit_many(freq, starts, entry + 40, entry - 20), want)
         assert ticks.first_hit(freq, int(starts[0]), int(entry[0]) + 40, int(entry[0]) - 20) == want[0]
 
 
@@ -264,18 +264,18 @@ def test_float_levels_are_exact(data):
     upper = p0 + rng.integers(0, 40, len(starts)) + rng.uniform(-0.96, 0.96, len(starts))
     lower = p0 - rng.integers(0, 40, len(starts)) + rng.uniform(-0.96, 0.96, len(starts))
     want = [tick_scan(data, s, data[s, NEXT['1']], u, l) for s, u, l in zip(starts, upper, lower)]
-    assert first_hit(data, '1', starts, upper, lower).tolist() == want
+    assert first_hit_many(data, '1', starts, upper, lower).tolist() == want
     assert first_hit(data, '1', int(starts[0]), float(upper[0]), float(lower[0])) == want[0]
 
 
 def test_inf_means_no_level_and_nan_raises(data):
     starts = np.flatnonzero(data[:, NEXT['60']])[:200]
     p0 = data[starts, PRICE_COL]
-    only_lower = first_hit(data, '60', starts, np.inf, p0 - 100)
+    only_lower = first_hit_many(data, '60', starts, np.inf, p0 - 100)
     assert set(only_lower.tolist()) <= {0, -1}
     assert only_lower.tolist() == [tick_scan(data, s, data[s, NEXT['60']], np.inf, l) for s, l in zip(starts, p0 - 100)]
     with pytest.raises(ValueError):
-        first_hit(data, '60', starts, np.where(np.arange(len(starts)) == 5, np.nan, p0 + 100.0), p0 - 100)
+        first_hit_many(data, '60', starts, np.where(np.arange(len(starts)) == 5, np.nan, p0 + 100.0), p0 - 100)
 
 
 def test_cut_or_negative_rows_raise_instead_of_reading_outside(data):
@@ -285,11 +285,11 @@ def test_cut_or_negative_rows_raise_instead_of_reading_outside(data):
     with pytest.raises(ValueError):
         first_hit(cut, 'day', int(day0), int(p0) + 10**7, int(p0) - 10**7)
     with pytest.raises(ValueError):
-        first_hit(cut, 'day', np.array([day0]), p0 + 10**7, p0 - 10**7)
+        first_hit_many(cut, 'day', np.array([day0]), p0 + 10**7, p0 - 10**7)
     with pytest.raises(ValueError):
         first_hit(data, '1', -1, int(p0) + 100, int(p0) - 100)
     with pytest.raises(ValueError):
-        first_hit(data, '1', np.array([-1, 0]), p0 + 100, p0 - 100)
+        first_hit_many(data, '1', np.array([-1, 0]), p0 + 100, p0 - 100)
 
 
 def test_bar_starts_cache_is_read_only(data):
@@ -329,3 +329,16 @@ def test_unpickle_refuses_a_changed_file(data, tmp_path):
     data[:10].tofile(path)  # to_dat.py wrote a new tick.dat
     with pytest.raises(ValueError):
         pickle.loads(blob)
+
+
+def test_each_function_rejects_the_other_kind_of_input(data):
+    starts = np.flatnonzero(data[:, NEXT['1']])[:5]
+    p0 = int(data[starts[0], PRICE_COL])
+    with pytest.raises(TypeError):
+        first_hit(data, '1', starts, p0 + 40, p0 - 20)             # many entries -> first_hit_many
+    with pytest.raises(TypeError):
+        first_hit(data, '1', int(starts[0]), np.array([p0 + 40]), p0 - 20)
+    with pytest.raises(TypeError):
+        first_hit_many(data, '1', int(starts[0]), p0 + 40, p0 - 20)  # one entry -> first_hit
+    sides = first_hit_many(data, '1', starts.tolist(), p0 + 40, p0 - 20)  # plain lists are fine
+    assert sides.dtype == np.int8 and sides.tolist() == [first_hit(data, '1', int(s), p0 + 40, p0 - 20) for s in starts]

@@ -47,7 +47,7 @@ BROKEN = 2
 
 
 @njit(cache=True)
-def _first_hit_one(data, ind, chain, price_col, upper, lower):
+def _kernel_one(data, ind, chain, price_col, upper, lower):
     n = data.shape[0]
     depth = chain.shape[0]
     ends = np.empty(depth, dtype=np.int64)  # ends[k]: end of the parent bar whose children level k scans
@@ -81,10 +81,10 @@ def _first_hit_one(data, ind, chain, price_col, upper, lower):
 
 
 @njit(parallel=True, cache=True)
-def _first_hit_many(data, starts, chain, price_col, upper, lower):
+def _kernel_many(data, starts, chain, price_col, upper, lower):
     out = np.empty(len(starts), dtype=np.int8)
     for q in prange(len(starts)):
-        out[q] = _first_hit_one(data, starts[q], chain, price_col, upper[q], lower[q])
+        out[q] = _kernel_one(data, starts[q], chain, price_col, upper[q], lower[q])
     return out
 
 
@@ -104,40 +104,46 @@ def _as_levels(upper, lower):
     return upper.astype(np.int64, copy=False), lower.astype(np.int64, copy=False)
 
 
-def _first_hit(data, chain, price_col, freq, start_idx, upper, lower):
-    n = data.shape[0]
-    if isinstance(start_idx, _INT) and isinstance(upper, _INT) and isinstance(lower, _INT):
-        start_idx = int(start_idx)
-        if not 0 <= start_idx < n or data[start_idx, chain[0, 0]] == 0:
-            raise ValueError(f"row {start_idx} is not the first tick of a {freq} bar")
-        side = int(_first_hit_one(data, start_idx, chain, price_col, int(upper), int(lower)))
-        if side == BROKEN:
-            raise ValueError(f"the {freq} bar at row {start_idx} is broken: its summary contradicts its ticks or points outside the data")
-        return side
+def _one(data, chain, price_col, freq, start_idx, upper, lower):
+    if not (isinstance(start_idx, _INT) and isinstance(upper, _INT) and isinstance(lower, _INT)):
+        if np.ndim(start_idx) or np.ndim(upper) or np.ndim(lower):
+            raise TypeError("first_hit takes one entry; use first_hit_many for arrays")
+        if np.asarray(start_idx).dtype.kind not in 'iu':
+            raise TypeError("start_idx must be an integer row number")
+        upper, lower = (int(x) for x in _as_levels(upper, lower))  # floats, 0-d arrays
+    start_idx = int(start_idx)
+    if not 0 <= start_idx < data.shape[0] or data[start_idx, chain[0, 0]] == 0:
+        raise ValueError(f"row {start_idx} is not the first tick of a {freq} bar")
+    side = int(_kernel_one(data, start_idx, chain, price_col, int(upper), int(lower)))
+    if side == BROKEN:
+        raise ValueError(f"the {freq} bar at row {start_idx} is broken: its summary contradicts its ticks or points outside the data")
+    return side
 
+
+def _many(data, chain, price_col, freq, start_idx, upper, lower):
     starts = np.asarray(start_idx)
+    if starts.ndim != 1:
+        raise TypeError("first_hit_many takes a 1-D array of start rows; use first_hit for one entry")
     if starts.size and starts.dtype.kind not in 'iu':
-        raise ValueError("start_idx must be integer row numbers")
+        raise TypeError("start_idx must be integer row numbers")
     starts = starts.astype(np.int64, copy=False)
     uppers, lowers = _as_levels(upper, lower)
     try:
         shape = np.broadcast_shapes(starts.shape, uppers.shape, lowers.shape)
     except ValueError:
-        raise ValueError("start_idx, upper and lower must broadcast to one 1-D shape") from None
-    if shape == ():  # 0-d arrays or float scalars: one entry
-        return _first_hit(data, chain, price_col, freq, int(starts), int(uppers), int(lowers))
-    if len(shape) != 1:
-        raise ValueError("start_idx, upper and lower must broadcast to one 1-D shape")
-    # Scalars are expanded into real arrays: the kernel gets contiguous memory, never broadcast views
+        shape = None
+    if shape != starts.shape:
+        raise ValueError("upper and lower must be single values or arrays as long as start_idx")
+    # Single levels are expanded into real arrays: the kernel gets contiguous memory, never broadcast views
     starts, uppers, lowers = (np.ascontiguousarray(a) if a.shape == shape else np.broadcast_to(a, shape).copy()
                               for a in (starts, uppers, lowers))
-    outside = (starts < 0) | (starts >= n)
+    outside = (starts < 0) | (starts >= data.shape[0])
     if outside.any():
         raise ValueError(f"{outside.sum()} start rows are outside the data, e.g. row {starts[outside][0]}")
     not_start = data[starts, chain[0, 0]] == 0
     if not_start.any():
         raise ValueError(f"{not_start.sum()} start rows are not the first tick of a {freq} bar, e.g. row {starts[not_start][0]}")
-    sides = _first_hit_many(data, starts, chain, price_col, uppers, lowers)
+    sides = _kernel_many(data, starts, chain, price_col, uppers, lowers)
     broken = sides == BROKEN
     if broken.any():
         raise ValueError(f"{broken.sum()} {freq} bars are broken (summary contradicts the ticks or points outside the data), e.g. row {starts[broken][0]}")
@@ -146,12 +152,9 @@ def _first_hit(data, chain, price_col, freq, start_idx, upper, lower):
 
 def first_hit(data, freq, start_idx, upper, lower):
     """
-    Which level each entry's `freq` bar touches first, looking only inside that bar.
-
-    Takes one entry or many: ints give an int back; 1-D arrays give an int8 array back, one value
-    per entry in input order. Scalars broadcast against arrays (e.g. one level for every entry).
-    Many entries run in one compiled call across all CPU cores (NUMBA_NUM_THREADS caps it).
-    For use from another class, TickData holds the loaded ticks and offers the same call.
+    Which level one entry's `freq` bar touches first, looking only inside that bar.
+    For many entries at once use first_hit_many; for use from another class, TickData holds the
+    loaded ticks and offers both calls.
 
     Same logic as search_org.search_stop: one level inside a bar decides it; both inside splits the bar
     into its CHILD bars, checked in time order; a 1s bar with both inside is walked tick by tick.
@@ -159,11 +162,10 @@ def first_hit(data, freq, start_idx, upper, lower):
     Args:
         data: the whole tick.dat as an int64 array (see load_dat). next_ind values are row numbers in
             the full file, so a slice must start at row 0 (a cut end is detected and raises).
-        freq: bar size to look inside, shared by all entries: 'day', '60', '30', '15', '10', '5',
-            '1', '15s' or '1s'.
-        start_idx: entry row(s); each must be the first tick of a `freq` bar.
-        upper: upper level(s) in ticks, price x4 (4000.25 -> 16001); hit when price >= upper.
-        lower: lower level(s) in ticks; hit when price <= lower.
+        freq: bar size to look inside: 'day', '60', '30', '15', '10', '5', '1', '15s' or '1s'.
+        start_idx: entry row; must be the first tick of a `freq` bar.
+        upper: upper level in ticks, price x4 (4000.25 -> 16001); hit when price >= upper.
+        lower: lower level in ticks; hit when price <= lower.
             Float levels are exact (upper is rounded up, lower down, to whole ticks);
             inf / -inf means no upper / lower level; NaN raises.
 
@@ -171,31 +173,68 @@ def first_hit(data, freq, start_idx, upper, lower):
          1  upper is hit first (a long's take-profit, a short's stop)
         -1  lower is hit first (a long's stop, a short's take-profit)
          0  neither is hit inside the bar (skip)
-        An int for one entry, an int8 array for many (cast with .astype(np.int64) before doing
-        arithmetic on it: int8 holds only -128..127).
 
     Raises:
-        ValueError: a start row is outside the data or not the first tick of a `freq` bar, a level
-            is NaN, the inputs do not broadcast to one 1-D shape, or a bar is broken (its summary
-            contradicts its ticks or points outside the data).
+        TypeError: an argument is an array (use first_hit_many).
+        ValueError: start_idx is outside the data or not the first tick of a `freq` bar, a level is
+            NaN, or the bar is broken (its summary contradicts its ticks or points outside the data).
 
     Example:
         import numpy as np
         from tick_data import first_hit, load_dat, DAT_COLS, PRICE_COL
 
         data = load_dat('data/zarr/tick.dat')
+        i = np.flatnonzero(data[:, DAT_COLS.index('next_ind_1')])[0]    # first tick of the first 1-min bar
+        entry = data[i, PRICE_COL]
+        side = first_hit(data, '1', i, entry + 40, entry - 20)         # +10 pts / -5 pts (40 / 20 ticks)
+        # side == 1: +10 came first; -1: -5 came first; 0: neither within that minute
+    """
+    return _one(data, CHAINS[freq], PRICE_COL, freq, start_idx, upper, lower)
+
+
+def first_hit_many(data, freq, start_idx, upper, lower):
+    """
+    first_hit for many entries at once, all on `freq` bars: entry q checks the bar starting at
+    start_idx[q] against upper[q] and lower[q], and the results equal calling first_hit per entry.
+    Runs in one compiled call across all CPU cores (NUMBA_NUM_THREADS caps it).
+
+    Args:
+        data: the whole tick.dat as an int64 array (see load_dat).
+        freq: bar size shared by all entries: 'day', '60', '30', '15', '10', '5', '1', '15s' or '1s'.
+        start_idx: 1-D array of entry rows, each the first tick of a `freq` bar.
+        upper, lower: arrays as long as start_idx, or single values used for every entry; in ticks,
+            same rules as first_hit (floats exact, inf = no level, NaN raises).
+
+    Returns:
+        int8 array with one value per entry, in input order: 1 upper first, -1 lower first, 0 neither
+        inside the bar. Cast with .astype(np.int64) before doing arithmetic on it (int8 holds only
+        -128..127); .tolist() gives a plain list.
+
+    Raises:
+        TypeError: start_idx is not a 1-D array (use first_hit for one entry).
+        ValueError: upper/lower do not match start_idx in length, a start row is outside the data or
+            not the first tick of a `freq` bar, a level is NaN, or a bar is broken.
+
+    Example:
+        import numpy as np
+        from tick_data import first_hit_many, load_dat, DAT_COLS, PRICE_COL
+
+        data = load_dat('data/zarr/tick.dat')
         starts = np.flatnonzero(data[:, DAT_COLS.index('next_ind_1')])  # first tick of every 1-min bar
         entry = data[starts, PRICE_COL]
-
-        # one entry: +10 pts / -5 pts (40 / 20 ticks) inside the first minute
-        side = first_hit(data, '1', starts[0], entry[0] + 40, entry[0] - 20)
-        # side == 1: +10 came first; -1: -5 came first; 0: neither within that minute
-
-        # every minute at once, same offsets from each entry price
-        sides = first_hit(data, '1', starts, entry + 40, entry - 20)
+        sides = first_hit_many(data, '1', starts, entry + 40, entry - 20)  # +10 / -5 pts each
         print((sides == 1).mean(), (sides == -1).mean(), (sides == 0).mean())  # share of each outcome
     """
-    return _first_hit(data, CHAINS[freq], PRICE_COL, freq, start_idx, upper, lower)
+    return _many(data, CHAINS[freq], PRICE_COL, freq, start_idx, upper, lower)
+
+
+def load_dat(path, n_cols=len(DAT_COLS)):
+    """Memory-map tick.dat read-only; n_cols is the column count to_dat.py wrote (len(DAT_COLS))."""
+    row_bytes = n_cols * 8
+    size = os.path.getsize(path)
+    if size % row_bytes:
+        raise ValueError(f"{path}: {size} bytes is not a whole number of {n_cols}-column rows")
+    return np.memmap(path, dtype=np.int64, mode='r', shape=(size // row_bytes, n_cols))
 
 
 def _whole_file(data, n_cols):
@@ -210,15 +249,6 @@ def _whole_file(data, n_cols):
 def _stamp(path):
     st = os.stat(path)
     return st.st_size, st.st_mtime_ns
-
-
-def load_dat(path, n_cols=len(DAT_COLS)):
-    """Memory-map tick.dat read-only; n_cols is the column count to_dat.py wrote (len(DAT_COLS))."""
-    row_bytes = n_cols * 8
-    size = os.path.getsize(path)
-    if size % row_bytes:
-        raise ValueError(f"{path}: {size} bytes is not a whole number of {n_cols}-column rows")
-    return np.memmap(path, dtype=np.int64, mode='r', shape=(size // row_bytes, n_cols))
 
 
 class TickData:
@@ -242,7 +272,7 @@ class TickData:
             def label(self, freq, tp, sl):
                 starts = self.ticks.bar_starts(freq)              # first tick of every `freq` bar (cached)
                 entry = self.ticks.price(starts)
-                return self.ticks.first_hit(freq, starts, entry + tp, entry - sl)  # 1 / -1 / 0 each
+                return self.ticks.first_hit_many(freq, starts, entry + tp, entry - sl)  # 1 / -1 / 0 each
 
         bt = Backtester('data/zarr/tick.dat')
         sides = bt.label('1', 40, 20)                             # +10 / -5 pts (ticks) on every 1-min bar
@@ -286,12 +316,12 @@ class TickData:
         return self.data[start_idx, self._chains[freq][0, 0]]
 
     def first_hit(self, freq, start_idx, upper, lower):
-        """
-        first_hit on these ticks (arguments and errors as the module-level first_hit).
-        Returns 1 if upper is hit first, -1 if lower is, 0 if neither is hit inside the bar;
-        an int for one entry, an int8 array for many.
-        """
-        return _first_hit(self.data, self._chains[freq], self.price_col, freq, start_idx, upper, lower)
+        """first_hit on these ticks: one entry -> 1 upper first, -1 lower first, 0 neither inside the bar."""
+        return _one(self.data, self._chains[freq], self.price_col, freq, start_idx, upper, lower)
+
+    def first_hit_many(self, freq, start_idx, upper, lower):
+        """first_hit_many on these ticks: many entries -> int8 array of 1 / -1 / 0, in input order."""
+        return _many(self.data, self._chains[freq], self.price_col, freq, start_idx, upper, lower)
 
     def __getstate__(self):
         state = self.__dict__.copy()

@@ -4,7 +4,7 @@ import sys
 import numpy as np
 from rich.console import Console
 
-from tick_data import first_hit, load_dat, PRICE_COL
+from tick_data import first_hit, first_hit_many, load_dat, PRICE_COL
 from benchmark_search import make_queries
 
 console = Console()
@@ -32,7 +32,7 @@ def main():
     data = load_dat(memmap_path)
     # The same queries benchmark_search.py runs, so a mismatch it reports can be replayed here
     starts, ends, uppers, lowers = make_queries(data, freq)
-    array_sides = first_hit(data, freq, starts, uppers, lowers)
+    array_sides = first_hit_many(data, freq, starts, uppers, lowers)
 
     for q, (idx, end_idx, tp, sl) in enumerate(zip(starts.tolist(), ends.tolist(), uppers.tolist(), lowers.tolist())):
         hit_idx, bf_side = brute_force_search(data, idx, end_idx, tp, sl)
@@ -51,7 +51,7 @@ def main():
             print(f"\nResults:")
             print(f"  Brute Force returned:         {bf_side} (tick {hit_idx})")
             print(f"  first_hit returned:           {single_side}")
-            print(f"  first_hit on arrays returned: {array_side}")
+            print(f"  first_hit_many returned:      {array_side}")
 
             last = min(end_idx, (hit_idx if hit_idx is not None else end_idx) + 2, idx + 200)
             print("\nData Subset (start_idx up to the first hit, at most 200 ticks):")
@@ -66,7 +66,7 @@ def main():
             print("="*50 + "\n")
             return
 
-    console.print(f"[green]No mismatch in {len(starts):,} queries on {freq} bars (single calls and arrays).[/green]")
+    console.print(f"[green]No mismatch in {len(starts):,} queries on {freq} bars (first_hit and first_hit_many).[/green]")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 from .params import CHILD, DAT_COLS, DAT_PATH, FREQS, PARQUET_FREQS
 
-_LAZY = ('PRICE_COL', 'TickData', 'first_hit', 'load_dat')
+_LAZY = ('PRICE_COL', 'TickData', 'first_hit', 'first_hit_many', 'load_dat')
 
 
 def __getattr__(name):

@@ -5,7 +5,7 @@ import time
 import numpy as np
 from rich.console import Console
 
-from tick_data import first_hit, load_dat, DAT_COLS, PRICE_COL
+from tick_data import first_hit, first_hit_many, load_dat, DAT_COLS, PRICE_COL
 
 console = Console()
 
@@ -61,7 +61,7 @@ def main():
 
     # Warm up Numba JIT (run once so compilation time isn't counted in the benchmark)
     first_hit(data, freq, int(start_indices[0]), int(uppers[0]), int(lowers[0]))
-    first_hit(data, freq, start_indices[:1], uppers[:1], lowers[:1])
+    first_hit_many(data, freq, start_indices[:1], uppers[:1], lowers[:1])
 
     console.print(f"\n[yellow]Running {NUM_QUERIES:,} first_hit calls, one entry each...[/yellow]")
     t0 = time.perf_counter()
@@ -69,11 +69,11 @@ def main():
     single_time = time.perf_counter() - t0
     console.print(f"first_hit took: [green]{single_time:.4f} seconds[/green] ({(single_time/NUM_QUERIES)*1000:.3f} ms per query)")
 
-    console.print(f"\n[yellow]Running {NUM_QUERIES:,} searches in one first_hit call on arrays...[/yellow]")
+    console.print(f"\n[yellow]Running {NUM_QUERIES:,} searches in one first_hit_many call...[/yellow]")
     t0 = time.perf_counter()
-    batch_results = first_hit(data, freq, start_indices, uppers, lowers).tolist()
+    batch_results = first_hit_many(data, freq, start_indices, uppers, lowers).tolist()
     batch_time = time.perf_counter() - t0
-    console.print(f"first_hit on arrays took: [green]{batch_time:.4f} seconds[/green] ({(batch_time/NUM_QUERIES)*1000:.4f} ms per query)")
+    console.print(f"first_hit_many took: [green]{batch_time:.4f} seconds[/green] ({(batch_time/NUM_QUERIES)*1000:.4f} ms per query)")
 
     # Verify correctness
     mismatches = sum(b != s or b != p for b, s, p in zip(bf_results, single_results, batch_results))
@@ -82,7 +82,7 @@ def main():
     else:
         console.print(f"\n[bold red]ERROR: {mismatches} results did not match! Run run_benchmark_mismatch.py {freq}[/bold red]")
 
-    console.print(f"\n[bold cyan]first_hit is {bf_time / single_time:.1f}x (one entry per call) and {bf_time / batch_time:.1f}x (arrays) FASTER than Brute Force![/bold cyan]")
+    console.print(f"\n[bold cyan]first_hit is {bf_time / single_time:.1f}x and first_hit_many {bf_time / batch_time:.1f}x FASTER than Brute Force![/bold cyan]")
 
 
 if __name__ == "__main__":
