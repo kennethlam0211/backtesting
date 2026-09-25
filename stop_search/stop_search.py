@@ -3,7 +3,7 @@ import os
 import numpy as np
 from numba import njit, prange
 
-from .params import CHILD, DAT_COLS
+from .params import CHILD, DAT_COLS, DAT_PATH
 
 
 def _seconds(freq):
@@ -33,6 +33,13 @@ def _chains(cols, child):
             f = child[f]
         chains[freq] = np.array(rows, dtype=np.int64)
     return chains
+
+
+def _chain_for(chains, freq):
+    try:
+        return chains[freq]
+    except (KeyError, TypeError):
+        raise ValueError(f"unknown bar size {freq!r}; use one of {', '.join(repr(f) for f in chains)}") from None
 
 
 _check_child(CHILD)
@@ -156,7 +163,7 @@ def first_hit(data, freq, start_idx, upper, lower):
     For many entries at once use first_hit_many; for use from another class, StopSearch holds the
     loaded ticks and offers both calls.
 
-    Same logic as search_org.search_stop: one level inside a bar decides it; both inside splits the bar
+    Same logic as reference/search_org.py (search_stop): one level inside a bar decides it; both inside splits the bar
     into its CHILD bars, checked in time order; a 1s bar with both inside is walked tick by tick.
 
     Args:
@@ -189,7 +196,7 @@ def first_hit(data, freq, start_idx, upper, lower):
         side = first_hit(data, '1', i, entry + 40, entry - 20)         # +10 pts / -5 pts (40 / 20 ticks)
         # side == 1: +10 came first; -1: -5 came first; 0: neither within that minute
     """
-    return _one(data, CHAINS[freq], PRICE_COL, freq, start_idx, upper, lower)
+    return _one(data, _chain_for(CHAINS, freq), PRICE_COL, freq, start_idx, upper, lower)
 
 
 def first_hit_many(data, freq, start_idx, upper, lower):
@@ -230,7 +237,7 @@ def first_hit_many(data, freq, start_idx, upper, lower):
         sides = first_hit_many(data, '1', starts, entry + 40, entry - 20)  # +10 / -5 pts each
         print((sides == 1).mean(), (sides == -1).mean(), (sides == 0).mean())  # share of each outcome
     """
-    return _many(data, CHAINS[freq], PRICE_COL, freq, start_idx, upper, lower)
+    return _many(data, _chain_for(CHAINS, freq), PRICE_COL, freq, start_idx, upper, lower)
 
 
 def load_dat(path, n_cols=len(DAT_COLS)):
@@ -261,7 +268,7 @@ class StopSearch:
     Stop search over tick.dat: which level, upper or lower, an entry's bar touches first.
     Load it once and keep it on the class that uses it (backtester, RL env).
 
-        stops = StopSearch.load('data/zarr/tick.dat')
+        stops = StopSearch.load()        # params.DAT_PATH (data/zarr/tick.dat), or pass a path
 
         stops.first_hit(freq, start_idx, upper, lower)       one entry    -> 1, -1 or 0
         stops.first_hit_many(freq, starts, uppers, lowers)   many entries -> int8 array of 1 / -1 / 0
@@ -310,8 +317,8 @@ class StopSearch:
         self._starts = {}
 
     @classmethod
-    def load(cls, path, cols=DAT_COLS, child=CHILD):
-        """Memory-map the tick.dat at `path` (see load_dat)."""
+    def load(cls, path=DAT_PATH, cols=DAT_COLS, child=CHILD):
+        """Memory-map the tick.dat at `path`, by default params.DAT_PATH (see load_dat)."""
         return cls(load_dat(path, len(cols)), path=path, cols=cols, child=child)
 
     def __len__(self):
@@ -324,14 +331,14 @@ class StopSearch:
     def bar_starts(self, freq):
         """Rows that start a `freq` bar, ascending, read-only. The column is scanned once, then cached."""
         if freq not in self._starts:
-            starts = np.flatnonzero(self.data[:, self._chains[freq][0, 0]])
+            starts = np.flatnonzero(self.data[:, _chain_for(self._chains, freq)[0, 0]])
             starts.setflags(write=False)  # shared cache: callers must copy before changing it
             self._starts[freq] = starts
         return self._starts[freq]
 
     def bar_end(self, freq, start_idx):
         """End row (exclusive) of the `freq` bar(s) starting at start_idx."""
-        return self.data[start_idx, self._chains[freq][0, 0]]
+        return self.data[start_idx, _chain_for(self._chains, freq)[0, 0]]
 
     def first_hit(self, freq, start_idx, upper, lower):
         """
@@ -358,7 +365,7 @@ class StopSearch:
             entry = stops.price(i)
             side = stops.first_hit('1', i, entry + 40, entry - 20)      # +10 / -5 pts -> 1, -1 or 0
         """
-        return _one(self.data, self._chains[freq], self.price_col, freq, start_idx, upper, lower)
+        return _one(self.data, _chain_for(self._chains, freq), self.price_col, freq, start_idx, upper, lower)
 
     def first_hit_many(self, freq, start_idx, upper, lower):
         """
@@ -391,7 +398,7 @@ class StopSearch:
             entry = stops.price(starts)
             sides = stops.first_hit_many('1', starts, entry + 40, entry - 20)   # +10 / -5 pts each
         """
-        return _many(self.data, self._chains[freq], self.price_col, freq, start_idx, upper, lower)
+        return _many(self.data, _chain_for(self._chains, freq), self.price_col, freq, start_idx, upper, lower)
 
     def __getstate__(self):
         state = self.__dict__.copy()

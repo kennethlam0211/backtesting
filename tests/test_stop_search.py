@@ -340,3 +340,25 @@ def test_each_function_rejects_the_other_kind_of_input(data):
         first_hit_many(data, '1', int(starts[0]), p0 + 40, p0 - 20)  # one entry -> first_hit
     sides = first_hit_many(data, '1', starts.tolist(), p0 + 40, p0 - 20)  # plain lists are fine
     assert sides.dtype == np.int8 and sides.tolist() == [first_hit(data, '1', int(s), p0 + 40, p0 - 20) for s in starts]
+
+
+def test_unknown_bar_size_raises_a_clear_error(data):
+    stops = StopSearch(data)
+    i = int(np.flatnonzero(data[:, NEXT['15']])[0])
+    p0 = int(data[i, PRICE_COL])
+    for bad in (15, '2', None):
+        for call in (lambda: first_hit(data, bad, i, p0 + 40, p0 - 20),
+                     lambda: first_hit_many(data, bad, [i], p0 + 40, p0 - 20),
+                     lambda: stops.first_hit(bad, i, p0 + 40, p0 - 20),
+                     lambda: stops.bar_starts(bad)):
+            with pytest.raises(ValueError, match="unknown bar size"):
+                call()
+
+
+def test_load_defaults_to_params_dat_path(data, tmp_path, monkeypatch):
+    from stop_search import DAT_PATH
+    monkeypatch.chdir(tmp_path)
+    os.makedirs(os.path.dirname(DAT_PATH))
+    data.tofile(DAT_PATH)
+    stops = StopSearch.load()
+    assert stops.path == os.path.abspath(DAT_PATH) and stops.data.shape == data.shape

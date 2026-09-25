@@ -13,5 +13,6 @@ DAT_COLS = ['start_ind', 'ts', 'price'] + [c for f in FREQS for c in (f'high_{f}
 CHILD = {'day': '60', '60': '30', '30': '10', '10': '5', '15': '5',
          '5': '1', '1': '15s', '15s': '5s', '5s': '1s', '1s': None}
 
-# Where pipeline/to_dat.py writes tick.dat by default
+# tick.dat that StopSearch.load() opens when no path is given (pipeline/to_dat.py writes it there
+# with its default --out ./data/zarr)
 DAT_PATH = 'data/zarr/tick.dat'
