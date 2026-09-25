@@ -3,3 +3,9 @@ raw_data/
 .venv/
 __pycache__/
 .claude/*.lock
+
+# Credentials and secrets
+credentials/
+*.env
+*.pem
+*.key
