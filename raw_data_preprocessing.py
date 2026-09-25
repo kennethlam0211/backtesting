@@ -125,13 +125,14 @@ def apply_news_flags(out, session_date):
         out[flag_col] = out[flag_col].astype('int8')
 
 def to_ticks(table, session_date, pdt_code):
-    """One raw single-contract session -> merged ticks with columns ts, price, volume, pdt_code.
+    """One raw single-contract session -> merged ticks with columns ts, price, volume, rth, session,
+    hour and the five news flags.
 
     ts = ts_event (UTC) as New York wall clock + 6h, tz-naive, floored to the second after the
-    merge. Rows with the same ts (ns) and
-    price are merged, summing size into volume, in first-appearance order. Identical raw rows
-    are separate fills, so summing (never dropping) keeps the volume exact. pdt_code is the
-    session's contract, e.g. ESM4.
+    merge. price is in 0.25-point ticks (x4). Rows with the same ts (ns) and price are merged,
+    summing size into volume, in first-appearance order. Identical raw rows are separate fills,
+    so summing (never dropping) keeps the volume exact. pdt_code is the session's contract,
+    e.g. ESM4; the caller has already checked it, and it is not written.
     """
     df = table.select(['ts_event', 'price', 'size']).to_pandas()
     # Wall clock first (handles daylight saving), then add the shift as plain clock arithmetic
@@ -162,7 +163,7 @@ def to_ticks(table, session_date, pdt_code):
     # Add hour column directly from the shifted ts
     out['hour'] = out['ts'].dt.hour.astype('int8')
 
-    # Floor to seconds and store as integer Unix timestamps directly to avoid datetime overhead in step 2
+    # Floor to whole seconds, kept as a timestamp (step 2 turns it into integer seconds for tick.dat)
     out['ts'] = out['ts'].dt.floor('s').astype('datetime64[s]')
 
     # Add news flags
