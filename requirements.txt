@@ -17,3 +17,13 @@ typing-extensions==4.16.0
 zarr==3.4.0
 numba==0.67.0
 llvmlite==0.49.0
+polars==1.44.2
+pytest==9.1.1
+
+# utils/ (logging to Mongo, Telegram, ZeroMQ); versions not pinned yet
+pymongo
+python-telegram-bot
+pyzmq
+requests
+psutil
+ratelimit

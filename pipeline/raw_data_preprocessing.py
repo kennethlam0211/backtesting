@@ -20,8 +20,8 @@ SHIFT = pd.Timedelta(hours=6)
 # NEW contract for that gap [18:00 ET, 00:00 UTC), bought as ES.c.1.
 BLOCK_DIR = Path("raw_data/roll_open_blocks")
 
-# Reference data (news calendar, contract codes) lives in config/
-CONFIG_DIR = Path(__file__).parent / "config"
+# Reference data (news calendar, contract codes) lives in config/ at the repo root
+CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
 
 # instrument_id -> contract code (ESH0 .. ESZ6). Databento numbers can be reused over the years,
 # so a match needs both the number and the session date range.

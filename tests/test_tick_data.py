@@ -1,7 +1,5 @@
-import sys
 import os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
+import sys
 import datetime
 import multiprocessing
 import subprocess
@@ -12,7 +10,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from to_dat import process_session
+from pipeline.to_dat import process_session
 from tick_data import first_hit, first_hit_many, load_dat, TickData, CHILD, DAT_COLS, FREQS, PRICE_COL
 
 NEXT = {f: DAT_COLS.index(f'next_ind_{f}') for f in FREQS}

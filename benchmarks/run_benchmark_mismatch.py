@@ -5,7 +5,7 @@ import numpy as np
 from rich.console import Console
 
 from tick_data import first_hit, first_hit_many, load_dat, PRICE_COL
-from tests.benchmark_search import make_queries
+from benchmarks.benchmark_search import make_queries
 
 console = Console()
 

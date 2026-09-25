@@ -1,0 +1,4 @@
+[tool.pytest.ini_options]
+# Tests import the packages (tick_data, pipeline, ...) from the repo root without sys.path changes
+pythonpath = ["."]
+testpaths = ["tests"]
