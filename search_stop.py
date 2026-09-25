@@ -36,6 +36,8 @@ def _chain(freq):
 
 CHAINS = {f: _chain(f) for f in CHILD}
 
+_INT = (int, np.integer)
+
 # Kernel result when the bar summaries contradict the ticks. Returned rather than raised:
 # an exception inside a prange loop is dropped silently.
 BROKEN = 2
@@ -76,50 +78,85 @@ def _search_stop(data, ind, chain, price_col, target_high, target_low):
 
 def search_stop(data, target_high, target_low, freq, start_idx):
     """
-    Which level the `freq` bar starting at start_idx touches first, looking only inside that bar.
-    Returns 1 if target_high (price >= target_high) comes first, -1 if target_low (price <= target_low)
-    does, 0 if neither is touched (skip).
+    Which level each entry's `freq` bar touches first, looking only inside that bar.
 
-    data is tick.dat as an int64 array (see load_dat); start_idx must be the bar's first tick.
+    Takes one entry or many: ints give an int back; 1-D arrays give an int8 array back, one value
+    per entry in input order. Scalars broadcast against arrays (e.g. one level for every entry).
+    Many entries run in one compiled call across all CPU cores (NUMBA_NUM_THREADS caps it).
+
     Same logic as search_org.search_stop: one level inside a bar decides it; both inside splits the bar
     into its CHILD bars, checked in time order; a 1s bar with both inside is walked tick by tick.
+
+    Args:
+        data: tick.dat as an int64 array (see load_dat).
+        target_high: upper level(s), price x100 (4000.25 -> 400025); hit when price >= target_high.
+        target_low: lower level(s), price x100; hit when price <= target_low.
+        freq: bar size to look inside, shared by all entries: 'day', '60', '30', '15', '10', '5',
+            '1', '15s' or '1s'.
+        start_idx: entry row(s); each must be the first tick of a `freq` bar.
+
+    Returns:
+         1  target_high is hit first (a long's take-profit, a short's stop)
+        -1  target_low is hit first (a long's stop, a short's take-profit)
+         0  neither is hit inside the bar (skip)
+        An int for one entry, an int8 array for many.
+
+    Raises:
+        ValueError: a start row is not the first tick of a `freq` bar, the inputs do not broadcast
+            to one 1-D shape, or the bar summaries contradict the ticks.
+
+    Example:
+        import numpy as np
+        from search_stop import search_stop, load_dat, PRICE_COL
+        from to_dat import DAT_COLS
+
+        data = load_dat('data/zarr/tick.dat')
+        starts = np.flatnonzero(data[:, DAT_COLS.index('next_ind_1')])  # first tick of every 1-min bar
+        entry = data[starts, PRICE_COL]
+
+        # one entry: +10 pts / -5 pts inside the first minute
+        side = search_stop(data, entry[0] + 1000, entry[0] - 500, '1', starts[0])
+        # side == 1: +10 came first; -1: -5 came first; 0: neither within that minute
+
+        # every minute at once, same offsets from each entry price
+        sides = search_stop(data, entry + 1000, entry - 500, '1', starts)
+        print((sides == 1).mean(), (sides == -1).mean(), (sides == 0).mean())  # share of each outcome
     """
     chain = CHAINS[freq]
-    if data[start_idx, chain[0, 0]] == 0:
-        raise ValueError(f"row {start_idx} is not the first tick of a {freq} bar")
-    side = int(_search_stop(data, start_idx, chain, PRICE_COL, target_high, target_low))
-    if side == BROKEN:
-        raise ValueError(f"bar summaries of the {freq} bar at row {start_idx} contradict its ticks")
-    return side
+    if isinstance(start_idx, _INT) and isinstance(target_high, _INT) and isinstance(target_low, _INT):
+        start_idx = int(start_idx)
+        if data[start_idx, chain[0, 0]] == 0:
+            raise ValueError(f"row {start_idx} is not the first tick of a {freq} bar")
+        side = int(_search_stop(data, start_idx, chain, PRICE_COL, int(target_high), int(target_low)))
+        if side == BROKEN:
+            raise ValueError(f"bar summaries of the {freq} bar at row {start_idx} contradict its ticks")
+        return side
+
+    try:
+        starts, highs, lows = np.broadcast_arrays(*(np.asarray(a, dtype=np.int64) for a in (start_idx, target_high, target_low)))
+    except ValueError:
+        raise ValueError("start_idx, target_high and target_low must broadcast to one 1-D shape") from None
+    if starts.ndim == 0:  # 0-d arrays: one entry
+        return search_stop(data, int(highs), int(lows), freq, int(starts))
+    if starts.ndim != 1:
+        raise ValueError("start_idx, target_high and target_low must broadcast to one 1-D shape")
+    starts, highs, lows = (np.ascontiguousarray(a) for a in (starts, highs, lows))
+    not_start = data[starts, chain[0, 0]] == 0
+    if not_start.any():
+        raise ValueError(f"{not_start.sum()} start rows are not the first tick of a {freq} bar, e.g. row {starts[not_start][0]}")
+    sides = _search_stop_many(data, starts, chain, PRICE_COL, highs, lows)
+    broken = sides == BROKEN
+    if broken.any():
+        raise ValueError(f"bar summaries contradict the ticks for {broken.sum()} entries, e.g. the {freq} bar at row {starts[broken][0]}")
+    return sides
 
 
 @njit(parallel=True, cache=True)
-def _search_stop_batch(data, starts, chain, price_col, target_high, target_low):
+def _search_stop_many(data, starts, chain, price_col, target_high, target_low):
     out = np.empty(len(starts), dtype=np.int8)
     for q in prange(len(starts)):
         out[q] = _search_stop(data, starts[q], chain, price_col, target_high[q], target_low[q])
     return out
-
-
-def search_stop_batch(data, target_high, target_low, freq, start_idx):
-    """
-    search_stop for many entries at once: equal-length arrays of levels and start rows, all on `freq`
-    bars. Runs in one compiled call across all cores (NUMBA_NUM_THREADS caps it); returns int8 sides.
-    """
-    start_idx = np.asarray(start_idx, dtype=np.int64)
-    target_high = np.asarray(target_high, dtype=np.int64)
-    target_low = np.asarray(target_low, dtype=np.int64)
-    if not (start_idx.ndim == 1 and start_idx.shape == target_high.shape == target_low.shape):
-        raise ValueError("start_idx, target_high and target_low must be 1-D arrays of equal length")
-    chain = CHAINS[freq]
-    not_start = data[start_idx, chain[0, 0]] == 0
-    if not_start.any():
-        raise ValueError(f"{not_start.sum()} start rows are not the first tick of a {freq} bar, e.g. row {start_idx[not_start][0]}")
-    sides = _search_stop_batch(data, start_idx, chain, PRICE_COL, target_high, target_low)
-    broken = sides == BROKEN
-    if broken.any():
-        raise ValueError(f"bar summaries contradict the ticks for {broken.sum()} entries, e.g. the {freq} bar at row {start_idx[broken][0]}")
-    return sides
 
 
 def load_dat(path):

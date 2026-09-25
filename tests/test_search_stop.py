@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 from to_dat import FREQS, DAT_COLS, process_session
-from search_stop import search_stop, search_stop_batch, load_dat, CHILD, PRICE_COL
+from search_stop import search_stop, load_dat, CHILD, PRICE_COL
 
 NEXT = {f: DAT_COLS.index(f'next_ind_{f}') for f in FREQS}
 HIGH = {f: DAT_COLS.index(f'high_{f}') for f in FREQS}
@@ -127,26 +127,40 @@ def test_inconsistent_summaries_raise(data):
 
 
 @pytest.mark.parametrize('freq', list(CHILD))
-def test_batch_matches_single_calls(data, freq):
+def test_arrays_match_single_calls(data, freq):
     rng = np.random.default_rng(2)
     starts = rng.choice(np.flatnonzero(data[:, NEXT[freq]]), size=2000)
     p0 = data[starts, PRICE_COL]
     hi = p0 + 25 * rng.integers(0, 80, len(starts))
     lo = p0 - 25 * rng.integers(0, 80, len(starts))
-    sides = search_stop_batch(data, hi, lo, freq, starts)
+    sides = search_stop(data, hi, lo, freq, starts)
+    assert sides.dtype == np.int8
     assert sides.tolist() == [search_stop(data, int(h), int(l), freq, int(s)) for s, h, l in zip(starts, hi, lo)]
 
 
-def test_batch_rejects_bad_starts_and_broken_summaries(data):
+def test_one_entry_gives_int_and_scalars_broadcast(data):
+    starts = np.flatnonzero(data[:, NEXT['15']])[:300]
+    p0 = int(data[starts[0], PRICE_COL])
+    side = search_stop(data, np.int64(p0 + 2500), p0 - 2500, '15', starts[0])
+    assert type(side) is int
+    # the same two levels for every entry
+    sides = search_stop(data, p0 + 2500, p0 - 2500, '15', starts)
+    assert sides.tolist() == [search_stop(data, p0 + 2500, p0 - 2500, '15', int(s)) for s in starts]
+    assert search_stop(data, p0 + 2500, p0 - 2500, '15', starts[:0]).shape == (0,)
+    with pytest.raises(ValueError):
+        search_stop(data, np.array([p0, p0]), p0 - 2500, '15', starts[:3])  # lengths 2 and 3
+
+
+def test_arrays_reject_bad_starts_and_broken_summaries(data):
     starts = np.flatnonzero(data[:, NEXT['1']])[:500]
     p0 = data[starts, PRICE_COL]
     with pytest.raises(ValueError):
-        search_stop_batch(data, p0 + 2500, p0 - 2500, '1', starts + 1)  # rows after a bar start
+        search_stop(data, p0 + 2500, p0 - 2500, '1', starts + 1)  # rows after a bar start
     bad = data.copy()
     i = starts[10]
     bad[i, HIGH['1']], bad[i, LOW['1']] = p0[10] + 100_000, p0[10] - 100_000
     with pytest.raises(ValueError):
-        search_stop_batch(bad, p0 + 50_000, p0 - 50_000, '1', starts)
+        search_stop(bad, p0 + 50_000, p0 - 50_000, '1', starts)
 
 
 def test_load_dat_reads_to_dat_layout(data, tmp_path):
@@ -162,3 +176,10 @@ def test_load_dat_reads_to_dat_layout(data, tmp_path):
         f.write(b'\0' * 8)
     with pytest.raises(ValueError):
         load_dat(path)
+
+
+def test_zero_d_arrays_count_as_one_entry(data):
+    i = int(np.flatnonzero(data[:, NEXT['5']])[7])
+    p0 = data[i, PRICE_COL]
+    side = search_stop(data, np.array(p0 + 2500), np.array(p0 - 2500), '5', np.array(i))
+    assert type(side) is int and side == search_stop(data, int(p0) + 2500, int(p0) - 2500, '5', i)
