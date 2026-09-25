@@ -188,9 +188,9 @@ def first_hit(data, freq, start_idx, upper, lower):
 
     Example:
         import numpy as np
-        from stop_search import first_hit, load_dat, DAT_COLS, PRICE_COL
+        from stop_search import first_hit, load_dat, DAT_COLS, DAT_PATH, PRICE_COL
 
-        data = load_dat('data/dat/tick.dat')
+        data = load_dat(DAT_PATH)                                       # to_dat.py's default output
         i = np.flatnonzero(data[:, DAT_COLS.index('next_ind_1')])[0]    # first tick of the first 1-min bar
         entry = data[i, PRICE_COL]
         side = first_hit(data, '1', i, entry + 40, entry - 20)         # +10 pts / -5 pts (40 / 20 ticks)
@@ -229,9 +229,9 @@ def first_hit_many(data, freq, start_idx, upper, lower):
 
     Example:
         import numpy as np
-        from stop_search import first_hit_many, load_dat, DAT_COLS, PRICE_COL
+        from stop_search import first_hit_many, load_dat, DAT_COLS, DAT_PATH, PRICE_COL
 
-        data = load_dat('data/dat/tick.dat')
+        data = load_dat(DAT_PATH)                                       # to_dat.py's default output
         starts = np.flatnonzero(data[:, DAT_COLS.index('next_ind_1')])  # first tick of every 1-min bar
         entry = data[starts, PRICE_COL]
         sides = first_hit_many(data, '1', starts, entry + 40, entry - 20)  # +10 / -5 pts each
@@ -268,7 +268,7 @@ class StopSearch:
     Stop search over tick.dat: which level, upper or lower, an entry's bar touches first.
     Load it once and keep it on the class that uses it (backtester, RL env).
 
-        stops = StopSearch.load()        # params.DAT_PATH (data/dat/tick.dat), or pass a path
+        stops = StopSearch.load()        # params.DAT_PATH (to_dat.py's default output), or pass a path
 
         stops.first_hit(freq, start_idx, upper, lower)       one entry    -> 1, -1 or 0
         stops.first_hit_many(freq, starts, uppers, lowers)   many entries -> int8 array of 1 / -1 / 0
@@ -288,7 +288,7 @@ class StopSearch:
     'forkserver' method (numba's OpenMP threads do not survive fork).
 
     Example:
-        from stop_search import StopSearch
+        from stop_search import StopSearch, DAT_PATH
 
         class Backtester:
             def __init__(self, path):
@@ -299,7 +299,7 @@ class StopSearch:
                 entry = self.stops.price(starts)
                 return self.stops.first_hit_many(freq, starts, entry + tp, entry - sl)  # 1 / -1 / 0 each
 
-        bt = Backtester('data/dat/tick.dat')
+        bt = Backtester(DAT_PATH)
         sides = bt.label('1', 40, 20)                               # +10 / -5 pts on every 1-min bar
     """
 
@@ -360,7 +360,7 @@ class StopSearch:
                 is NaN, or the bar is broken.
 
         Example:
-            stops = StopSearch.load('data/dat/tick.dat')
+            stops = StopSearch.load()
             i = stops.bar_starts('1')[0]                                 # an entry row
             entry = stops.price(i)
             side = stops.first_hit('1', i, entry + 40, entry - 20)      # +10 / -5 pts -> 1, -1 or 0
@@ -393,7 +393,7 @@ class StopSearch:
                 tick of a `freq` bar or is outside the data, a level is NaN, or a bar is broken.
 
         Example:
-            stops = StopSearch.load('data/dat/tick.dat')
+            stops = StopSearch.load()
             starts = stops.bar_starts('1')                               # every 1-min bar
             entry = stops.price(starts)
             sides = stops.first_hit_many('1', starts, entry + 40, entry - 20)   # +10 / -5 pts each

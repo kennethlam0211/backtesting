@@ -4,6 +4,7 @@ import datetime
 import multiprocessing
 import subprocess
 import pickle
+import re
 from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
@@ -362,3 +363,17 @@ def test_load_defaults_to_params_dat_path(data, tmp_path, monkeypatch):
     data.tofile(DAT_PATH)
     stops = StopSearch.load()
     assert stops.path == os.path.abspath(DAT_PATH) and stops.data.shape == data.shape
+
+
+def _default(script, option):
+    """An argparse default from a pipeline script, read from its source."""
+    src = open(os.path.join(os.path.dirname(__file__), '..', 'pipeline', script)).read()
+    return re.search(rf'"{option}".*?default="([^"]+)"', src).group(1)
+
+
+def test_default_paths_agree_with_to_dat():
+    # to_dat.py keeps its own output path; StopSearch.load() and step 3 must follow it
+    from stop_search import DAT_PATH
+    out = _default('to_dat.py', '--out')
+    assert os.path.normpath(os.path.join(out, 'tick.dat')) == os.path.normpath(DAT_PATH), "update DAT_PATH in stop_search/params.py"
+    assert os.path.normpath(_default('data_preprocessing.py', '--data-dir')) == os.path.normpath(out), "update --data-dir in data_preprocessing.py"
