@@ -80,7 +80,7 @@ def main():
     if mismatches == 0:
         console.print("\n[bold green]SUCCESS: All three returned identical results 100% of the time![/bold green]")
     else:
-        console.print(f"\n[bold red]ERROR: {mismatches} results did not match! Run run_benchmark_mismatch.py {freq}[/bold red]")
+        console.print(f"\n[bold red]ERROR: {mismatches} results did not match! Run: python -m tests.run_benchmark_mismatch {freq}[/bold red]")
 
     console.print(f"\n[bold cyan]first_hit is {bf_time / single_time:.1f}x and first_hit_many {bf_time / batch_time:.1f}x FASTER than Brute Force![/bold cyan]")
 
