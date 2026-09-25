@@ -38,7 +38,7 @@ Every other raw column (`ts_recv`, `instrument_id`, `side`, `sequence`, …) is 
 |---|---|
 | `raw_data/ES_c_0_trades_<date>.parquet`, `raw_data/ES_v_0_trades_<date>.parquet` | The sessions. The prefix only records which request fetched the day; each date exists once |
 | `raw_data/roll_open_blocks/ES_c_1_open_block_<date>.parquet` | New contract's ticks for the opening hours of the 27 roll days |
-| `params/pdt_codes.csv` | `instrument_id` + date range → contract code |
+| `raw_data/pdt_codes.csv` | `instrument_id` + date range → contract code |
 | `params/news_events.yaml` | News release dates and times (see *News flags*); a missing file stops the run |
 
 Only top-level `raw_data/ES_*_trades_*.parquet` files are read, minus `*_partial.parquet`; so
@@ -53,7 +53,7 @@ Only top-level `raw_data/ES_*_trades_*.parquet` files are read, minus `*_partial
 2. **Schema check** — every file must have the first file's columns and types.
 3. **Roll-day splice** (still in UTC) — see *Roll days*. Keeps only the new contract.
 4. **One contract** — the session must now hold exactly one `instrument_id`.
-5. **Contract code** — look up `pdt_code` in `params/pdt_codes.csv` by number **and** date.
+5. **Contract code** — look up `pdt_code` in `raw_data/pdt_codes.csv` by number **and** date.
 6. **Clock** — `ts_event` (UTC) → New York wall clock → **+6h** → tz-naive `ts`.
    Check: every tick is inside its file's session, `[date 00:00, date 23:00)`.
 7. **Price to ticks** — `price x 4` as int32 (ES moves in 0.25-point ticks, so this is exact).
@@ -111,7 +111,7 @@ rows, is the same contract, and price moves at most 1 tick across the seam.
 - **`ts_event`, not `ts_recv`.** Exchange match time is "when it happened"; `ts_recv` is dropped.
 - **Contract code by number + date.** Databento `instrument_id`s are just numbers and can be reused.
 
-## Contracts (`params/pdt_codes.csv`)
+## Contracts (`raw_data/pdt_codes.csv`)
 
 28 contracts, `ESH0` → `ESZ6`. Built from the roll sequence (quarterly H/M/U/Z, starting from `ESH0` on
 2020-01-02) and checked: every contract's last session is 3 or 7 days before its expiry (third Friday).
@@ -155,7 +155,7 @@ NFP, CPI and PPI end in September 2026: add the next releases before the data ru
 | Same schema as the first file | A changed download format |
 | Block: one contract, same schema, ends before the raw new-contract rows | A wrong or overlapping block |
 | One contract per session after the splice | A roll day without a block |
-| Contract code found | A contract missing from `params/pdt_codes.csv` |
+| Contract code found | A contract missing from `raw_data/pdt_codes.csv` |
 | Every tick in `[date 00:00, date 23:00)` | Clock / daylight-saving mistakes, files on the wrong date |
 | Volume unchanged by the merge | A merge bug |
 

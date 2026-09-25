@@ -20,12 +20,14 @@ SHIFT = pd.Timedelta(hours=6)
 # NEW contract for that gap [18:00 ET, 00:00 UTC), bought as ES.c.1.
 BLOCK_DIR = Path("raw_data/roll_open_blocks")
 
-# Reference data (news calendar, contract codes) lives in params/ at the repo root
-PARAMS_DIR = Path(__file__).resolve().parents[1] / "params"
+# Found from the repo root, whatever the working directory: the news calendar lives in params/,
+# the contract-code table next to the raw Databento files in raw_data/
+REPO_DIR = Path(__file__).resolve().parents[1]
+PARAMS_DIR = REPO_DIR / "params"
 
 # instrument_id -> contract code (ESH0 .. ESZ6). Databento numbers can be reused over the years,
 # so a match needs both the number and the session date range.
-PDT_CODES = pd.read_csv(PARAMS_DIR / "pdt_codes.csv")
+PDT_CODES = pd.read_csv(REPO_DIR / "raw_data" / "pdt_codes.csv")
 
 
 # News events window: 5 mins before to 5 mins after

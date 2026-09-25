@@ -1,5 +1,7 @@
 data/
-raw_data/
+# Raw Databento downloads stay local; the contract-code table is tracked
+raw_data/*
+!raw_data/pdt_codes.csv
 .venv/
 __pycache__/
 .claude/*.lock
