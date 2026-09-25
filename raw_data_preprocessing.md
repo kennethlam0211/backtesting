@@ -1,29 +1,36 @@
-# Step 1 — `preprocess_1_concat.py`
+# Step 1 — `raw_data_preprocessing.py`
 
 Turns the raw Databento ES trade files (one per session) into **one clean, time-ordered tick file**
-with one contract per session and a clock that looks the same in summer and winter.
-Step 2 (`to_zarr.py`) reads its output.
+with one contract per session, prices in ticks, and a clock that looks the same in summer and winter.
+Step 2 (`to_dat.py`) reads its output and writes `tick.dat` (for the stop search, `tick_data.first_hit`)
+and the OHLCV bar files.
 
 ```bash
-.venv/bin/python preprocess_1_concat.py                      # all sessions -> data/ES_trades_concat.parquet
-.venv/bin/python preprocess_1_concat.py --start 2024-01-01 --end 2024-12-31 --out data/ES_trades_2024.parquet
+.venv/bin/python raw_data_preprocessing.py                      # all sessions -> data/ES_trades_concat.parquet
+.venv/bin/python raw_data_preprocessing.py --start 2024-01-01 --end 2024-12-31 --out data/ES_trades_2024.parquet
 ```
+
+Run from the repo root: `raw_data/` and the output path are relative to it, and the output folder
+(`data/`) must already exist. `config/` is found next to the script.
 
 Full run: 1,737 sessions (2020-01-02 → 2026-09-18) in about 3 minutes; about 1 GB of RAM.
 
 ## Output
 
-`data/ES_trades_concat.parquet`, one row per merged tick, in time order:
+`data/ES_trades_concat.parquet` (zstd), one row per merged tick, in time order:
 
 | Column | Type | Meaning |
 |---|---|---|
 | `ts` | timestamp, whole seconds | New York time + 6h (see *Clock*). Session = `ts.date` |
-| `price` | float | Trade price, raw (not adjusted across rolls) |
+| `price` | int64 | Trade price **in ticks**: points x 4 (4000.25 -> 16001). Raw, not adjusted across rolls |
 | `volume` | int64 | Contracts traded (sum of merged raw `size`) |
-| `pdt_code` | string | Contract, e.g. `ESM4` |
-| `news_fomc`, `news_nfp`, ... | int8 | `1` if tick is in `[event - 5m, event + 5m)`, else `0` (FOMC, NFP, CPI, PPI, GDP) |
+| `rth` | int8 | `1` in regular hours, New York `[09:30, 16:00)` = `ts` `[15:30, 22:00)` |
+| `session` | int8 | 8-hour block of `ts`: `1` Asia = `ts` 00–07 (NY 18:00–02:00), `2` Europe = 08–15 (NY 02:00–10:00), `3` US = 16–22 (NY 10:00–17:00). The first 30 min of RTH are `2` |
+| `hour` | int8 | Hour of `ts` (shifted clock, 0–22): `0` = NY 18:00, `15` = NY 09:00 |
+| `news_fomc`, `news_nfp`, `news_cpi`, `news_ppi`, `news_gdp` | int8 | `1` if the tick is in `[event - 5m, event + 5m)`, else `0` (see *News flags*) |
 
-Every other raw column (`ts_recv`, `side`, `sequence`, …) is dropped.
+The contract code (`pdt_code`) is looked up and checked for every session but not written.
+Every other raw column (`ts_recv`, `instrument_id`, `side`, `sequence`, …) is dropped.
 
 ## Inputs
 
@@ -32,23 +39,30 @@ Every other raw column (`ts_recv`, `side`, `sequence`, …) is dropped.
 | `raw_data/ES_c_0_trades_<date>.parquet`, `raw_data/ES_v_0_trades_<date>.parquet` | The sessions. The prefix only records which request fetched the day; each date exists once |
 | `raw_data/roll_open_blocks/ES_c_1_open_block_<date>.parquet` | New contract's ticks for the opening hours of the 27 roll days |
 | `config/pdt_codes.csv` | `instrument_id` + date range → contract code |
+| `config/news_events.yaml` | News release dates and times (see *News flags*); a missing file stops the run |
 
-Ignored: `raw_data/_superseded/`, `raw_data/_batch/`, `_manifest*.csv`, `_qc_report*.txt`, `*_partial.parquet`.
+Only top-level `raw_data/ES_*_trades_*.parquet` files are read, minus `*_partial.parquet`; so
+`raw_data/_superseded/`, `raw_data/_batch/`, `_manifest*.csv` and `_qc_report*.txt` are never touched.
+`--start` / `--end` compare against the date in the file name.
 
 ## What happens to each session (in date order)
 
 1. **Pick and sort** — top-level `ES_*_trades_*.parquet`, sorted by the **date in the name**
    (sorting by full name would put all `c_0` before all `v_0`; they interleave).
+   Check: each date appears once.
 2. **Schema check** — every file must have the first file's columns and types.
 3. **Roll-day splice** (still in UTC) — see *Roll days*. Keeps only the new contract.
 4. **One contract** — the session must now hold exactly one `instrument_id`.
 5. **Contract code** — look up `pdt_code` in `config/pdt_codes.csv` by number **and** date.
 6. **Clock** — `ts_event` (UTC) → New York wall clock → **+6h** → tz-naive `ts`.
    Check: every tick is inside its file's session, `[date 00:00, date 23:00)`.
-7. **Merge** — rows with the same **nanosecond** `ts` and the same price become one row,
+7. **Price to ticks** — `price x 4` as int64 (ES moves in 0.25-point ticks, so this is exact).
+8. **Merge** — rows with the same **nanosecond** `ts` and the same price become one row,
    `volume = sum(size)`, kept in first-traded order. Check: total volume unchanged.
-8. **Floor to seconds** — after the merge, `ts` is floored to the second.
-9. **Write** to the output file.
+9. **Labels** — `rth`, `session` and `hour` from the (still nanosecond) `ts`.
+10. **Floor to seconds** — after the merge, `ts` is floored to the second.
+11. **News flags** — see *News flags*.
+12. **Write** to the output file.
 
 ## Clock
 
@@ -90,7 +104,10 @@ rows, is the same contract, and price moves at most 1 tick across the seam.
   order. Summing keeps volume exact; dropping would lose ~0.3%.
 - **Merge before flooring to seconds.** Only truly simultaneous fills at one price are combined.
   After flooring, several rows can share a second and price; they stay separate rows, and **row order is
-  the true trade order** (the search in Step 3 walks rows in order).
+  the true trade order** (the stop search, `tick_data.first_hit`, walks rows in order).
+- **Prices in ticks (x4).** One unit is one 0.25-point tick, so prices, OHLC bars and stop/target levels
+  downstream are all whole numbers of ticks (10 points = 40). There is no grid check: a price off the
+  0.25 grid would be truncated, which ES data does not have.
 - **`ts_event`, not `ts_recv`.** Exchange match time is "when it happened"; `ts_recv` is dropped.
 - **Contract code by number + date.** Databento `instrument_id`s are just numbers and can be reused.
 
@@ -104,25 +121,37 @@ A contract after `ESZ6` needs a new row, or Step 1 stops with *"no contract code
 
 Added in Step 1 to allow fast filtering later. Five `int8` columns (`news_fomc`, `news_nfp`, `news_cpi`, `news_ppi`, `news_gdp`).
 
-- **Window**: Exactly 5 minutes before to 5 minutes after the announcement time (`[event - 5m, event + 5m)`). Ticks exactly at the boundary are excluded.
-- **Announcement times**: Read from `config/news_events.yaml`.
-- **Clock**: The YAML stores times in ET (e.g. 14:00). We convert this to our `ts` clock by adding 6 hours (no timezone math needed because our `ts` is already "New York wall clock + 6h").
-- **Speed**: Vectorized parsing on import; `np.searchsorted` per session to only flag ticks inside windows overlapping that session. Very small overhead.
+- **Announcement times**: read from `config/news_events.yaml` when the script is imported. Each event type
+  has its `dates` and one `time_et`; a date listed under `times:` uses its own time instead
+  (FOMC `2020-03-03: '10:00'`, `2020-03-15: '17:00'`). An override for a date not in `dates` is ignored.
+- **Clock**: the YAML times are New York local time, so only the +6h shift is added (no timezone
+  conversion; daylight saving is already in the New York time).
+- **Window**: `[event - 5m, event + 5m)` on the floored-second `ts`: a tick at `event - 5m` is flagged,
+  one at `event + 5m` is not.
+- **Speed**: `np.searchsorted` per session flags only the windows overlapping that session.
 
-### Data quality findings from `config/news_events.yaml`
+### `config/news_events.yaml`
 
-Reviewed on 2026-09-24:
-- All dates are sorted and deduplicated per event type.
-- **FOMC**: 21 dates out of range (before 2020-03-17 or after 2026-09-18). One weekend date found: `2020-03-15` (Sunday emergency cut). `2020-03-03` and `2025-08-22` are present. 8 scheduled per year, 9 in 2020 and 2025.
-- **NFP/CPI/PPI**: 15 out of range each. 7 missing dates were added for each, and several corrected.
-- **GDP**: 17 out of range. 2 missing dates added.
-- **Other events**: The yaml contains no other event types. Only these five top-level keys exist.
-- We updated the yaml directly with official dates after auditing against federalreserve.gov, bls.gov, and bea.gov. The 2020 entries (incl. 03-03, 03-15) will be useful when the backtest data expands to early 2020.
+Corrected against federalreserve.gov, bls.gov and bea.gov on 2026-09-24; every change (54 rows: moved,
+added and removed dates, and the two FOMC time overrides) is listed in `config/news_date_audit.csv`.
+The code reads only the YAML. Dates are sorted with no duplicates; only these five event types exist.
+
+| Event | Time (NY) | Dates | Per year |
+|---|---|---|---|
+| FOMC | 14:00 | 2019-01-30 → 2027-12-08 | 8; 9 in 2020 (emergency 03-03 10:00 and Sunday 03-15 17:00) |
+| NFP | 08:30 | 2019-01-04 → 2026-09-04 | 12; 11 in 2025 (government shutdown) |
+| CPI | 08:30 | 2019-01-11 → 2026-09-11 | 12; 11 in 2025 (government shutdown) |
+| PPI | 08:30 | 2019-01-15 → 2026-09-10 | 12; 11 in 2025 (government shutdown) |
+| GDP | 08:30 | 2019-02-28 → 2026-12-23 | 12 (11 in 2019) |
+
+NFP, CPI and PPI end in September 2026: add the next releases before the data runs past them.
 
 ## Checks that stop the run
 
 | Check | Catches |
 |---|---|
+| `config/news_events.yaml` exists | Silently all-zero news flags |
+| Each session date once | A day downloaded twice (`c_0` and `v_0`) |
 | Same schema as the first file | A changed download format |
 | Block: one contract, same schema, ends before the raw new-contract rows | A wrong or overlapping block |
 | One contract per session after the splice | A roll day without a block |
