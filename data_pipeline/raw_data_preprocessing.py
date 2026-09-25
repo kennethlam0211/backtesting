@@ -1,4 +1,6 @@
 import argparse
+import itertools
+import os
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +31,9 @@ PARAMS_DIR = REPO_DIR / "params"
 # so a match needs both the number and the session date range.
 PDT_CODES = pd.read_csv(REPO_DIR / "raw_data" / "pdt_codes.csv")
 
+
+# Default output (the step-1 tick file); daily_update.py uses it too
+DEFAULT_OUT = "data/ES_trades_concat.parquet"
 
 # News events window: 5 mins before to 5 mins after
 NEWS_WINDOW = pd.Timedelta(minutes=5)
@@ -176,15 +181,61 @@ def to_ticks(table, session_date, pdt_code):
     return pa.Table.from_pandas(out[cols], preserve_index=False)
 
 
-def main():
+def last_session(path):
+    """Session date of the last tick in a step-1 file, or None if it holds no ticks."""
+    pf = pq.ParquetFile(path)
+    for i in reversed(range(pf.num_row_groups)):
+        ts = pf.read_row_group(i, columns=['ts']).column('ts')
+        if len(ts):
+            # ts is New York time + 6h, so its calendar date is the session
+            return pc.max(ts).as_py().date()
+    return None
+
+
+def append_sessions(path, days):
+    """
+    Append mode: add sessions to the end of the step-1 file. `days` holds to_ticks tables, one session each,
+    oldest first, all newer than the file's last session; it can be a generator (daily_update.py reads
+    MongoDB one session at a time). Parquet cannot be extended in place, so the file is copied to a temp file
+    with the sessions added and swapped in; on any error the file is left as it was. Returns the number of
+    sessions added.
+    """
+    pf = pq.ParquetFile(path)
+    last = last_session(path)
+    days = (day for day in days if day.num_rows)
+    first = next(days, None)
+    if first is None:
+        return 0
+    tmp = Path(str(path) + '.tmp')
+    added = 0
+    try:
+        with pq.ParquetWriter(tmp, pf.schema_arrow, compression='zstd') as writer:
+            for i in range(pf.num_row_groups):
+                writer.write_table(pf.read_row_group(i))
+            for day in itertools.chain([first], days):
+                date = pc.min(day.column('ts')).as_py().date()
+                if last is not None and date <= last:
+                    raise ValueError(f"session {date} is not newer than the last one in {path} ({last}); run init to rebuild")
+                writer.write_table(day.cast(pf.schema_arrow))
+                last = date
+                added += 1
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    os.replace(tmp, path)
+    return added
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--start", default="0000-00-00", help="first session date YYYY-MM-DD (inclusive)")
     parser.add_argument("--end", default="9999-99-99", help="last session date YYYY-MM-DD (inclusive)")
-    parser.add_argument("--out", default="data/ES_trades_concat.parquet")
-    args = parser.parse_args()
+    parser.add_argument("--out", default=DEFAULT_OUT)
+    args = parser.parse_args(argv)
 
     raw_dir = Path("raw_data")
     out_file = Path(args.out)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
 
     # Get all files matching pattern, excluding "_partial".
     # Sort by the session date, not the full name: ES_c_0_ and ES_v_0_ dates interleave.

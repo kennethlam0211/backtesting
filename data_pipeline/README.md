@@ -1,33 +1,138 @@
-# Pipeline: how to run it
+# Data pipeline: how to run it
 
 Two steps, run **in this order**, each from the **repo root** with `python -m` (so the packages
-`data_pipeline` and `stop_search` import without any path setup):
+`data_pipeline` and `stop_search` import without any path setup). `daily_update.py` runs both, in one of two modes:
 
 ```bash
 pip install -r requirements.txt                 # once
 
+python -m data_pipeline.daily_update init       # once: the full history from the Databento files in raw_data/
+python -m data_pipeline.daily_update append     # every day (cron): add the new sessions IB_recorder saved in MongoDB
+```
+
+`init` is the same as running the two steps by hand without arguments:
+
+```bash
 python -m data_pipeline.raw_data_preprocessing       # 1. raw Databento trades -> one tick file
 python -m data_pipeline.to_dat                       # 2. ticks -> tick.dat + OHLCV bar files
 ```
 
 **Without arguments, each step runs on the full data and uses the default input and output paths set
 in the script** (its `--src` / `--out` defaults): step 2 reads step 1's default output, and
-`StopSearch.load()` reads step 2's. Arguments are only needed for a date range, a subset, or
-other paths.
+`StopSearch.load()` reads step 2's. `append` uses the same defaults. Arguments are only needed for a
+date range, a subset, or other paths.
 
 ```
-raw_data/ES_*_trades_<date>.parquet ─┐
-raw_data/roll_open_blocks/           ├─ 1 ─> tick parquet ─ 2 ─> tick.dat ──────────> stop_search.StopSearch / first_hit
-raw_data/pdt_codes.csv               │                           {freq}_ohlcv.parquet ─> features (template below)
-params/news_events.yaml ─────────────┘
+init    raw_data/ES_*_trades_<date>.parquet ─┐
+        raw_data/roll_open_blocks/           ├─ 1 ─> tick parquet ─ 2 ─> tick.dat ──────────> stop_search.StopSearch / first_hit
+        raw_data/pdt_codes.csv               │                           {freq}_ohlcv.parquet ─> features (template below)
+        params/news_events.yaml ─────────────┘
+append  MongoDB (IB_recorder) ─ 1 (to_ticks) ─> + new sessions ─ 2 ─> + new rows and bars
 ```
 
 Each step reads the previous step's output, so after changing an earlier step, rerun every step after it.
 
-**For now this is the one-time initial build of the whole history from the Databento files.** Every
-run rebuilds its outputs from scratch (step 1 rewrites its parquet file, step 2 rewrites `tick.dat` and
-every bar file); nothing is appended. Sessions from here on are recorded with the IB recorder
-(`IB_recorder`); this pipeline does not read those recordings yet.
+## Modes: `daily_update.py`
+
+### `init` — the whole history, once
+
+Steps 1 and 2 on every session in `raw_data/`, with the default paths. Every output is rebuilt from
+scratch: step 1 rewrites its parquet file, and step 2 rewrites `tick.dat` and every bar file. The sessions
+that exist only in MongoDB are then gone from the outputs; run `append` right after `init` to add them back.
+It catches up from the last Databento session, as long as MongoDB still holds those days.
+
+### `append` — new sessions from MongoDB, every day
+
+```bash
+python -m data_pipeline.daily_update append                        # up to the last closed session (17:00 New York)
+python -m data_pipeline.daily_update append --until 2026-09-25     # up to a given session
+python -m data_pipeline.daily_update append --file trades.jsonl    # from a JSON-lines file instead of MongoDB
+```
+
+1. Every weekday session after the last one in step 1's file, up to `--until` (default: the last
+   closed session), is read from MongoDB one at a time (`ib_ticks.py`). Each is converted with step 1's
+   `to_ticks` (same clock, ticks x4, merge, `rth` / `session` / `hour` / news flags) and added to the end
+   of step 1's file.
+2. Step 2 adds every session of step 1's file that is newer than `tick.dat`'s last one to `tick.dat` and
+   the bar files. It writes exactly the rows a full build would: `tests/test_daily_update.py` checks that
+   `init` on four sessions equals `init` on two plus `append`.
+
+`--src` / `--out` point it at another step 1 file and step 2 folder (default: the steps' default outputs).
+
+It is safe to run it again, and a failed run is caught up by the next one:
+
+| Case | What happens |
+|---|---|
+| Already up to date | Nothing is read or written; exit 0 |
+| A missed day (cron did not run) | Caught up by the next run |
+| A weekday with no ticks in MongoDB (exchange holiday) | Skipped with a note. If it is the `--until` session itself: exit 1 (holiday, or the recorder did not run) |
+| Any error (MongoDB down, disk full, ...) | Files stay as they were. Step 1 writes a temp file and swaps it in; step 2 cuts `tick.dat` back and swaps in the new bar files only once `tick.dat` is on disk |
+| Step 2 fails after step 1 worked | The next run finishes step 2 from step 1's file, without MongoDB |
+| A run killed part-way (power cut, OOM) | Can leave `tick.dat` longer than the bars. The next `append` detects it and stops; rebuild step 2 from step 1's file with `python -m data_pipeline.to_dat`, which keeps the appended sessions |
+| Two runs at once | The second stops: "another append is running" |
+| A session older than the data | Never inserted. To change a past session, run `init` (then `append`) |
+
+Cost: parquet cannot be extended in place, so each `append` rewrites step 1's file, streaming it one row
+group at a time. Step 2 appends to `tick.dat` in place and rewrites the (small) bar files.
+
+**Keep `params/news_events.yaml` up to date** with the coming FOMC / NFP / CPI / PPI / GDP dates. The
+news flags are set when a session is appended, so an event added to the yaml later only reaches that
+session through `init` (then `append`).
+
+#### MongoDB (`ib_ticks.py`)
+
+Connection from environment variables: `MONGO_URI` (default `mongodb://localhost:27017`), `MONGO_DB`
+(default `ib`) and `MONGO_COLLECTION` (default `ES_trades`). The script expects one document per trade:
+
+```json
+{"time": 1727208000, "price": 5100.25, "size": 3, "symbol": "ES"}
+```
+
+- Other field names: edit `FIELDS`.
+- `time` stored as epoch milliseconds or as a BSON date: set `TIME_UNIT` to `"ms"` or `"datetime"`.
+- `SYMBOL`: the documents to keep; set it to `None` to keep every document.
+- Index: `db.ES_trades.createIndex({symbol: 1, time: 1})`, so reading a session does not scan the whole collection.
+
+The recorder must save one contract per session and roll at a session open, as the Databento files
+do after the splice. `append` does not check the contract. IB times are whole seconds, so same-price
+trades within a second merge into one tick; Databento only merges trades in the same nanosecond. So IB
+days have fewer rows per bar. The stop search is unaffected, because `ts` is whole seconds either way
+and the first tick at each price keeps its place.
+
+#### Trying it with fake data: `fake_ib_data.py`
+
+`fake_ib_data.py` writes fake recorder data, as if already pulled from MongoDB, for the weekdays after
+the last session in step 1's file. The prices are a random walk in 0.25 steps from the last real price,
+with more trades in regular hours (about 100k trades a session). The file has one document per line, in
+the recorder's format above: `append --file` reads it, and
+`mongoimport --db ib --collection ES_trades --file data/fake_ib/ES_trades.jsonl` loads it into a real
+MongoDB. **Append it to a copy of the outputs**: appended sessions cannot be taken out again without `init`.
+
+```bash
+mkdir -p data/test && cp data/ES_trades_concat.parquet data/test/ && cp -r data/processed data/test/processed
+
+python -m data_pipeline.fake_ib_data --src data/test/ES_trades_concat.parquet               # 5 sessions -> data/fake_ib/ES_trades.jsonl
+python -m data_pipeline.daily_update append --file data/fake_ib/ES_trades.jsonl --until <5th session, printed above> \
+    --src data/test/ES_trades_concat.parquet --out data/test/processed
+```
+
+Then `StopSearch.load('data/test/processed/tick.dat')` reads the real sessions followed by the fake ones.
+Options: `--days N` (default 5), `--seed`, `--out`.
+
+#### Cron
+
+Run it after the 17:00 New York close, Monday to Friday New York time, from the repo root. The session
+comes from New York time, so the machine's time zone only decides when cron fires. Cron does not load
+your shell profile, so give the full path to the environment's Python. Example for a machine on Hong
+Kong time (UTC+8): 06:30 HKT, Tuesday to Saturday, is 18:30 (summer) or 17:30 (winter) the evening
+before in New York:
+
+```cron
+30 6 * * 2-6  cd /path/to/backtesting && MONGO_URI=mongodb://localhost:27017 .venv/bin/python -m data_pipeline.daily_update append >> data/append.log 2>&1
+```
+
+With cronie, `CRON_TZ=America/New_York` on the line above the entry lets you write the time in New York
+time instead: `30 17 * * 1-5  cd /path/to/backtesting && ...`.
 
 ## 1. `raw_data_preprocessing.py` — raw trades to one tick file
 
@@ -41,10 +146,10 @@ python -m data_pipeline.raw_data_preprocessing --start 2024-01-01 --end 2024-12-
 | Reads | `raw_data/ES_*_trades_<date>.parquet` (one per session), `raw_data/roll_open_blocks/ES_c_1_open_block_<date>.parquet`, `raw_data/pdt_codes.csv`, `params/news_events.yaml` |
 | Writes | `--out` (default set in the script): one row per merged tick with `ts`, `price` (ticks, x4), `volume`, `rth`, `session`, `hour`, `news_*` |
 | Options | `--start`, `--end`: first / last session date, inclusive (default: all sessions) |
-| Before running | the output's folder must exist (`mkdir -p data`); the script does not create it |
+| Notes | Creates the output's folder if missing |
 
 Stops with an error on anything suspicious (changed schema, a roll day without a block, an unknown
-contract, a tick outside its session, ...). Full details: [`docs/raw_data_preprocessing.md`](../docs/raw_data_preprocessing.md).
+contract, a tick outside its session, ...). Full details: [`docs/data_pipeline.md`](../docs/data_pipeline.md).
 
 ## 2. `to_dat.py` — ticks to `tick.dat` and bars
 
@@ -97,7 +202,7 @@ Prices are in ticks (x4): 10 points = 40.
 ## Checking the output
 
 ```bash
-pytest                                                        # unit tests, no data needed
+pytest                                                        # unit tests (append against a fake MongoDB), no data needed
 python -m data_pipeline.to_dat --limit 5 --out data/processed_test # the benchmarks read data/processed_test/tick.dat
 python -m benchmarks.run_benchmark_mismatch 1                 # first_hit vs a tick-by-tick scan (also 5, 15, 60, day)
 python -m benchmarks.benchmark_search 1                       # the same, with timings

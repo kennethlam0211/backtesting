@@ -10,8 +10,10 @@ python -m data_pipeline.raw_data_preprocessing                      # all sessio
 python -m data_pipeline.raw_data_preprocessing --start 2024-01-01 --end 2024-12-31 --out data/ES_trades_2024.parquet
 ```
 
-Run from the repo root: `raw_data/` and the output path are relative to it, and the output folder
-(`data/`) must already exist. `params/` is read from the repo root.
+Run from the repo root: `raw_data/` and the output path are relative to it; the output folder
+(`data/`) is created if missing. `params/` is read from the repo root. New sessions after the Databento
+history come from MongoDB with `python -m data_pipeline.daily_update append`, through the same `to_ticks`
+(see `data_pipeline/README.md`).
 
 Full run: 1,737 sessions (2020-01-02 → 2026-09-18) in about 3 minutes; about 1 GB of RAM.
 

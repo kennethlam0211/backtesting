@@ -374,6 +374,6 @@ def _default(script, option):
 def test_default_paths_agree_with_to_dat():
     # to_dat.py keeps its own output path; StopSearch.load() and step 3 must follow it
     from stop_search import DAT_PATH
-    out = _default('to_dat.py', '--out')
+    from data_pipeline.to_dat import DEFAULT_OUT as out
     assert os.path.normpath(os.path.join(out, 'tick.dat')) == os.path.normpath(DAT_PATH), "update DAT_PATH in stop_search/params.py"
     assert os.path.normpath(_default('data_preprocessing(template).py', '--data-dir')) == os.path.normpath(out), "update --data-dir in data_preprocessing(template).py"

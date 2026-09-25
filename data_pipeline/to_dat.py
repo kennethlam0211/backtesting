@@ -18,6 +18,10 @@ from stop_search.params import FREQS, PARQUET_FREQS, DAT_COLS
 install()
 console = Console()
 
+# Default input (step 1's output) and output folder; daily_update.py uses them too
+DEFAULT_SRC = "data/ES_trades_concat.parquet"
+DEFAULT_OUT = "data/processed"
+
 
 def to_unix_epoch(ts: pd.Series) -> pd.Series:
     """
@@ -186,20 +190,90 @@ def process_session(session_df: pd.DataFrame, session_date: datetime.date) -> tu
     return tick_res, resampled_res, sess_len
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--limit", type=int, default=None, help="Process only first N sessions")
-    parser.add_argument("--out", type=str, default="data/processed", help="Output directory")
-    parser.add_argument("--start", type=str, default=None, help="Skip to date YYYY-MM-DD")
-    parser.add_argument("--src", type=str, default="./data/ES_trades_concat.parquet", help="Step 1 output")
-    args = parser.parse_args()
+def offset_session(tick_res: pd.DataFrame, resampled_res: dict[str, np.ndarray], offset: int) -> np.ndarray:
+    """
+    One processed session -> its tick.dat rows, with local row numbers moved to global ones by `offset`
+    (the number of rows already in tick.dat). Also offsets the bars' start_ind, in place.
+    """
+    # start_ind is -1 on rows that do not start a 1-min bar, and next_ind is 0 on rows that do not start a bar
+    start_mask = tick_res['start_ind'] != -1
+    tick_res.loc[start_mask, 'start_ind'] += offset
+    tick_res.loc[~start_mask, 'start_ind'] = 0
+    for f in FREQS:
+        next_col = f'next_ind_{f}'
+        tick_res[next_col] = np.where(tick_res[next_col] > 0, tick_res[next_col] + offset, 0)
+        if f in PARQUET_FREQS and len(resampled_res[f]) > 0:
+            resampled_res[f]['start_ind'] += offset
+    return tick_res[DAT_COLS].values.astype(np.int64)
 
-    os.makedirs(args.out, exist_ok=True)
 
-    pf = pq.ParquetFile(args.src)
+def bars_table(bars: list[np.ndarray]) -> pa.Table:
+    """Bar arrays from process_session -> one parquet table, ts as unix seconds on the shifted clock."""
+    df = pd.DataFrame(np.concatenate(bars))
+    # Convert bar_labels (ns shifted time) back to proper datetimes, then to absolute unix seconds
+    shifted_ts = pd.to_datetime(df['ts'], unit='ns')
+    df['ts'] = to_unix_epoch(shifted_ts)
+    return pa.Table.from_pandas(df, preserve_index=False)
+
+
+def iter_sessions(src: str, start=None):
+    """
+    (session_date, ticks DataFrame) for each session of the step-1 file `src`, oldest first. With `start`
+    (a date), only ticks from that date on; row groups that end before it are skipped without reading them.
+    """
+    pf = pq.ParquetFile(src)
+    start_ts = pd.Timestamp(start) if start is not None else None
+    row_groups = list(range(pf.num_row_groups))
+    if start_ts is not None:
+        ts_col = pf.schema_arrow.get_field_index('ts')
+        stats = [pf.metadata.row_group(i).column(ts_col).statistics for i in row_groups]
+        row_groups = [i for i, st in zip(row_groups, stats) if st is None or not st.has_min_max or pd.Timestamp(st.max) >= start_ts]
 
     current_session = None
     buffer = []
+    for batch in pf.iter_batches(row_groups=row_groups):
+        df_batch = batch.to_pandas()
+
+        if start_ts is not None:
+            if df_batch['ts'].max() < start_ts:
+                continue
+            df_batch = df_batch[df_batch['ts'] >= start_ts].copy()
+            if df_batch.empty:
+                continue
+
+        # ts is already New York + 6h from step 1, so its calendar date is the session
+        df_batch['session_date'] = df_batch['ts'].dt.date
+
+        for sess_date, group in df_batch.groupby('session_date'):
+            if current_session is None:
+                current_session = sess_date
+            if sess_date != current_session:
+                yield current_session, pd.concat(buffer, ignore_index=True)
+                buffer = [group]
+                current_session = sess_date
+            else:
+                buffer.append(group)
+
+    if buffer:
+        yield current_session, pd.concat(buffer, ignore_index=True)
+
+
+def check_session(sess_df: pd.DataFrame, sess_date: datetime.date):
+    """Every tick of a session must fall inside it: [date 00:00, date 23:00) on the shifted clock."""
+    open_ts = pd.Timestamp(sess_date)
+    start_time, end_time = sess_df['ts'].min(), sess_df['ts'].max()
+    assert open_ts <= start_time and end_time < open_ts + pd.Timedelta(hours=23), f"ticks outside session {sess_date}: {start_time} .. {end_time}"
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--limit", type=int, default=None, help="Process only first N sessions")
+    parser.add_argument("--out", type=str, default=DEFAULT_OUT, help="Output directory")
+    parser.add_argument("--start", type=str, default=None, help="Skip to date YYYY-MM-DD")
+    parser.add_argument("--src", type=str, default=DEFAULT_SRC, help="Step 1 output")
+    args = parser.parse_args(argv)
+
+    os.makedirs(args.out, exist_ok=True)
 
     sessions_processed = 0
     t_start_all = time.monotonic()
@@ -211,7 +285,6 @@ def main():
 
     dat_path = os.path.join(args.out, 'tick.dat')
     dat_tmp_path = os.path.join(args.out, 'tick.dat.tmp')
-    col_names = DAT_COLS
 
     # We don't know the exact final row count.
     # To append to a memmap, we can open it in 'r+' (or 'w+' initially)
@@ -229,11 +302,7 @@ def main():
     def flush_bars(f):
         if not bar_buffers.get(f):
             return
-        df = pd.DataFrame(np.concatenate(bar_buffers[f]))
-        # Convert bar_labels (ns shifted time) back to proper datetimes, then to absolute unix seconds
-        shifted_ts = pd.to_datetime(df['ts'], unit='ns')
-        df['ts'] = to_unix_epoch(shifted_ts)
-        table = pa.Table.from_pandas(df, preserve_index=False)
+        table = bars_table(bar_buffers[f])
         if f not in bar_writers:
             bar_writers[f] = pq.ParquetWriter(os.path.join(args.out, f'{f}_ohlcv.parquet'), table.schema, compression='zstd')
         bar_writers[f].write_table(table)
@@ -242,26 +311,12 @@ def main():
     def write_result(future):
         nonlocal global_offset
         tick_res, resampled_res, sess_len = future.result()
-
-        # Apply global offset to local indices
-        # We stored -1 for non-first rows in start_ind, and 0 for non-first rows in next_ind
-
-        start_mask = tick_res['start_ind'] != -1
-        tick_res.loc[start_mask, 'start_ind'] += global_offset
-        tick_res.loc[~start_mask, 'start_ind'] = 0
-
-        for f in FREQS:
-            next_col = f'next_ind_{f}'
-            tick_res[next_col] = np.where(tick_res[next_col] > 0, tick_res[next_col] + global_offset, 0)
-
-            # Apply to OHLCV start_ind
-            if f in PARQUET_FREQS and len(resampled_res[f]) > 0:
-                resampled_res[f]['start_ind'] += global_offset
+        tick_arr = offset_session(tick_res, resampled_res, global_offset)
+        for f in PARQUET_FREQS:
+            if len(resampled_res[f]) > 0:
                 bar_buffers[f].append(resampled_res[f])
                 if sum(len(b) for b in bar_buffers[f]) >= 1_000_000:
                     flush_bars(f)
-
-        tick_arr = tick_res[col_names].values.astype(np.int64)
 
         # Write the binary bytes directly to the end of the file
         dat_file.write(tick_arr.tobytes())
@@ -270,13 +325,8 @@ def main():
     def submit_session(sess_df, sess_date):
         nonlocal sessions_processed
 
-        start_time = sess_df['ts'].min()
-        end_time = sess_df['ts'].max()
-
-        print(f"Found session {sess_date}: {len(sess_df)} rows, {start_time} to {end_time}")
-
-        open_ts = pd.Timestamp(sess_date)
-        assert open_ts <= start_time and end_time < open_ts + pd.Timedelta(hours=23), f"ticks outside session {sess_date}: {start_time} .. {end_time}"
+        print(f"Found session {sess_date}: {len(sess_df)} rows, {sess_df['ts'].min()} to {sess_df['ts'].max()}")
+        check_session(sess_df, sess_date)
 
         future = executor.submit(process_session, sess_df, sess_date)
         in_flight.append(future)
@@ -287,45 +337,10 @@ def main():
 
         sessions_processed += 1
 
-    start_date = pd.Timestamp(args.start) if args.start else None
-
-    # We iterate chunks, reading all columns
-    for batch in pf.iter_batches():
-        df_batch = batch.to_pandas()
-
-        if start_date is not None:
-            if df_batch['ts'].max() < start_date:
-                continue
-            df_batch = df_batch[df_batch['ts'] >= start_date].copy()
-            if df_batch.empty:
-                continue
-
-
-        # ts is already New York + 6h from step 1, so its calendar date is the session
-        df_batch['session_date'] = df_batch['ts'].dt.date
-
-        for sess_date, group in df_batch.groupby('session_date'):
-            if current_session is None:
-                current_session = sess_date
-
-            if sess_date != current_session:
-                sess_df = pd.concat(buffer, ignore_index=True)
-                submit_session(sess_df, current_session)
-
-                if args.limit and sessions_processed >= args.limit:
-                    break
-
-                buffer = [group]
-                current_session = sess_date
-            else:
-                buffer.append(group)
-
+    for sess_date, sess_df in iter_sessions(args.src, args.start):
+        submit_session(sess_df, sess_date)
         if args.limit and sessions_processed >= args.limit:
             break
-
-    if buffer and (not args.limit or sessions_processed < args.limit):
-        sess_df = pd.concat(buffer, ignore_index=True)
-        submit_session(sess_df, current_session)
 
     # Drain remaining futures
     while in_flight:
@@ -351,6 +366,99 @@ def main():
         print(f"Extrapolated full run (approx 1684 sessions): {time_per_session * 1684 / 60:.2f} mins")
 
     executor.shutdown()
+
+
+def _read_row(dat_path: str, i: int) -> np.ndarray:
+    """Row i of tick.dat (its DAT_COLS values), or an empty array past the end."""
+    row_bytes = len(DAT_COLS) * 8
+    with open(dat_path, 'rb') as f:
+        f.seek(i * row_bytes)
+        return np.frombuffer(f.read(row_bytes), dtype=np.int64)
+
+
+def last_session(out_dir: str):
+    """Session date of the last row in out_dir/tick.dat, or None if the file is empty."""
+    dat_path = os.path.join(out_dir, 'tick.dat')
+    row_bytes = len(DAT_COLS) * 8
+    size = os.path.getsize(dat_path)
+    if size % row_bytes:
+        raise ValueError(f"{dat_path}: {size} bytes is not a whole number of {len(DAT_COLS)}-column rows")
+    if size == 0:
+        return None
+    last_ts = int(_read_row(dat_path, size // row_bytes - 1)[DAT_COLS.index('ts')])
+    # ts is the shifted clock stored as if UTC, so its calendar date is the session
+    return datetime.datetime.fromtimestamp(last_ts, datetime.timezone.utc).date()
+
+
+def committed_rows(out_dir: str) -> int:
+    """
+    Rows of out_dir/tick.dat the bar files account for: where the last day bar ends. A full build or a
+    finished append leaves this equal to tick.dat's row count; an append killed part-way leaves it smaller.
+    """
+    day = pq.read_table(os.path.join(out_dir, 'day_ohlcv.parquet'), columns=['start_ind']).column('start_ind')
+    if len(day) == 0:
+        return 0
+    row = _read_row(os.path.join(out_dir, 'tick.dat'), int(day[-1].as_py()))  # first row of the last session
+    return int(row[DAT_COLS.index('next_ind_day')]) if len(row) else -1
+
+
+def append_sessions(out_dir: str = DEFAULT_OUT, src: str = DEFAULT_SRC) -> list[datetime.date]:
+    """
+    Append mode: add every session of the step-1 file `src` newer than the last one in out_dir/tick.dat to
+    tick.dat and the OHLCV bar files, exactly as a full build would have written them. Returns the dates
+    added (empty when tick.dat is already up to date). On any error tick.dat is cut back to its old size
+    and the bar files are left as they were.
+    """
+    last = last_session(out_dir)
+    start = None if last is None else last + datetime.timedelta(days=1)
+    dat_path = os.path.join(out_dir, 'tick.dat')
+    size = os.path.getsize(dat_path)
+    n_rows = size // (len(DAT_COLS) * 8)
+    if committed_rows(out_dir) != n_rows:
+        raise ValueError(f"{dat_path} holds rows the bar files do not (an append was cut off?); "
+                         f"rebuild step 2 from step 1's file with `python -m data_pipeline.to_dat`")
+
+    added = []
+    bars = {f: [] for f in PARQUET_FREQS}
+    tmps = {}
+    try:
+        # Rows go straight onto the end of tick.dat; bars are collected and written once at the end
+        with open(dat_path, 'r+b') as fh:
+            fh.seek(size)
+            for sess_date, sess_df in iter_sessions(src, start):
+                check_session(sess_df, sess_date)
+                tick_res, resampled_res, sess_len = process_session(sess_df, sess_date)
+                fh.write(offset_session(tick_res, resampled_res, n_rows).tobytes())
+                n_rows += sess_len
+                for f in PARQUET_FREQS:
+                    if len(resampled_res[f]) > 0:
+                        bars[f].append(resampled_res[f])
+                added.append(sess_date)
+            if not added:
+                return added
+
+            # New bar files are written next to the old ones, and swapped in only once tick.dat is on disk
+            for f in PARQUET_FREQS:
+                path = os.path.join(out_dir, f'{f}_ohlcv.parquet')
+                old = pq.read_table(path)
+                tmps[path] = path + '.tmp'
+                new = [bars_table(bars[f]).cast(old.schema)] if bars[f] else []
+                pq.write_table(pa.concat_tables([old, *new]), tmps[path], compression='zstd')
+            fh.flush()
+            os.fsync(fh.fileno())
+    except BaseException:
+        with open(dat_path, 'r+b') as fh:
+            fh.truncate(size)
+        for tmp in tmps.values():
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        raise
+
+    # day_ohlcv.parquet goes last: it is the commit record committed_rows() checks
+    for path in sorted(tmps, key=lambda path: path.endswith('day_ohlcv.parquet')):
+        os.replace(tmps[path], path)
+    return added
+
 
 if __name__ == '__main__':
     main()
