@@ -3,7 +3,7 @@
 Turns the raw Databento ES trade files (one per session) into **one clean, time-ordered tick file**
 with one contract per session, prices in ticks, and a clock that looks the same in summer and winter.
 Step 2 (`to_dat.py`) reads its output and writes `tick.dat` (for the stop search, `tick_data.first_hit`)
-and the OHLCV bar files.
+and the OHLCV bar files (`open`/`high`/`low`/`close` in ticks, int32, like `price` here).
 
 ```bash
 .venv/bin/python raw_data_preprocessing.py                      # all sessions -> data/ES_trades_concat.parquet
@@ -22,7 +22,7 @@ Full run: 1,737 sessions (2020-01-02 → 2026-09-18) in about 3 minutes; about 1
 | Column | Type | Meaning |
 |---|---|---|
 | `ts` | timestamp, whole seconds | New York time + 6h (see *Clock*). Session = `ts.date` |
-| `price` | int64 | Trade price **in ticks**: points x 4 (4000.25 -> 16001). Raw, not adjusted across rolls |
+| `price` | int32 | Trade price **in ticks**: points x 4 (4000.25 -> 16001). Raw, not adjusted across rolls |
 | `volume` | int64 | Contracts traded (sum of merged raw `size`) |
 | `rth` | int8 | `1` in regular hours, New York `[09:30, 16:00)` = `ts` `[15:30, 22:00)` |
 | `session` | int8 | 8-hour block of `ts`: `1` Asia = `ts` 00–07 (NY 18:00–02:00), `2` Europe = 08–15 (NY 02:00–10:00), `3` US = 16–22 (NY 10:00–17:00). The first 30 min of RTH are `2` |
@@ -56,7 +56,7 @@ Only top-level `raw_data/ES_*_trades_*.parquet` files are read, minus `*_partial
 5. **Contract code** — look up `pdt_code` in `config/pdt_codes.csv` by number **and** date.
 6. **Clock** — `ts_event` (UTC) → New York wall clock → **+6h** → tz-naive `ts`.
    Check: every tick is inside its file's session, `[date 00:00, date 23:00)`.
-7. **Price to ticks** — `price x 4` as int64 (ES moves in 0.25-point ticks, so this is exact).
+7. **Price to ticks** — `price x 4` as int32 (ES moves in 0.25-point ticks, so this is exact).
 8. **Merge** — rows with the same **nanosecond** `ts` and the same price become one row,
    `volume = sum(size)`, kept in first-traded order. Check: total volume unchanged.
 9. **Labels** — `rth`, `session` and `hour` from the (still nanosecond) `ts`.

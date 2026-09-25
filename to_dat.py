@@ -53,7 +53,8 @@ def process_session(session_df: pd.DataFrame, session_date: datetime.date) -> tu
 
     sess_len = len(merged_ts)
 
-    # Price storage: step 1 already stores price x4 (0.25-pt ticks), so it arrives as an exact integer
+    # Price storage: step 1 stores price x4 (0.25-pt ticks) as int32; widened to int64 here for tick.dat.
+    # Bar open/high/low/close go back to int32 in the OHLCV parquet files.
     merged_price = session_df['price'].values.astype(np.int64)
 
     tick_res = pd.DataFrame({
@@ -94,8 +95,8 @@ def process_session(session_df: pd.DataFrame, session_date: datetime.date) -> tu
 
         if num_bars == 0:
             resampled_res[freq] = np.zeros(0, dtype=[
-                ('start_ind', 'i8'), ('ts', 'i8'), ('open', 'i8'),
-                ('high', 'i8'), ('low', 'i8'), ('close', 'i8'),
+                ('start_ind', 'i8'), ('ts', 'i8'), ('open', 'i4'),
+                ('high', 'i4'), ('low', 'i4'), ('close', 'i4'),
                 ('volume', 'i8'), ('avg_px', 'f8'), ('hl', '?'), ('rth', '?'),
                 ('hour', 'i8')
             ])
@@ -150,8 +151,8 @@ def process_session(session_df: pd.DataFrame, session_date: datetime.date) -> tu
 
         # Create structured array
         dtype_list = [
-            ('start_ind', 'i8'), ('ts', 'i8'), ('open', 'i8'),
-            ('high', 'i8'), ('low', 'i8'), ('close', 'i8'),
+            ('start_ind', 'i8'), ('ts', 'i8'), ('open', 'i4'),
+            ('high', 'i4'), ('low', 'i4'), ('close', 'i4'),
             ('volume', 'i8'), ('hl', '?'), ('rth', '?'),
             ('session', 'i1'), ('hour', 'i8'),
             ('news_fomc', 'i1'), ('news_nfp', 'i1'), ('news_cpi', 'i1'), ('news_ppi', 'i1'), ('news_gdp', 'i1')
