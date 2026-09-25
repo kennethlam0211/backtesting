@@ -189,7 +189,7 @@ def process_session(session_df: pd.DataFrame, session_date: datetime.date) -> tu
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=None, help="Process only first N sessions")
-    parser.add_argument("--out", type=str, default="./data/dat", help="Output directory")
+    parser.add_argument("--out", type=str, default="data/processed", help="Output directory")
     parser.add_argument("--start", type=str, default=None, help="Skip to date YYYY-MM-DD")
     parser.add_argument("--src", type=str, default="./data/ES_trades_concat.parquet", help="Step 1 output")
     args = parser.parse_args()
