@@ -9,8 +9,9 @@ Bollinger bands (2 sigma), ATR, SMA-RSI, FVG, bar-to-bar moves and bar score. Ev
 joined onto the 1-min bars: a bar appears on the 1-min row during which it closes and stays until the next
 one closes, so a row holds nothing from the future once that 1-min bar has closed.
 U/D, as the reference: for every freq on the 1-min closes, with that freq's std as the reversal threshold
-(for a higher freq its live std: the last 19 closes shown so far plus the current 1-min close), with the
-flag and the last params.UD_PIVOTS pivots.
+(for a higher freq its live std: the last 19 closes shown so far plus the current 1-min close, once 19 have
+closed), with the flag and the last params.UD_PIVOTS pivots. The output starts once every freq has its
+pivots (as the reference's take_away_burnout_period); --keep-warmup keeps the rows before.
 Prices are in ticks (x4), like the bar files.
 """
 import argparse
@@ -128,18 +129,30 @@ def calc_ud_levels_polars(df: pl.DataFrame, window: int) -> pl.DataFrame:
     return df.with_columns(ud_columns(df['close'].to_numpy(), df[f'{window}_std'].to_numpy(), window))
 
 
-def live_std(df: pl.DataFrame, freq: str) -> np.ndarray:
+def live_std(df: pl.DataFrame, freq: str, window: int = 20) -> np.ndarray:
     """
     The reference's live std of a higher freq at every 1-min row (unit_std): the std (ddof 0) of the last
     window-1 closes of the freq's bars shown so far and the current 1-min close, the close of the bar still
-    forming. Built from the joined mean / M2 / count of those closes plus the one current close.
+    forming. NaN until window-1 bars have closed: no U/D on a partial window, whose std is too small.
+    Built from the joined mean and M2 of those closes plus the one current close.
     """
-    n = df[f'_live_n_{freq}'].to_numpy().astype(np.float64)
+    n = window - 1
     mean = df[f'_live_mean_{freq}'].to_numpy().astype(np.float64)
     m2 = df[f'_live_m2_{freq}'].to_numpy().astype(np.float64)
     close = df['close_1'].to_numpy().astype(np.float64)
-    total = n + 1
-    return np.sqrt((m2 + (close - mean) ** 2 * n / total) / total)
+    return np.sqrt((m2 + (close - mean) ** 2 * n / (n + 1)) / (n + 1))
+
+
+def warmup_rows(df: pl.DataFrame, freqs) -> int:
+    """
+    Rows before every freq has its UD_PIVOTS pivots (as the reference's take_away_burnout_period). The
+    pivot columns never go back to NaN once filled, so every later row has them all.
+    """
+    full = np.logical_and.reduce([~np.isnan(df[f'20_UD_last{UD_PIVOTS}_{freq}'].to_numpy()) for freq in freqs])
+    if not full.any():
+        raise ValueError(f"no row has {UD_PIVOTS} U/D pivots for every freq in {list(freqs)} yet: more data is "
+                         f"needed (or --keep-warmup)")
+    return int(full.argmax())
 
 
 class DataPreprocessor:
@@ -250,13 +263,11 @@ class DataPreprocessor:
             df = calc_ud_levels_polars(lf.collect(), window=20)
         else:
             # Higher freqs: U/D runs later on the 1-min closes (see build_merged_dataset). Here only what its
-            # live std needs: mean, M2 and count of the last window-1 closes (fewer at the start, as the reference)
+            # live std needs: mean and M2 of the last window-1 closes, null until there are that many
             k = 20 - 1
-            count = pl.min_horizontal(pl.int_range(1, pl.len() + 1), pl.lit(k)).cast(pl.Float64)
             df = lf.with_columns([
-                count.alias('_live_n'),
-                pl.col('close').rolling_mean(k, min_samples=1).alias('_live_mean'),
-                (pl.col('close').rolling_var(k, min_samples=1, ddof=0) * count).alias('_live_m2'),
+                pl.col('close').rolling_mean(k).alias('_live_mean'),
+                (pl.col('close').rolling_var(k, ddof=0) * k).alias('_live_m2'),
             ]).collect()
 
         # Rename columns to have frequency suffix (except ts and join keys)
@@ -265,8 +276,11 @@ class DataPreprocessor:
 
         return df
 
-    def build_merged_dataset(self) -> pl.DataFrame:
-        """Load 1m data and asof join all higher timeframes onto it."""
+    def build_merged_dataset(self, keep_warmup: bool = False) -> pl.DataFrame:
+        """
+        Load 1m data and asof join all higher timeframes onto it. Starts once every freq has its U/D pivots,
+        unless keep_warmup.
+        """
         print("Processing 1m base data...")
         df_1m = self.process_frequency('1')
 
@@ -298,19 +312,25 @@ class DataPreprocessor:
             # freq's live std as the reversal threshold, so its levels and pivots move every minute
             std = live_std(df_1m, freq)
             df_1m = df_1m.with_columns([pl.Series(f'20_std_live_{freq}', std), *ud_columns(df_1m['close_1'], std, 20, f'_{freq}')])
-            df_1m = df_1m.drop([f'_live_n_{freq}', f'_live_mean_{freq}', f'_live_m2_{freq}'])
+            df_1m = df_1m.drop([f'_live_mean_{freq}', f'_live_m2_{freq}'])
 
+        if not keep_warmup:
+            first = warmup_rows(df_1m, FREQS)
+            if first:
+                print(f"Warm-up dropped: the first {first:,} rows, until every freq has {UD_PIVOTS} U/D pivots")
+            df_1m = df_1m.slice(first)
         return df_1m
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Bar features, higher freqs joined onto the 1-min bars.")
     parser.add_argument("--data-dir", default=DATA_DIR, help="step 2's output folder with the {freq}_ohlcv.parquet files")
     parser.add_argument("--out", default=None, help="output parquet (default: training_data.parquet in --data-dir)")
+    parser.add_argument("--keep-warmup", action="store_true", help="keep the rows before every freq has its U/D pivots")
     args = parser.parse_args(argv)
     out = args.out or os.path.join(args.data_dir, "training_data.parquet")
 
     t0 = time.time()
-    final_df = DataPreprocessor(data_dir=args.data_dir).build_merged_dataset()
+    final_df = DataPreprocessor(data_dir=args.data_dir).build_merged_dataset(keep_warmup=args.keep_warmup)
     print(f"\nPipeline completed in {time.time() - t0:.2f} seconds!")
     print(f"Final shape: {final_df.shape}")
     print("Sample of merged data:")

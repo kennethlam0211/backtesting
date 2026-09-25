@@ -54,10 +54,11 @@ def write_bars(folder, cutoff=None):
     return folder
 
 
-def build(folder):
+def build(folder, freqs=FREQS, keep_warmup=True):
+    """The merged table; the warm-up is kept by default (3 sessions are too few for 5 day pivots)."""
     with pytest.MonkeyPatch.context() as m:
-        m.setattr(dp, "FREQS", FREQS)
-        return dp.DataPreprocessor(str(folder)).build_merged_dataset().to_pandas()
+        m.setattr(dp, "FREQS", freqs)
+        return dp.DataPreprocessor(str(folder)).build_merged_dataset(keep_warmup=keep_warmup).to_pandas()
 
 
 @pytest.fixture(scope="module")
@@ -96,12 +97,13 @@ def reference_live_std(merged, bars, freq):
     """
     The reference's unit_std(raw_20 + [close_1]) at every 1-min row: raw_20 holds the last 21 closes of the
     bars shown so far, and unit_std keeps the last 20 of the list, so 19 closes plus the current 1-min close.
+    Unlike the reference, NaN until 19 bars have closed (no std of a partial window).
     """
     length = 24 * 3600 if freq == "day" else int(freq) * 60
     closes = np.minimum(bars["ts"] + length, bars["ts"] // 86400 * 86400 + 23 * 3600).to_numpy()
     shown = np.searchsorted(closes, merged["ts"].to_numpy() + 60, side="right") - 1
     px = bars["close"].to_numpy(float)
-    return np.array([np.std((list(px[max(0, k - 20):k + 1]) + [c])[-20:]) if k >= 0 else np.nan
+    return np.array([np.std((list(px[max(0, k - 20):k + 1]) + [c])[-20:]) if k >= 18 else np.nan
                      for k, c in zip(shown, merged["close_1"].to_numpy(float))])
 
 
@@ -113,7 +115,7 @@ def test_higher_freq_ud_follows_the_reference(data_dir, merged, freq):
 
     # UD(df, 20, freq) = UD_cal on close_1 with that std; equal once the start has passed (see the U/D note above)
     old = ref.UD_cal(pd.DataFrame({"close_1": merged["close_1"], f"20_std_{freq}": std}), "close_1", 20, freq)
-    start = 300
+    start = int(np.argmax(~np.isnan(std))) + 300  # once the std exists and the start has passed
     for col in [f"20_U_{freq}", f"20_D_{freq}", f"20_UD_flag_{freq}"]:
         np.testing.assert_allclose(merged[col].to_numpy(float)[start:], old[col].to_numpy(float)[start:],
                                    rtol=0, atol=1e-6, equal_nan=True, err_msg=col)
@@ -212,9 +214,33 @@ def test_ud_levels_never_read_ahead():
                 np.testing.assert_array_equal(a, b[:k])
 
 
+def test_live_std_needs_19_closed_bars(merged, data_dir):
+    bars = pd.read_parquet(data_dir / "60_ohlcv.parquet").sort_values("ts").reset_index(drop=True)
+    closes = np.minimum(bars["ts"] + 3600, bars["ts"] // 86400 * 86400 + 23 * 3600).to_numpy()
+    shown = np.searchsorted(closes, merged["ts"].to_numpy() + 60, side="right")  # bars closed by each row
+    std = merged["20_std_live_60"].to_numpy(float)
+    assert np.isnan(std[shown < 19]).all() and not np.isnan(std[shown >= 19]).any()
+    assert np.isnan(merged["20_U_60"].to_numpy(float)[shown < 19]).all()  # no pivot on a partial window
+
+
+def test_warmup_is_dropped(data_dir):
+    freqs = ["1", "15", "60"]  # 3 sessions are enough for these to get their pivots, not for the day
+    full = build(data_dir, freqs)
+    trimmed = build(data_dir, freqs, keep_warmup=False)
+    pivots = full[[f"20_UD_last{UD_PIVOTS}_{f}" for f in freqs]].notna().all(axis=1)
+    first = int(pivots.to_numpy().argmax())
+    assert 0 < first < len(full) and pivots.iloc[first:].all() and not pivots.iloc[first - 1]
+    # (dtypes may differ: pandas turns an int column with a null in the warm-up into float)
+    pd.testing.assert_frame_equal(trimmed, full.iloc[first:].reset_index(drop=True), check_dtype=False)
+    with pytest.raises(ValueError, match="more data is needed"):
+        build(data_dir, FREQS, keep_warmup=False)  # the day never gets 5 pivots in 3 sessions
+
+
 def test_main_writes_next_to_the_bars(data_dir, capsys, monkeypatch):
-    monkeypatch.setattr(dp, "FREQS", FREQS)
+    monkeypatch.setattr(dp, "FREQS", ["1", "15", "60"])
     dp.main(["--data-dir", str(data_dir)])
     out = pd.read_parquet(data_dir / "training_data.parquet")
-    assert len(out) == len(pd.read_parquet(data_dir / "1_ohlcv.parquet"))
-    assert "Data saved to" in capsys.readouterr().out
+    assert 0 < len(out) < len(pd.read_parquet(data_dir / "1_ohlcv.parquet"))  # the warm-up is dropped
+    assert "Warm-up dropped" in capsys.readouterr().out
+    dp.main(["--data-dir", str(data_dir), "--keep-warmup"])
+    assert len(pd.read_parquet(data_dir / "training_data.parquet")) == len(pd.read_parquet(data_dir / "1_ohlcv.parquet"))

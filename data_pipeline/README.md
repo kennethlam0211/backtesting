@@ -201,9 +201,9 @@ python -m data_pipeline.data_preprocessing --data-dir data/processed_2024 --out 
 | | |
 |---|---|
 | Reads | `{--data-dir}/{freq}_ohlcv.parquet` for every freq in `params.FREQS` (default folder: step 2's default output) |
-| Writes | `--out` (default `training_data.parquet` in `--data-dir`): one row per 1-min bar, with every freq's bars and features as columns suffixed `_{freq}` |
+| Writes | `--out` (default `training_data.parquet` in `--data-dir`): one row per 1-min bar, with every freq's bars and features as columns suffixed `_{freq}`. It starts once every freq has its 5 U/D pivots (the warm-up is dropped, as the reference's `take_away_burnout_period`); `--keep-warmup` keeps those rows |
 | Features | Per freq, window 20: SMA, std, Bollinger bands (2 sigma), ATR (Wilder, 14), SMA-RSI (14), FVG, bar-to-bar moves `HO HH HL HC`, `bar_score` (`params.NORM_FACTOR`), and U/D (below) |
-| U/D | For every freq (1, 15, 60, day), as the reference: a zigzag on the **1-min closes**, reversing when price moves more than that freq's std from the last extreme. For a higher freq that is its live std, `20_std_live_{freq}`: the last 19 closes shown so far plus the current 1-min close, so the levels move every minute. Columns `20_U_{freq}`, `20_D_{freq}` (the level on the bar where it is confirmed, else NaN), `20_UD_flag_{freq}`, and the last `params.UD_PIVOTS` (5) pivots, U and D in one sequence: `20_UD_last1_{freq}` (newest) … `20_UD_last5_{freq}`, in ticks, NaN until there are enough |
+| U/D | For every freq (1, 15, 60, day), as the reference: a zigzag on the **1-min closes**, reversing when price moves more than that freq's std from the last extreme. For a higher freq that is its live std, `20_std_live_{freq}`: the last 19 closes shown so far plus the current 1-min close, so the levels move every minute. It needs a full window: NaN until 19 bars have closed (the 1-min std needs 20 closes), so no pivot forms on a too-small std at the start. Columns `20_U_{freq}`, `20_D_{freq}` (the level on the bar where it is confirmed, else NaN), `20_UD_flag_{freq}`, and the last `params.UD_PIVOTS` (5) pivots, U and D in one sequence: `20_UD_last1_{freq}` (newest) … `20_UD_last5_{freq}`, in ticks, NaN until there are enough |
 
 The polars version of `reference/preprocessing_pandas.py`. It gives the same values
 (`tests/test_data_preprocessing.py` checks this, U/D included), with these differences:
@@ -215,8 +215,11 @@ The polars version of `reference/preprocessing_pandas.py`. It gives the same val
 - Other higher-freq indicators (std, ATR, SMA-RSI, Bollinger) are those of the last closed bar. The
   reference recomputed them every minute with the current 1-min close as the forming bar's close; so far
   only the std is ported that way (`20_std_live_{freq}`, for U/D).
-- The start of the data is kept. The reference dropped it until the slowest freq had a full pivot list
-  (`take_away_burnout_period`).
+- The live std needs 19 closed bars. The reference used however many had closed, so its first pivots of
+  each freq came from a too-small std (for the day: its first month).
+- The warm-up is dropped once every freq has 5 pivots (the reference: until its slowest freq had 20). With
+  the day in `params.FREQS` the output starts after about a month plus 5 daily pivots; a short run (fewer
+  sessions than that) stops with an error unless `--keep-warmup`.
 
 **No look-ahead.** A higher-freq bar appears on the 1-min row during which it closes, and stays until the
 next one closes. The 15-min bar 10:00–10:14:59 appears on the 10:14 row, and the day bar on the session's
