@@ -1,4 +1,4 @@
-# Bar sizes built by pipeline/to_dat.py. Second bars are appended last so every other column keeps its
+# Bar sizes built by data_pipeline/to_dat.py. Second bars are appended last so every other column keeps its
 # position from the HSI layout.
 FREQS = ["1", "5", "10", "15", "30", "60", "day", "1s", "15s", "5s"]
 # Bar sizes also written as OHLCV parquet
@@ -13,6 +13,6 @@ DAT_COLS = ['start_ind', 'ts', 'price'] + [c for f in FREQS for c in (f'high_{f}
 CHILD = {'day': '60', '60': '30', '30': '10', '10': '5', '15': '5',
          '5': '1', '1': '15s', '15s': '5s', '5s': '1s', '1s': None}
 
-# tick.dat that StopSearch.load() opens when no path is given: the one pipeline/to_dat.py writes with
+# tick.dat that StopSearch.load() opens when no path is given: the one data_pipeline/to_dat.py writes with
 # its default --out (tests/test_stop_search.py checks the two agree)
 DAT_PATH = 'data/processed/tick.dat'

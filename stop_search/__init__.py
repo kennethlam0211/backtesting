@@ -4,7 +4,7 @@ _LAZY = ('PRICE_COL', 'StopSearch', 'first_hit', 'first_hit_many', 'load_dat')
 
 
 def __getattr__(name):
-    # The numba code loads on first use, so `from stop_search.params import ...` (pipeline/to_dat.py) stays light
+    # The numba code loads on first use, so `from stop_search.params import ...` (data_pipeline/to_dat.py) stays light
     if name in _LAZY:
         from . import stop_search
         return getattr(stop_search, name)

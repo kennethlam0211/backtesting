@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from pipeline.to_dat import process_session
+from data_pipeline.to_dat import process_session
 from stop_search import first_hit, first_hit_many, load_dat, StopSearch, CHILD, DAT_COLS, FREQS, PRICE_COL
 
 NEXT = {f: DAT_COLS.index(f'next_ind_{f}') for f in FREQS}
@@ -366,8 +366,8 @@ def test_load_defaults_to_params_dat_path(data, tmp_path, monkeypatch):
 
 
 def _default(script, option):
-    """An argparse default from a pipeline script, read from its source."""
-    src = open(os.path.join(os.path.dirname(__file__), '..', 'pipeline', script)).read()
+    """An argparse default from a data_pipeline script, read from its source."""
+    src = open(os.path.join(os.path.dirname(__file__), '..', 'data_pipeline', script)).read()
     return re.search(rf'"{option}".*?default="([^"]+)"', src).group(1)
 
 
@@ -376,4 +376,4 @@ def test_default_paths_agree_with_to_dat():
     from stop_search import DAT_PATH
     out = _default('to_dat.py', '--out')
     assert os.path.normpath(os.path.join(out, 'tick.dat')) == os.path.normpath(DAT_PATH), "update DAT_PATH in stop_search/params.py"
-    assert os.path.normpath(_default('data_preprocessing.py', '--data-dir')) == os.path.normpath(out), "update --data-dir in data_preprocessing.py"
+    assert os.path.normpath(_default('data_preprocessing(template).py', '--data-dir')) == os.path.normpath(out), "update --data-dir in data_preprocessing(template).py"
