@@ -82,7 +82,7 @@ def _first_hit_one(data, ind, chain, price_col, upper, lower):
 
 @njit(parallel=True, cache=True)
 def _first_hit_many(data, starts, chain, price_col, upper, lower):
-    out = np.empty(len(starts), dtype=np.int64)
+    out = np.empty(len(starts), dtype=np.int8)
     for q in prange(len(starts)):
         out[q] = _first_hit_one(data, starts[q], chain, price_col, upper[q], lower[q])
     return out
@@ -148,7 +148,7 @@ def first_hit(data, freq, start_idx, upper, lower):
     """
     Which level each entry's `freq` bar touches first, looking only inside that bar.
 
-    Takes one entry or many: ints give an int back; 1-D arrays give an int64 array back, one value
+    Takes one entry or many: ints give an int back; 1-D arrays give an int8 array back, one value
     per entry in input order. Scalars broadcast against arrays (e.g. one level for every entry).
     Many entries run in one compiled call across all CPU cores (NUMBA_NUM_THREADS caps it).
     For use from another class, TickData holds the loaded ticks and offers the same call.
@@ -171,7 +171,8 @@ def first_hit(data, freq, start_idx, upper, lower):
          1  upper is hit first (a long's take-profit, a short's stop)
         -1  lower is hit first (a long's stop, a short's take-profit)
          0  neither is hit inside the bar (skip)
-        An int for one entry, an int64 array for many.
+        An int for one entry, an int8 array for many (cast with .astype(np.int64) before doing
+        arithmetic on it: int8 holds only -128..127).
 
     Raises:
         ValueError: a start row is outside the data or not the first tick of a `freq` bar, a level
@@ -288,7 +289,7 @@ class TickData:
         """
         first_hit on these ticks (arguments and errors as the module-level first_hit).
         Returns 1 if upper is hit first, -1 if lower is, 0 if neither is hit inside the bar;
-        an int for one entry, an int64 array for many.
+        an int for one entry, an int8 array for many.
         """
         return _first_hit(self.data, self._chains[freq], self.price_col, freq, start_idx, upper, lower)
 

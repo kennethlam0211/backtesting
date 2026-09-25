@@ -139,7 +139,7 @@ def test_arrays_match_single_calls(data, freq):
     hi = p0 + rng.integers(0, 80, len(starts))
     lo = p0 - rng.integers(0, 80, len(starts))
     sides = first_hit(data, freq, starts, hi, lo)
-    assert sides.dtype == np.int64  # safe for P&L arithmetic (sides * tp)
+    assert sides.dtype == np.int8
     assert sides.tolist() == [first_hit(data, freq, int(s), int(h), int(l)) for s, h, l in zip(starts, hi, lo)]
 
 
