@@ -13,6 +13,6 @@ DAT_COLS = ['start_ind', 'ts', 'price'] + [c for f in FREQS for c in (f'high_{f}
 CHILD = {'day': '60', '60': '30', '30': '10', '10': '5', '15': '5',
          '5': '1', '1': '15s', '15s': '5s', '5s': '1s', '1s': None}
 
-# tick.dat that StopSearch.load() opens when no path is given (pipeline/to_dat.py writes it there
-# with its default --out ./data/dat)
-DAT_PATH = 'data/dat/tick.dat'
+# tick.dat that StopSearch.load() opens when no path is given: the one pipeline/to_dat.py writes with
+# its default --out (tests/test_stop_search.py checks the two agree)
+DAT_PATH = 'data/processed/tick.dat'
