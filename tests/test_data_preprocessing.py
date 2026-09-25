@@ -1,0 +1,179 @@
+"""
+data_pipeline/data_preprocessing.py (polars) against reference/preprocessing_pandas.py, and no look-ahead:
+- every higher-freq bar appears on the 1-min row during which it closes, not sooner and not later;
+- cutting the data off at any time T leaves every row that ended by T exactly as it was (nothing reads ahead).
+The bars come from the real pipeline (to_ticks -> process_session), with many minutes without trades.
+"""
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+import pytest
+
+import reference.preprocessing_pandas as ref
+from data_pipeline import data_preprocessing as dp
+from data_pipeline import raw_data_preprocessing as step1
+from data_pipeline import to_dat as step2
+from stop_search.params import PARQUET_FREQS
+
+SESSIONS = ["2024-03-04", "2024-03-05", "2024-03-06"]
+FREQS = ["1", "15", "60", "day"]
+
+
+def raw_session(date, rng):
+    """Sparse raw trades (about 30% of minutes have none, as overnight), busy in the session's last 2 minutes."""
+    day = pd.Timestamp(date)
+    secs = pd.date_range(day - pd.Timedelta(hours=6), day + pd.Timedelta(hours=17), freq="1s", tz="America/New_York", inclusive="left")
+    busy = secs >= (day + pd.Timedelta(hours=16, minutes=58)).tz_localize("America/New_York")
+    secs = secs[rng.random(len(secs)) < np.where(busy, 0.5, 0.02)]
+    price = 5100 + 0.25 * np.cumsum(rng.integers(-2, 3, len(secs)))
+    return pa.table({
+        "ts_event": pa.array(secs.tz_convert("UTC").values, pa.timestamp("ns", tz="UTC")),
+        "price": pa.array(price, pa.float64()),
+        "size": pa.array(rng.integers(1, 10, len(secs)), pa.int64()),
+    })
+
+
+RNG = np.random.default_rng(5)
+TICKS = {date: step1.to_ticks(raw_session(date, RNG), pd.Timestamp(date), "ESH4").to_pandas() for date in SESSIONS}
+
+
+def write_bars(folder, cutoff=None):
+    """The bar files of the three sessions as step 2 writes them; with `cutoff`, only the ticks before it."""
+    bars = {f: [] for f in PARQUET_FREQS}
+    for date, ticks in TICKS.items():
+        if cutoff is not None:
+            ticks = ticks[ticks["ts"] < cutoff]
+        if len(ticks):
+            _, resampled, _ = step2.process_session(ticks.reset_index(drop=True), pd.Timestamp(date).date())
+            for f in PARQUET_FREQS:
+                bars[f].append(resampled[f])
+    for f in PARQUET_FREQS:
+        pq.write_table(step2.bars_table(bars[f]), folder / f"{f}_ohlcv.parquet")
+    return folder
+
+
+def build(folder):
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(dp, "FREQS", FREQS)
+        return dp.DataPreprocessor(str(folder)).build_merged_dataset().to_pandas()
+
+
+@pytest.fixture(scope="module")
+def data_dir(tmp_path_factory):
+    return write_bars(tmp_path_factory.mktemp("bars"))
+
+
+@pytest.fixture(scope="module")
+def merged(data_dir):
+    return build(data_dir)
+
+
+def test_features_match_the_pandas_reference(data_dir):
+    new = dp.DataPreprocessor(str(data_dir)).process_frequency("1").to_pandas()
+    old = pd.read_parquet(data_dir / "1_ohlcv.parquet").sort_values("ts").reset_index(drop=True)
+    ref.sma(old, 20)
+    ref.std(old, 20)
+    ref.atr(old, 20)
+    ref.sma_rsi(old, 20)
+    old = ref.fvg(old, 20)
+    old["20_std_1"] = old["20_std"]
+    old = ref.UD_cal(old, "close", 20, "1")
+
+    for col in ["20_sma", "20_std", "20_atr", "20_sma_rsi", "20_fvg"]:
+        np.testing.assert_allclose(new[f"{col}_1"].to_numpy(float), old[col].to_numpy(float),
+                                   rtol=0, atol=1e-6, equal_nan=True, err_msg=col)
+    # U/D: the reference picks its starting side from 10 bars ahead; without that peek the levels differ
+    # until the state first resets (about 35 bars at most), then match exactly
+    for col in ["20_U", "20_D", "20_UD_flag"]:
+        np.testing.assert_allclose(new[f"{col}_1"].to_numpy(float)[100:], old[f"{col}_1"].to_numpy(float)[100:],
+                                   rtol=0, atol=1e-6, equal_nan=True, err_msg=col)
+    assert (old["20_U_1"].iloc[100:] > 0).any()  # the U/D levels were really compared
+
+
+def test_bollinger_bands_are_2_sigma(data_dir):
+    new = dp.DataPreprocessor(str(data_dir)).process_frequency("1").to_pandas()
+    sma, std = new["20_sma_1"], new["20_std_1"]
+    ok = std > 0
+    np.testing.assert_allclose(new["20_bbands_1"][ok], ((new["close_1"] - sma) / (2 * std))[ok])
+    np.testing.assert_allclose(new["20_bband_upper_1"], sma + 2 * std)
+    np.testing.assert_allclose(new["20_bband_lower_1"], sma - 2 * std)
+
+
+@pytest.mark.parametrize("freq", ["15", "60", "day"])
+def test_higher_freq_bar_appears_when_it_closes(data_dir, merged, freq):
+    bars = pd.read_parquet(data_dir / f"{freq}_ohlcv.parquet").sort_values("ts").reset_index(drop=True)
+    length = 24 * 3600 if freq == "day" else int(freq) * 60
+    closes = np.minimum(bars["ts"] + length, bars["ts"] // 86400 * 86400 + 23 * 3600)  # sessions end at 23:00
+
+    rows = merged["ts"].to_numpy()
+    # The newest bar that has closed by the end of each 1-min row (row ts + 60 s)
+    k = np.searchsorted(closes.to_numpy(), rows + 60, side="right") - 1
+    expected = np.where(k >= 0, bars["close"].to_numpy()[np.maximum(k, 0)], np.nan)
+    got = merged[f"close_{freq}"].to_numpy(float)
+    np.testing.assert_array_equal(got, expected)
+
+    if freq != "day":  # and the join really was tested across gaps: some bars close in a minute without trades
+        assert not np.isin(closes - 60, rows).all()
+
+
+def test_day_bar_waits_for_the_session_end(merged):
+    ts = pd.to_datetime(merged["ts"], unit="s")
+    first_day = ts.dt.date == pd.Timestamp(SESSIONS[0]).date()
+    before_close = first_day & (ts.dt.time < pd.Timestamp("22:59").time())
+    assert merged.loc[before_close, "close_day"].isna().all()  # no day bar before its session closes
+    second_day = ts.dt.date == pd.Timestamp(SESSIONS[1]).date()
+    assert merged.loc[second_day, "close_day"].notna().all()  # the previous session's bar all day
+
+
+def cutoffs():
+    """
+    Cut times inside the last minute of 15-min, 60-min and day bars, with trades of that bar still to come:
+    where a bar shown even a minute early would be missing them. Plus a few times anywhere.
+    """
+    ts = TICKS[SESSIONS[1]]["ts"]
+    sec = ((ts - ts.dt.normalize()).dt.total_seconds()).astype(int).to_numpy()
+    out = []
+    for minutes in (15, 60, 23 * 60):  # the day bar ends with the session at 23:00
+        length = minutes * 60
+        last_minute = sec % length >= length - 60
+        found = 0
+        for bar in np.unique(sec[last_minute] // length):
+            times = np.unique(sec[last_minute & (sec // length == bar)])
+            if len(times) >= 2 and found < 2:
+                out.append(ts.dt.normalize().iloc[0] + pd.Timedelta(seconds=int(times[0]) + 1))
+                found += 1
+    return out + [pd.Timestamp(t) for t in ("2024-03-05 03:17:31", "2024-03-06 15:45:00")]
+
+
+def test_no_look_ahead_cut_the_data_at_any_time(merged, tmp_path):
+    # Everything is rebuilt from the ticks before each cutoff: the rows that ended by then must not change
+    cuts = cutoffs()
+    assert len(cuts) >= 6
+    for i, cut in enumerate(cuts):
+        folder = tmp_path / str(i)
+        folder.mkdir()
+        part = build(write_bars(folder, cutoff=cut))
+        done = lambda df: df[df["ts"] + 60 <= int(cut.timestamp())].reset_index(drop=True)
+        pd.testing.assert_frame_equal(done(part), done(merged), obj=f"rows ended by {cut}")
+
+
+def test_ud_levels_never_read_ahead():
+    rng = np.random.default_rng(9)
+    for trial in range(20):
+        px = 20400 + np.cumsum(rng.integers(-3, 4, 2000)).astype(float)
+        if trial % 2:
+            px[:11] = px[0] + np.arange(11)  # rising at the start: where the reference peeked 10 bars ahead
+        kv = pd.Series(px).rolling(20).std(ddof=0).to_numpy()
+        full = dp._calc_ud_levels(px, kv)
+        for k in (1, 5, 11, 25, 500):
+            for a, b in zip(dp._calc_ud_levels(px[:k], kv[:k]), full):
+                np.testing.assert_array_equal(a, b[:k])
+
+
+def test_main_writes_next_to_the_bars(data_dir, capsys, monkeypatch):
+    monkeypatch.setattr(dp, "FREQS", FREQS)
+    dp.main(["--data-dir", str(data_dir)])
+    out = pd.read_parquet(data_dir / "training_data.parquet")
+    assert len(out) == len(pd.read_parquet(data_dir / "1_ohlcv.parquet"))
+    assert "Data saved to" in capsys.readouterr().out

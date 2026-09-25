@@ -1,13 +1,28 @@
-import os
-import sys
-# Add the project root to path so we can import params correctly
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+"""
+Bar features for the RL agent: the polars version of reference/preprocessing_pandas.py. Runs after step 2:
 
-import polars as pl
+    python -m data_pipeline.data_preprocessing                  # step 2's default output -> training_data.parquet in it
+    python -m data_pipeline.data_preprocessing --data-dir data/processed_2024 --out data/features_2024.parquet
+
+Reads {data-dir}/{freq}_ohlcv.parquet for every freq in params.FREQS and adds, per freq (window 20): SMA, std,
+Bollinger bands (2 sigma), ATR, SMA-RSI, FVG, bar-to-bar moves, bar score and the U/D levels. Every higher
+freq is then joined onto the 1-min bars: a bar appears on the 1-min row during which it closes and stays
+until the next one closes, so a row holds nothing from the future once that 1-min bar has closed.
+Prices are in ticks (x4), like the bar files.
+"""
+import argparse
+import os
+import time
+
 import numpy as np
+import polars as pl
 from numba import njit
 
-from params.params import NORM_FACTOR, WINDOW_SIZE, FREQS
+from data_pipeline.to_dat import DEFAULT_OUT as DATA_DIR
+from params import FREQS, NORM_FACTOR
+
+# A session is [00:00, 23:00) on the shifted clock (New York + 6h): no bar runs past 23:00
+SESSION_SECONDS = 23 * 3600
 
 @njit(cache=True)
 def _calc_ud_levels(px, kv):
@@ -21,12 +36,10 @@ def _calc_ud_levels(px, kv):
 
     for i in range(n):
         if i == 0:
-            if i+10 < n and px[i+10] - px[i] > 0:
-                U_last = px[i]
-                D_last = 0.0
-            else:
-                U_last = 0.0
-                D_last = px[i]
+            # Start on the D side. The reference picked the side from 10 bars ahead (px[i+10]): a peek at the
+            # future, so it is left out; the levels only differ from the reference until the state first resets.
+            U_last = 0.0
+            D_last = px[i]
 
         U_update = U_last
         D_update = D_last
@@ -59,7 +72,11 @@ def _calc_ud_levels(px, kv):
         U_last = U_update
         D_last = D_update
 
-    # Shift forward by 1 to prevent look-ahead
+    # A level of 0 means "no level": NaN, as in the reference (not a price of 0)
+    U_arr[U_arr == 0] = np.nan
+    D_arr[D_arr == 0] = np.nan
+
+    # Shift forward by 1 to prevent look-ahead (the level at i-1 is only known at bar i)
     U_out = np.concatenate((np.array([np.nan]), U_arr[:-1]))
     D_out = np.concatenate((np.array([np.nan]), D_arr[:-1]))
     flag_out = np.concatenate((np.array([-1], dtype=np.int8), flag_arr[:-1]))
@@ -69,11 +86,9 @@ def _calc_ud_levels(px, kv):
 
 def calc_ud_levels_polars(df: pl.DataFrame, window: int) -> pl.DataFrame:
     """Wrapper to run the Numba UD level calculation inside Polars."""
-    px = df['close'].to_numpy(zero_copy_only=False).astype(np.float64)
-    kv = df[f'{window}_std'].to_numpy(zero_copy_only=False).astype(np.float64)
-
-    # Fill nulls in kv with 0 to prevent numba issues at the start of the array
-    kv = np.nan_to_num(kv, nan=0.0)
+    px = df['close'].to_numpy().astype(np.float64)
+    # The first window-1 bars have no std: NaN, so every comparison with it is False, as in the reference
+    kv = df[f'{window}_std'].to_numpy().astype(np.float64)
 
     u, d, flag = _calc_ud_levels(px, kv)
 
@@ -104,7 +119,7 @@ class DataPreprocessor:
             ]).alias('_tr')
         ])
 
-        # 2. Bollinger Bands
+        # 2. Bollinger Bands, 2 sigma (the pandas reference used 4)
         lf = lf.with_columns([
             ((pl.col('close') - pl.col(f'{window}_sma')) / (2 * pl.col(f'{window}_std'))).alias(f'{window}_bbands'),
             pl.col(f'{window}_sma').alias(f'{window}_bband_mid'),
@@ -112,17 +127,18 @@ class DataPreprocessor:
             (pl.col(f'{window}_sma') - pl.col(f'{window}_std') * 2).alias(f'{window}_bband_lower')
         ])
 
-        # 3. ATR (Wilder's Smoothing)
+        # 3. ATR (Wilder's smoothing over 14 bars, whatever the window, as in the reference)
         lf = lf.with_columns(
-            pl.col('_tr').ewm_mean(com=13, ignore_nulls=True, adjust=False).alias(f'{window}_atr')
+            pl.col('_tr').ewm_mean(com=13, min_samples=14, ignore_nulls=True, adjust=False).alias(f'{window}_atr')
         ).drop('_tr')
 
         # 4. SMA RSI (Custom Logic)
         lf = lf.with_columns([
             (pl.col('close') - pl.col('close').shift(1)).alias('_change')
         ]).with_columns([
-            pl.when(pl.col('_change') > 0).then(pl.col('_change')).otherwise(0).rolling_mean(14).alias('_avg_gain'),
-            pl.when(pl.col('_change') < 0).then(pl.col('_change').abs()).otherwise(0).rolling_mean(14).alias('_avg_loss')
+            # clip keeps the first bar's missing change missing, as pandas does
+            pl.col('_change').clip(lower_bound=0).rolling_mean(14).alias('_avg_gain'),
+            (-pl.col('_change')).clip(lower_bound=0).rolling_mean(14).alias('_avg_loss')
         ]).with_columns([
             (pl.col('_avg_gain') / pl.col('_avg_loss')).alias('_rs')
         ]).with_columns([
@@ -207,21 +223,16 @@ class DataPreprocessor:
             if freq == '1':
                 continue
 
-            print(f"Processing and joining {freq}m data...")
+            print(f"Processing and joining {freq if freq == 'day' else freq + 'm'} data...")
             df_htf = self.process_frequency(freq)
 
-            # Prevent Look-Ahead Bias:
-            # A 15m bar starting at 10:00 contains data up to 10:14:59.
-            # In the original pandas script, this bar became visible to the 1m agent at exactly 10:14:00 (the closing minute).
-            # To replicate this, we shift the HTF's timestamp forward by (duration - 1 minute).
-            if freq == 'day':
-                # Shift by 24 hours - 1 minute
-                shift_seconds = (24 * 3600) - 60
-            else:
-                shift_seconds = (int(freq) * 60) - 60
-
+            # No look-ahead: a bar appears on the 1-min row during which it closes, i.e. its ts moves to its
+            # close minus 1 minute. The 15-min bar 10:00-10:14:59 lands on the 10:14 row, whose close is 10:15:00.
+            # A bar closes after its length, or at the session end (23:00) if that comes first (the day bar).
+            bar_seconds = 24 * 3600 if freq == 'day' else int(freq) * 60
+            session_end = (pl.col('ts') // 86400) * 86400 + SESSION_SECONDS
             df_htf = df_htf.with_columns(
-                (pl.col('ts') + shift_seconds).alias('ts')
+                (pl.min_horizontal(pl.col('ts') + bar_seconds, session_end) - 60).alias('ts')
             )
 
             # ASOF JOIN: For every 1-minute tick, find the MOST RECENT *completed* higher timeframe bar.
@@ -234,25 +245,23 @@ class DataPreprocessor:
 
         return df_1m
 
-if __name__ == "__main__":
-    from params.params import DATA_PATH
-    import time
-
-    # Expand tilde in path
-    path = os.path.expanduser(DATA_PATH)
-
-    preprocessor = DataPreprocessor(data_dir=path)
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Bar features, higher freqs joined onto the 1-min bars.")
+    parser.add_argument("--data-dir", default=DATA_DIR, help="step 2's output folder with the {freq}_ohlcv.parquet files")
+    parser.add_argument("--out", default=None, help="output parquet (default: training_data.parquet in --data-dir)")
+    args = parser.parse_args(argv)
+    out = args.out or os.path.join(args.data_dir, "training_data.parquet")
 
     t0 = time.time()
-    final_df = preprocessor.build_merged_dataset()
-    t1 = time.time()
-
-    print(f"\\nPipeline completed in {t1 - t0:.2f} seconds!")
+    final_df = DataPreprocessor(data_dir=args.data_dir).build_merged_dataset()
+    print(f"\nPipeline completed in {time.time() - t0:.2f} seconds!")
     print(f"Final shape: {final_df.shape}")
     print("Sample of merged data:")
     print(final_df.tail())
 
-    # Write to final output file
-    output_file = os.path.join(path, "training_data.parquet")
-    final_df.write_parquet(output_file)
-    print(f"Data saved to: {output_file}")
+    final_df.write_parquet(out)
+    print(f"Data saved to: {out}")
+
+
+if __name__ == "__main__":
+    main()

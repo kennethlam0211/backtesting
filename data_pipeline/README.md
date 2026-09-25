@@ -25,7 +25,7 @@ date range, a subset, or other paths.
 ```
 init    raw_data/ES_*_trades_<date>.parquet ─┐
         raw_data/roll_open_blocks/           ├─ 1 ─> tick parquet ─ 2 ─> tick.dat ──────────> stop_search.StopSearch / first_hit
-        raw_data/pdt_codes.csv               │                           {freq}_ohlcv.parquet ─> features (template below)
+        raw_data/pdt_codes.csv               │                           {freq}_ohlcv.parquet ─> data_preprocessing.py ─> training_data.parquet
         params/news_events.yaml ─────────────┘
 append  MongoDB (IB_recorder) ─────────┐
         params/holidays.yaml           ├─ 1 (to_ticks) ─> + new sessions ─ 2 ─> + new rows and bars
@@ -190,6 +190,32 @@ Bar sizes and the `tick.dat` layout come from `stop_search/params.py`. Changing 
 the file layout: rerun this step before using `stop_search` again. If you change the default `--out`,
 update `DAT_PATH` in `stop_search/params.py` and `--data-dir` in `data_preprocessing(template).py` to
 match (`pytest` fails until they agree).
+
+## 3. `data_preprocessing.py` — bar features for the RL agent
+
+```bash
+python -m data_pipeline.data_preprocessing                                             # step 2's default output
+python -m data_pipeline.data_preprocessing --data-dir data/processed_2024 --out data/features_2024.parquet
+```
+
+| | |
+|---|---|
+| Reads | `{--data-dir}/{freq}_ohlcv.parquet` for every freq in `params.FREQS` (default folder: step 2's default output) |
+| Writes | `--out` (default `training_data.parquet` in `--data-dir`): one row per 1-min bar, with every freq's bars and features as columns suffixed `_{freq}` |
+| Features | Per freq, window 20: SMA, std, Bollinger bands (2 sigma), ATR (Wilder, 14), SMA-RSI (14), FVG, bar-to-bar moves `HO HH HL HC`, `bar_score` (`params.NORM_FACTOR`), U/D levels |
+
+The polars version of `reference/preprocessing_pandas.py`. It gives the same values
+(`tests/test_data_preprocessing.py` checks this), with two deliberate differences:
+- Bollinger bands are 2 sigma; the reference used 4.
+- U/D no longer peeks 10 bars ahead to choose its starting side. The levels differ from the reference
+  for the first bars only, until the state first resets (about 35 bars at most).
+
+**No look-ahead.** A higher-freq bar appears on the 1-min row during which it closes, and stays until the
+next one closes. The 15-min bar 10:00–10:14:59 appears on the 10:14 row, and the day bar on the session's
+last minute, 22:59. So a row holds nothing that happens after that 1-min bar closes: use it at the row's
+close, and enter on the next bar. The join is on time, not row order, so minutes without trades change
+nothing. The test cuts the data off at many times T, including inside a bar's last minute, rebuilds
+everything, and checks that every row that ended by T is unchanged.
 
 ## Template: `data_preprocessing(template).py` — bar features
 
