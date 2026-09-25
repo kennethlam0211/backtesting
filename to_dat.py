@@ -209,6 +209,7 @@ def main():
     in_flight = deque()
 
     dat_path = os.path.join(args.out, 'tick.dat')
+    dat_tmp_path = os.path.join(args.out, 'tick.dat.tmp')
     col_names = ['start_ind', 'ts', 'price']
     for f in FREQS:
         col_names.extend([f'high_{f}', f'low_{f}', f'next_ind_{f}'])
@@ -218,8 +219,8 @@ def main():
     # but we can't easily dynamically resize a raw memmap cleanly in Windows/Linux without
     # rewriting the file or pre-allocating.
     # A cleaner approach for streaming is a raw binary append.
-
-    dat_file = open(dat_path, 'wb')
+    # We write to a .tmp file first, and only rename it to .dat if the entire script finishes successfully.
+    dat_file = open(dat_tmp_path, 'wb')
 
     global_offset = 0
     # Bars go to one parquet per freq, written as they come (flushed ~1M rows at a time) so RAM stays flat
@@ -337,6 +338,9 @@ def main():
         w.close()
 
     dat_file.close()
+
+    # Atomic rename: guarantees that if tick.dat exists, it is 100% complete.
+    os.rename(dat_tmp_path, dat_path)
 
     t_end_all = time.monotonic()
 
