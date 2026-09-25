@@ -12,7 +12,9 @@ import pandas as pd
 import pytest
 
 from data_pipeline.to_dat import process_session
-from stop_search import first_hit, first_hit_many, load_dat, StopSearch, CHILD, DAT_COLS, FREQS, PRICE_COL
+from stop_search import StopSearch, CHILD, DAT_COLS, FREQS
+
+PRICE_COL = DAT_COLS.index('price')
 
 NEXT = {f: DAT_COLS.index(f'next_ind_{f}') for f in FREQS}
 HIGH = {f: DAT_COLS.index(f'high_{f}') for f in FREQS}
@@ -64,6 +66,11 @@ def data():
     return build_dat(rng, [datetime.date(2024, 3, 11), datetime.date(2024, 3, 12)])
 
 
+@pytest.fixture(scope='module')
+def stops(data):
+    return StopSearch(data)
+
+
 def test_child_bars_tile_their_parent(data):
     # The search relies on this: a parent's children start on its first row and end exactly at its end
     for parent, child in CHILD.items():
@@ -78,7 +85,7 @@ def test_child_bars_tile_their_parent(data):
 
 
 @pytest.mark.parametrize('freq', list(CHILD))
-def test_matches_tick_scan(data, freq):
+def test_matches_tick_scan(stops, data, freq):
     rng = np.random.default_rng(1)
     starts = np.flatnonzero(data[:, NEXT[freq]])
     sample = rng.choice(starts, size=min(300, len(starts)), replace=False)
@@ -89,35 +96,35 @@ def test_matches_tick_scan(data, freq):
             hi = p0 + int(rng.integers(0, 80))
             lo = p0 - int(rng.integers(0, 80))
             want = tick_scan(data, i, data[i, NEXT[freq]], hi, lo)
-            assert first_hit(data, freq, i, hi, lo) == want, f"{freq} bar at row {i}, levels {hi}/{lo}"
+            assert stops.first_hit(freq, i, hi, lo) == want, f"{freq} bar at row {i}, levels {hi}/{lo}"
             sides.append(want)
     assert {1, -1} <= set(sides)
 
 
-def test_both_levels_in_one_second_walks_ticks(data):
+def test_both_levels_in_one_second_walks_ticks(stops, data):
     starts = np.flatnonzero(data[:, NEXT['1s']])
     both = [i for i in starts if data[i, HIGH['1s']] > data[i, LOW['1s']]]
     assert len(both) > 50
     for i in both:
         hi, lo = data[i, HIGH['1s']], data[i, LOW['1s']]
-        assert first_hit(data, '1s', i, hi, lo) == tick_scan(data, i, data[i, NEXT['1s']], hi, lo)
+        assert stops.first_hit('1s', i, hi, lo) == tick_scan(data, i, data[i, NEXT['1s']], hi, lo)
 
 
-def test_clean_bar_is_skipped_even_if_a_later_bar_hits(data):
+def test_clean_bar_is_skipped_even_if_a_later_bar_hits(stops, data):
     for i in np.flatnonzero(data[:, NEXT['5']]):
         hi, lo = data[i, HIGH['5']] + 1, data[i, LOW['5']] - 1
         if tick_scan(data, i, len(data), hi, lo) != 0:
             break
     else:
         pytest.fail("no 5-min bar with a later hit")
-    assert first_hit(data, '5', i, hi, lo) == 0
+    assert stops.first_hit('5', i, hi, lo) == 0
 
 
-def test_start_must_be_first_tick_of_the_bar(data):
+def test_start_must_be_first_tick_of_the_bar(stops, data):
     i = int(np.flatnonzero(data[:, NEXT['60']] == 0)[0])
     p0 = data[i, PRICE_COL]
     with pytest.raises(ValueError):
-        first_hit(data, '60', i, p0 + 4000, p0 - 4000)
+        stops.first_hit('60', i, p0 + 4000, p0 - 4000)
 
 
 def test_inconsistent_summaries_raise(data):
@@ -127,66 +134,66 @@ def test_inconsistent_summaries_raise(data):
     p0 = bad[i, PRICE_COL]
     bad[i, HIGH['1']], bad[i, LOW['1']] = p0 + 4000, p0 - 4000
     with pytest.raises(ValueError):
-        first_hit(bad, '1', i, p0 + 2000, p0 - 2000)
+        StopSearch(bad).first_hit('1', i, p0 + 2000, p0 - 2000)
 
 
 @pytest.mark.parametrize('freq', list(CHILD))
-def test_arrays_match_single_calls(data, freq):
+def test_arrays_match_single_calls(stops, data, freq):
     rng = np.random.default_rng(2)
     starts = rng.choice(np.flatnonzero(data[:, NEXT[freq]]), size=2000)
     p0 = data[starts, PRICE_COL]
     hi = p0 + rng.integers(0, 80, len(starts))
     lo = p0 - rng.integers(0, 80, len(starts))
-    sides = first_hit_many(data, freq, starts, hi, lo)
+    sides = stops.first_hit_many(freq, starts, hi, lo)
     assert sides.dtype == np.int8
-    assert sides.tolist() == [first_hit(data, freq, int(s), int(h), int(l)) for s, h, l in zip(starts, hi, lo)]
+    assert sides.tolist() == [stops.first_hit(freq, int(s), int(h), int(l)) for s, h, l in zip(starts, hi, lo)]
 
 
-def test_one_entry_gives_int_and_scalars_broadcast(data):
+def test_one_entry_gives_int_and_scalars_broadcast(stops, data):
     starts = np.flatnonzero(data[:, NEXT['15']])[:300]
     p0 = int(data[starts[0], PRICE_COL])
-    side = first_hit(data, '15', starts[0], np.int64(p0 + 100), p0 - 100)
+    side = stops.first_hit('15', starts[0], np.int64(p0 + 100), p0 - 100)
     assert type(side) is int
     # the same two levels for every entry
-    sides = first_hit_many(data, '15', starts, p0 + 100, p0 - 100)
-    assert sides.tolist() == [first_hit(data, '15', int(s), p0 + 100, p0 - 100) for s in starts]
-    assert first_hit_many(data, '15', starts[:0], p0 + 100, p0 - 100).shape == (0,)
+    sides = stops.first_hit_many('15', starts, p0 + 100, p0 - 100)
+    assert sides.tolist() == [stops.first_hit('15', int(s), p0 + 100, p0 - 100) for s in starts]
+    assert stops.first_hit_many('15', starts[:0], p0 + 100, p0 - 100).shape == (0,)
     with pytest.raises(ValueError):
-        first_hit_many(data, '15', starts[:3], np.array([p0, p0]), p0 - 100)  # lengths 2 and 3
+        stops.first_hit_many('15', starts[:3], np.array([p0, p0]), p0 - 100)  # lengths 2 and 3
 
 
-def test_arrays_reject_bad_starts_and_broken_summaries(data):
+def test_arrays_reject_bad_starts_and_broken_summaries(stops, data):
     starts = np.flatnonzero(data[:, NEXT['1']])[:500]
     p0 = data[starts, PRICE_COL]
     with pytest.raises(ValueError):
-        first_hit_many(data, '1', starts + 1, p0 + 100, p0 - 100)  # rows after a bar start
+        stops.first_hit_many('1', starts + 1, p0 + 100, p0 - 100)  # rows after a bar start
     bad = data.copy()
     i = starts[10]
     bad[i, HIGH['1']], bad[i, LOW['1']] = p0[10] + 4000, p0[10] - 4000
     with pytest.raises(ValueError):
-        first_hit_many(bad, '1', starts, p0 + 2000, p0 - 2000)
+        StopSearch(bad).first_hit_many('1', starts, p0 + 2000, p0 - 2000)
 
 
-def test_load_dat_reads_to_dat_layout(data, tmp_path):
+def test_load_reads_to_dat_layout(data, tmp_path):
     path = tmp_path / 'tick.dat'
     data.tofile(path)
-    mm = load_dat(path)
-    assert mm.shape == data.shape
-    i = int(np.flatnonzero(mm[:, NEXT['60']])[3])
-    p0 = mm[i, PRICE_COL]
-    assert first_hit(mm, '60', i, p0 + 100, p0 - 100) == tick_scan(data, i, data[i, NEXT['60']], p0 + 100, p0 - 100)
+    mm = StopSearch.load(path)
+    assert mm.data.shape == data.shape
+    i = int(mm.bar_starts('60')[3])
+    p0 = mm.price(i)
+    assert mm.first_hit('60', i, p0 + 100, p0 - 100) == tick_scan(data, i, data[i, NEXT['60']], p0 + 100, p0 - 100)
 
     with open(path, 'ab') as f:
         f.write(b'\0' * 8)
     with pytest.raises(ValueError):
-        load_dat(path)
+        StopSearch.load(path)
 
 
-def test_zero_d_arrays_count_as_one_entry(data):
+def test_zero_d_arrays_count_as_one_entry(stops, data):
     i = int(np.flatnonzero(data[:, NEXT['5']])[7])
     p0 = data[i, PRICE_COL]
-    side = first_hit(data, '5', np.array(i), np.array(p0 + 100), np.array(p0 - 100))
-    assert type(side) is int and side == first_hit(data, '5', i, int(p0) + 100, int(p0) - 100)
+    side = stops.first_hit('5', np.array(i), np.array(p0 + 100), np.array(p0 - 100))
+    assert type(side) is int and side == stops.first_hit('5', i, int(p0) + 100, int(p0) - 100)
 
 
 class Backtester:
@@ -212,7 +219,7 @@ def dat_file(data, tmp_path_factory):
     return path
 
 
-def test_stopsearch_matches_function(data):
+def test_stopsearch_bar_helpers(data):
     ticks = StopSearch(data)
     assert len(ticks) == len(data)
     for freq in CHILD:
@@ -220,10 +227,7 @@ def test_stopsearch_matches_function(data):
         assert np.array_equal(starts, np.flatnonzero(data[:, NEXT[freq]]))
         assert ticks.bar_starts(freq) is starts  # cached
         assert np.array_equal(ticks.bar_end(freq, starts), data[starts, NEXT[freq]])
-        entry = ticks.price(starts)
-        want = first_hit_many(data, freq, starts, entry + 40, entry - 20)
-        assert np.array_equal(ticks.first_hit_many(freq, starts, entry + 40, entry - 20), want)
-        assert ticks.first_hit(freq, int(starts[0]), int(entry[0]) + 40, int(entry[0]) - 20) == want[0]
+        assert np.array_equal(ticks.price(starts), data[starts, PRICE_COL])
 
 
 def test_stopsearch_rejects_child_tables_that_do_not_tile(data):
@@ -256,39 +260,39 @@ def test_owner_class_works_in_worker_processes(dat_file):
     assert np.array_equal(results[1], bt.label('15', 40, 20))
 
 
-def test_float_levels_are_exact(data):
+def test_float_levels_are_exact(stops, data):
     rng = np.random.default_rng(3)
     starts = rng.choice(np.flatnonzero(data[:, NEXT['1']]), size=1500)
     p0 = data[starts, PRICE_COL].astype(float)
     upper = p0 + rng.integers(0, 40, len(starts)) + rng.uniform(-0.96, 0.96, len(starts))
     lower = p0 - rng.integers(0, 40, len(starts)) + rng.uniform(-0.96, 0.96, len(starts))
     want = [tick_scan(data, s, data[s, NEXT['1']], u, l) for s, u, l in zip(starts, upper, lower)]
-    assert first_hit_many(data, '1', starts, upper, lower).tolist() == want
-    assert first_hit(data, '1', int(starts[0]), float(upper[0]), float(lower[0])) == want[0]
+    assert stops.first_hit_many('1', starts, upper, lower).tolist() == want
+    assert stops.first_hit('1', int(starts[0]), float(upper[0]), float(lower[0])) == want[0]
 
 
-def test_inf_means_no_level_and_nan_raises(data):
+def test_inf_means_no_level_and_nan_raises(stops, data):
     starts = np.flatnonzero(data[:, NEXT['60']])[:200]
     p0 = data[starts, PRICE_COL]
-    only_lower = first_hit_many(data, '60', starts, np.inf, p0 - 100)
+    only_lower = stops.first_hit_many('60', starts, np.inf, p0 - 100)
     assert set(only_lower.tolist()) <= {0, -1}
     assert only_lower.tolist() == [tick_scan(data, s, data[s, NEXT['60']], np.inf, l) for s, l in zip(starts, p0 - 100)]
     with pytest.raises(ValueError):
-        first_hit_many(data, '60', starts, np.where(np.arange(len(starts)) == 5, np.nan, p0 + 100.0), p0 - 100)
+        stops.first_hit_many('60', starts, np.where(np.arange(len(starts)) == 5, np.nan, p0 + 100.0), p0 - 100)
 
 
-def test_cut_or_negative_rows_raise_instead_of_reading_outside(data):
+def test_cut_or_negative_rows_raise_instead_of_reading_outside(stops, data):
     day0, day1 = np.flatnonzero(data[:, NEXT['day']])[:2]
     cut = data[:day1 - 100]  # ends inside the first session: its day bar points past the end
     p0 = data[day0, PRICE_COL]
     with pytest.raises(ValueError):
-        first_hit(cut, 'day', int(day0), int(p0) + 10**7, int(p0) - 10**7)
+        StopSearch(cut).first_hit('day', int(day0), int(p0) + 10**7, int(p0) - 10**7)
     with pytest.raises(ValueError):
-        first_hit_many(cut, 'day', np.array([day0]), p0 + 10**7, p0 - 10**7)
+        StopSearch(cut).first_hit_many('day', np.array([day0]), p0 + 10**7, p0 - 10**7)
     with pytest.raises(ValueError):
-        first_hit(data, '1', -1, int(p0) + 100, int(p0) - 100)
+        stops.first_hit('1', -1, int(p0) + 100, int(p0) - 100)
     with pytest.raises(ValueError):
-        first_hit_many(data, '1', np.array([-1, 0]), p0 + 100, p0 - 100)
+        stops.first_hit_many('1', np.array([-1, 0]), p0 + 100, p0 - 100)
 
 
 def test_bar_starts_cache_is_read_only(data):
@@ -314,10 +318,11 @@ def test_pickle_uses_absolute_path_and_memmap_file(data, dat_file, tmp_path, mon
     assert os.path.isabs(ticks.path)
     monkeypatch.chdir(tmp_path)  # a worker with another working directory
     assert np.array_equal(pickle.loads(pickle.dumps(ticks)).data, data)
-    # built from load_dat: the memmap knows its file, so pickling still carries only the path
-    assert len(pickle.dumps(StopSearch(load_dat(dat_file)))) < 10_000
+    # built from the memmap itself: it knows its file, so pickling still carries only the path
+    mm = StopSearch.load(dat_file).data
+    assert len(pickle.dumps(StopSearch(mm))) < 10_000
     # a slice of the memmap is not the whole file: pickled with its ticks
-    part = load_dat(dat_file)[:100]
+    part = mm[:100]
     assert np.array_equal(pickle.loads(pickle.dumps(StopSearch(part))).data, part)
 
 
@@ -330,28 +335,27 @@ def test_unpickle_refuses_a_changed_file(data, tmp_path):
         pickle.loads(blob)
 
 
-def test_each_function_rejects_the_other_kind_of_input(data):
+def test_each_call_rejects_the_other_kind_of_input(stops, data):
     starts = np.flatnonzero(data[:, NEXT['1']])[:5]
     p0 = int(data[starts[0], PRICE_COL])
     with pytest.raises(TypeError):
-        first_hit(data, '1', starts, p0 + 40, p0 - 20)             # many entries -> first_hit_many
+        stops.first_hit('1', starts, p0 + 40, p0 - 20)             # many entries -> first_hit_many
     with pytest.raises(TypeError):
-        first_hit(data, '1', int(starts[0]), np.array([p0 + 40]), p0 - 20)
+        stops.first_hit('1', int(starts[0]), np.array([p0 + 40]), p0 - 20)
     with pytest.raises(TypeError):
-        first_hit_many(data, '1', int(starts[0]), p0 + 40, p0 - 20)  # one entry -> first_hit
-    sides = first_hit_many(data, '1', starts.tolist(), p0 + 40, p0 - 20)  # plain lists are fine
-    assert sides.dtype == np.int8 and sides.tolist() == [first_hit(data, '1', int(s), p0 + 40, p0 - 20) for s in starts]
+        stops.first_hit_many('1', int(starts[0]), p0 + 40, p0 - 20)  # one entry -> first_hit
+    sides = stops.first_hit_many('1', starts.tolist(), p0 + 40, p0 - 20)  # plain lists are fine
+    assert sides.dtype == np.int8 and sides.tolist() == [stops.first_hit('1', int(s), p0 + 40, p0 - 20) for s in starts]
 
 
-def test_unknown_bar_size_raises_a_clear_error(data):
-    stops = StopSearch(data)
+def test_unknown_bar_size_raises_a_clear_error(stops, data):
     i = int(np.flatnonzero(data[:, NEXT['15']])[0])
     p0 = int(data[i, PRICE_COL])
     for bad in (15, '2', None):
-        for call in (lambda: first_hit(data, bad, i, p0 + 40, p0 - 20),
-                     lambda: first_hit_many(data, bad, [i], p0 + 40, p0 - 20),
-                     lambda: stops.first_hit(bad, i, p0 + 40, p0 - 20),
-                     lambda: stops.bar_starts(bad)):
+        for call in (lambda: stops.first_hit(bad, i, p0 + 40, p0 - 20),
+                     lambda: stops.first_hit_many(bad, [i], p0 + 40, p0 - 20),
+                     lambda: stops.bar_starts(bad),
+                     lambda: stops.bar_end(bad, i)):
             with pytest.raises(ValueError, match="unknown bar size"):
                 call()
 

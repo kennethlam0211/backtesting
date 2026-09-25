@@ -24,7 +24,7 @@ date range, a subset, or other paths.
 
 ```
 init    raw_data/ES_*_trades_<date>.parquet ─┐
-        raw_data/roll_open_blocks/           ├─ 1 ─> tick parquet ─ 2 ─> tick.dat ──────────> stop_search.StopSearch / first_hit
+        raw_data/roll_open_blocks/           ├─ 1 ─> tick parquet ─ 2 ─> tick.dat ──────────> stop_search.StopSearch
         raw_data/pdt_codes.csv               │                           {freq}_ohlcv.parquet ─> data_preprocessing.py ─> training_data.parquet
         params/news_events.yaml ─────────────┘
 append  MongoDB (IB_recorder) ─────────┐

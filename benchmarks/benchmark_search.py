@@ -5,7 +5,9 @@ import time
 import numpy as np
 from rich.console import Console
 
-from stop_search import first_hit, first_hit_many, load_dat, DAT_COLS, PRICE_COL
+from stop_search import StopSearch, DAT_COLS
+
+PRICE_COL = DAT_COLS.index('price')
 
 console = Console()
 
@@ -47,7 +49,8 @@ def main():
         console.print(f"[red]Could not find test data at {memmap_path}[/red]")
         return
 
-    data = load_dat(memmap_path)
+    stops = StopSearch.load(memmap_path)
+    data = stops.data
     console.print(f"[green]Array contains {data.shape[0]:,} ticks.[/green]")
 
     NUM_QUERIES = 10_000
@@ -60,18 +63,18 @@ def main():
     console.print(f"Brute Force took: [red]{bf_time:.4f} seconds[/red] ({(bf_time/NUM_QUERIES)*1000:.3f} ms per query)")
 
     # Warm up Numba JIT (run once so compilation time isn't counted in the benchmark)
-    first_hit(data, freq, int(start_indices[0]), int(uppers[0]), int(lowers[0]))
-    first_hit_many(data, freq, start_indices[:1], uppers[:1], lowers[:1])
+    stops.first_hit(freq, int(start_indices[0]), int(uppers[0]), int(lowers[0]))
+    stops.first_hit_many(freq, start_indices[:1], uppers[:1], lowers[:1])
 
     console.print(f"\n[yellow]Running {NUM_QUERIES:,} first_hit calls, one entry each...[/yellow]")
     t0 = time.perf_counter()
-    single_results = [first_hit(data, freq, int(s), int(h), int(l)) for s, h, l in zip(start_indices, uppers, lowers)]
+    single_results = [stops.first_hit(freq, int(s), int(h), int(l)) for s, h, l in zip(start_indices, uppers, lowers)]
     single_time = time.perf_counter() - t0
     console.print(f"first_hit took: [green]{single_time:.4f} seconds[/green] ({(single_time/NUM_QUERIES)*1000:.3f} ms per query)")
 
     console.print(f"\n[yellow]Running {NUM_QUERIES:,} searches in one first_hit_many call...[/yellow]")
     t0 = time.perf_counter()
-    batch_results = first_hit_many(data, freq, start_indices, uppers, lowers).tolist()
+    batch_results = stops.first_hit_many(freq, start_indices, uppers, lowers).tolist()
     batch_time = time.perf_counter() - t0
     console.print(f"first_hit_many took: [green]{batch_time:.4f} seconds[/green] ({(batch_time/NUM_QUERIES)*1000:.4f} ms per query)")
 

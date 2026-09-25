@@ -42,10 +42,6 @@ def _chain_for(chains, freq):
         raise ValueError(f"unknown bar size {freq!r}; use one of {', '.join(repr(f) for f in chains)}") from None
 
 
-_check_child(CHILD)
-PRICE_COL = DAT_COLS.index('price')
-CHAINS = _chains(DAT_COLS, CHILD)
-
 _INT = (int, np.integer)
 
 # Kernel result when the bar summaries contradict the ticks. Returned rather than raised:
@@ -157,90 +153,7 @@ def _many(data, chain, price_col, freq, start_idx, upper, lower):
     return sides
 
 
-def first_hit(data, freq, start_idx, upper, lower):
-    """
-    Which level one entry's `freq` bar touches first, looking only inside that bar.
-    For many entries at once use first_hit_many; for use from another class, StopSearch holds the
-    loaded ticks and offers both calls.
-
-    Same logic as reference/search_org.py (search_stop): one level inside a bar decides it; both inside splits the bar
-    into its CHILD bars, checked in time order; a 1s bar with both inside is walked tick by tick.
-
-    Args:
-        data: the whole tick.dat as an int64 array (see load_dat). next_ind values are row numbers in
-            the full file, so a slice must start at row 0 (a cut end is detected and raises).
-        freq: bar size to look inside: 'day', '60', '30', '15', '10', '5', '1', '15s', '5s' or '1s'.
-        start_idx: entry row; must be the first tick of a `freq` bar.
-        upper: upper level in ticks, price x4 (4000.25 -> 16001); hit when price >= upper.
-        lower: lower level in ticks; hit when price <= lower.
-            Float levels are exact (upper is rounded up, lower down, to whole ticks);
-            inf / -inf means no upper / lower level; NaN raises.
-
-    Returns:
-         1  upper is hit first (a long's take-profit, a short's stop)
-        -1  lower is hit first (a long's stop, a short's take-profit)
-         0  neither is hit inside the bar (skip)
-
-    Raises:
-        TypeError: an argument is an array (use first_hit_many).
-        ValueError: start_idx is outside the data or not the first tick of a `freq` bar, a level is
-            NaN, or the bar is broken (its summary contradicts its ticks or points outside the data).
-
-    Example:
-        import numpy as np
-        from stop_search import first_hit, load_dat, DAT_COLS, DAT_PATH, PRICE_COL
-
-        data = load_dat(DAT_PATH)                                       # to_dat.py's default output
-        i = np.flatnonzero(data[:, DAT_COLS.index('next_ind_1')])[0]    # first tick of the first 1-min bar
-        entry = data[i, PRICE_COL]
-        side = first_hit(data, '1', i, entry + 40, entry - 20)         # +10 pts / -5 pts (40 / 20 ticks)
-        # side == 1: +10 came first; -1: -5 came first; 0: neither within that minute
-    """
-    return _one(data, _chain_for(CHAINS, freq), PRICE_COL, freq, start_idx, upper, lower)
-
-
-def first_hit_many(data, freq, start_idx, upper, lower):
-    """
-    first_hit for many entries at once, all on `freq` bars: entry q checks the bar starting at
-    start_idx[q] against upper[q] and lower[q], and the results equal calling first_hit per entry.
-    Runs in one compiled call across all CPU cores (NUMBA_NUM_THREADS caps it).
-
-    The arguments are columns, not rows: one array per argument, not a list of
-    (freq, start, upper, lower) tuples. To call it from tuples, unpack them first (one freq per call):
-        freqs, starts, uppers, lowers = zip(*entries)
-        sides = first_hit_many(data, freqs[0], starts, uppers, lowers)
-
-    Args:
-        data: the whole tick.dat as an int64 array (see load_dat).
-        freq: bar size shared by all entries: 'day', '60', '30', '15', '10', '5', '1', '15s', '5s' or '1s'.
-        start_idx: 1-D array of entry rows, each the first tick of a `freq` bar.
-        upper, lower: arrays as long as start_idx, or single values used for every entry; in ticks,
-            same rules as first_hit (floats exact, inf = no level, NaN raises).
-
-    Returns:
-        int8 array with one value per entry, in input order: 1 upper first, -1 lower first, 0 neither
-        inside the bar. Cast with .astype(np.int64) before doing arithmetic on it (int8 holds only
-        -128..127); .tolist() gives a plain list.
-
-    Raises:
-        TypeError: start_idx is not a 1-D array (use first_hit for one entry).
-        ValueError: upper/lower do not match start_idx in length, a start row is outside the data or
-            not the first tick of a `freq` bar, a level is NaN, or a bar is broken.
-
-    Example:
-        import numpy as np
-        from stop_search import first_hit_many, load_dat, DAT_COLS, DAT_PATH, PRICE_COL
-
-        data = load_dat(DAT_PATH)                                       # to_dat.py's default output
-        starts = np.flatnonzero(data[:, DAT_COLS.index('next_ind_1')])  # first tick of every 1-min bar
-        entry = data[starts, PRICE_COL]
-        sides = first_hit_many(data, '1', starts, entry + 40, entry - 20)  # +10 / -5 pts each
-        print((sides == 1).mean(), (sides == -1).mean(), (sides == 0).mean())  # share of each outcome
-    """
-    return _many(data, _chain_for(CHAINS, freq), PRICE_COL, freq, start_idx, upper, lower)
-
-
-def load_dat(path, n_cols=len(DAT_COLS)):
+def _load_dat(path, n_cols):
     """Memory-map tick.dat read-only; n_cols is the column count data_pipeline/to_dat.py wrote (len(DAT_COLS))."""
     row_bytes = n_cols * 8
     size = os.path.getsize(path)
@@ -280,6 +193,9 @@ class StopSearch:
     take-profit, a short's stop), -1 = lower hit first (a long's stop, a short's take-profit),
     0 = neither inside the bar.
 
+    Same logic as reference/search_org.py (search_stop): one level inside a bar decides it; both inside
+    splits the bar into its CHILD bars, checked in time order; a 1s bar with both inside is walked tick by tick.
+
     The ticks are memory-mapped read-only: loading is instant, pages are read from disk on first touch
     and stay in the OS page cache, shared by every process that opens the same file. Pickling (e.g.
     handing the owner to worker processes) carries only the absolute path, so each worker reopens the
@@ -304,6 +220,11 @@ class StopSearch:
     """
 
     def __init__(self, data, path=None, cols=DAT_COLS, child=CHILD):
+        """
+        data: the whole tick.dat as an int64 array (StopSearch.load maps the file). next_ind values are
+        row numbers in the full file, so an array cut from it must start at row 0 (a cut end is detected
+        and raises). path: the file behind data, for pickling; found by itself for a whole-file memmap.
+        """
         _check_child(child)
         if path is None:
             path = _whole_file(data, len(cols))
@@ -318,8 +239,8 @@ class StopSearch:
 
     @classmethod
     def load(cls, path=DAT_PATH, cols=DAT_COLS, child=CHILD):
-        """Memory-map the tick.dat at `path`, by default params.DAT_PATH (see load_dat)."""
-        return cls(load_dat(path, len(cols)), path=path, cols=cols, child=child)
+        """Memory-map the tick.dat at `path` read-only, by default params.DAT_PATH (to_dat.py's default output)."""
+        return cls(_load_dat(path, len(cols)), path=path, cols=cols, child=child)
 
     def __len__(self):
         return self.data.shape[0]
@@ -370,6 +291,7 @@ class StopSearch:
     def first_hit_many(self, freq, start_idx, upper, lower):
         """
         Many entries on `freq` bars in one parallel call; the same answers as first_hit per entry.
+        Runs in one compiled call across all CPU cores (NUMBA_NUM_THREADS caps it).
 
         The arguments are columns, not rows: entry q is (start_idx[q], upper[q], lower[q]). A list of
         (freq, start, upper, lower) tuples is not accepted; unpack it first (one freq per call):
@@ -412,4 +334,4 @@ class StopSearch:
         if self.data is None:
             if _stamp(self.path) != self._stamp:
                 raise ValueError(f"{self.path} changed since it was loaded; load it again instead of unpickling")
-            self.data = load_dat(self.path, len(self.cols))
+            self.data = _load_dat(self.path, len(self.cols))

@@ -1,6 +1,7 @@
 from .params import CHILD, DAT_COLS, DAT_PATH, FREQS, PARQUET_FREQS
 
-_LAZY = ('PRICE_COL', 'StopSearch', 'first_hit', 'first_hit_many', 'load_dat')
+__all__ = ['StopSearch', 'CHILD', 'DAT_COLS', 'DAT_PATH', 'FREQS', 'PARQUET_FREQS']
+_LAZY = ('StopSearch',)
 
 
 def __getattr__(name):
