@@ -162,7 +162,7 @@ def first_hit(data, freq, start_idx, upper, lower):
     Args:
         data: the whole tick.dat as an int64 array (see load_dat). next_ind values are row numbers in
             the full file, so a slice must start at row 0 (a cut end is detected and raises).
-        freq: bar size to look inside: 'day', '60', '30', '15', '10', '5', '1', '15s' or '1s'.
+        freq: bar size to look inside: 'day', '60', '30', '15', '10', '5', '1', '15s', '5s' or '1s'.
         start_idx: entry row; must be the first tick of a `freq` bar.
         upper: upper level in ticks, price x4 (4000.25 -> 16001); hit when price >= upper.
         lower: lower level in ticks; hit when price <= lower.
@@ -198,9 +198,14 @@ def first_hit_many(data, freq, start_idx, upper, lower):
     start_idx[q] against upper[q] and lower[q], and the results equal calling first_hit per entry.
     Runs in one compiled call across all CPU cores (NUMBA_NUM_THREADS caps it).
 
+    The arguments are columns, not rows: one array per argument, not a list of
+    (freq, start, upper, lower) tuples. To call it from tuples, unpack them first (one freq per call):
+        freqs, starts, uppers, lowers = zip(*entries)
+        sides = first_hit_many(data, freqs[0], starts, uppers, lowers)
+
     Args:
         data: the whole tick.dat as an int64 array (see load_dat).
-        freq: bar size shared by all entries: 'day', '60', '30', '15', '10', '5', '1', '15s' or '1s'.
+        freq: bar size shared by all entries: 'day', '60', '30', '15', '10', '5', '1', '15s', '5s' or '1s'.
         start_idx: 1-D array of entry rows, each the first tick of a `freq` bar.
         upper, lower: arrays as long as start_idx, or single values used for every entry; in ticks,
             same rules as first_hit (floats exact, inf = no level, NaN raises).
@@ -253,29 +258,42 @@ def _stamp(path):
 
 class StopSearch:
     """
-    tick.dat loaded once, with its bar layout, for another class (backtester, RL env) to hold and query.
+    Stop search over tick.dat: which level, upper or lower, an entry's bar touches first.
+    Load it once and keep it on the class that uses it (backtester, RL env).
+
+        stops = StopSearch.load('data/zarr/tick.dat')
+
+        stops.first_hit(freq, start_idx, upper, lower)       one entry    -> 1, -1 or 0
+        stops.first_hit_many(freq, starts, uppers, lowers)   many entries -> int8 array of 1 / -1 / 0
+        stops.bar_starts(freq)                                rows where `freq` bars start (entry rows)
+        stops.bar_end(freq, start_idx)                        row just after the bar's last tick
+        stops.price(idx)                                      price in ticks at row(s)
+
+    Prices and levels are in ticks (price x4): 10 points = 40. 1 = upper hit first (a long's
+    take-profit, a short's stop), -1 = lower hit first (a long's stop, a short's take-profit),
+    0 = neither inside the bar.
 
     The ticks are memory-mapped read-only: loading is instant, pages are read from disk on first touch
     and stay in the OS page cache, shared by every process that opens the same file. Pickling (e.g.
     handing the owner to worker processes) carries only the absolute path, so each worker reopens the
-    file instead of receiving a copy of the ticks; unpickling raises if the file changed meanwhile. Workers that run in parallel should set
-    NUMBA_NUM_THREADS=1 and be started with the 'spawn' or 'forkserver' method (numba's OpenMP
-    threads do not survive fork).
+    file instead of receiving a copy of the ticks; unpickling raises if the file changed meanwhile.
+    Workers that run in parallel should set NUMBA_NUM_THREADS=1 and be started with the 'spawn' or
+    'forkserver' method (numba's OpenMP threads do not survive fork).
 
     Example:
         from stop_search import StopSearch
 
         class Backtester:
             def __init__(self, path):
-                self.ticks = StopSearch.load(path)                  # once
+                self.stops = StopSearch.load(path)                 # once
 
             def label(self, freq, tp, sl):
-                starts = self.ticks.bar_starts(freq)              # first tick of every `freq` bar (cached)
-                entry = self.ticks.price(starts)
-                return self.ticks.first_hit_many(freq, starts, entry + tp, entry - sl)  # 1 / -1 / 0 each
+                starts = self.stops.bar_starts(freq)                # first tick of every `freq` bar (cached)
+                entry = self.stops.price(starts)
+                return self.stops.first_hit_many(freq, starts, entry + tp, entry - sl)  # 1 / -1 / 0 each
 
         bt = Backtester('data/zarr/tick.dat')
-        sides = bt.label('1', 40, 20)                             # +10 / -5 pts (ticks) on every 1-min bar
+        sides = bt.label('1', 40, 20)                               # +10 / -5 pts on every 1-min bar
     """
 
     def __init__(self, data, path=None, cols=DAT_COLS, child=CHILD):
@@ -316,11 +334,63 @@ class StopSearch:
         return self.data[start_idx, self._chains[freq][0, 0]]
 
     def first_hit(self, freq, start_idx, upper, lower):
-        """first_hit on these ticks: one entry -> 1 upper first, -1 lower first, 0 neither inside the bar."""
+        """
+        One entry: which level the `freq` bar starting at start_idx touches first.
+
+        Args:
+            freq: bar size: 'day', '60', '30', '15', '10', '5', '1', '15s', '5s' or '1s'.
+            start_idx: one row (an int), the first tick of a `freq` bar; bar_starts(freq) lists them.
+            upper: one level in ticks (price x4); hit when price >= upper.
+            lower: one level in ticks; hit when price <= lower.
+                Floats are exact (upper rounded up, lower down); inf / -inf = no level; NaN raises.
+
+        Returns:
+            1 upper hit first, -1 lower hit first, 0 neither inside the bar (an int).
+
+        Raises:
+            TypeError: an argument is an array; use first_hit_many.
+            ValueError: start_idx is not the first tick of a `freq` bar or is outside the data, a level
+                is NaN, or the bar is broken.
+
+        Example:
+            stops = StopSearch.load('data/zarr/tick.dat')
+            i = stops.bar_starts('1')[0]                                 # an entry row
+            entry = stops.price(i)
+            side = stops.first_hit('1', i, entry + 40, entry - 20)      # +10 / -5 pts -> 1, -1 or 0
+        """
         return _one(self.data, self._chains[freq], self.price_col, freq, start_idx, upper, lower)
 
     def first_hit_many(self, freq, start_idx, upper, lower):
-        """first_hit_many on these ticks: many entries -> int8 array of 1 / -1 / 0, in input order."""
+        """
+        Many entries on `freq` bars in one parallel call; the same answers as first_hit per entry.
+
+        The arguments are columns, not rows: entry q is (start_idx[q], upper[q], lower[q]). A list of
+        (freq, start, upper, lower) tuples is not accepted; unpack it first (one freq per call):
+            freqs, starts, uppers, lowers = zip(*entries)
+            sides = stops.first_hit_many(freqs[0], starts, uppers, lowers)
+        For entries on several bar sizes, call once per size.
+
+        Args:
+            freq: bar size shared by every entry: 'day', '60', '30', '15', '10', '5', '1', '15s', '5s' or '1s'.
+            start_idx: 1-D array (or list) of entry rows, each the first tick of a `freq` bar.
+            upper, lower: arrays as long as start_idx, or one value used for every entry; in ticks,
+                same rules as first_hit.
+
+        Returns:
+            int8 array, one value per entry in input order: 1 upper first, -1 lower first, 0 neither.
+            Cast with .astype(np.int64) before arithmetic on it; .tolist() gives a plain list.
+
+        Raises:
+            TypeError: start_idx is a single row; use first_hit.
+            ValueError: upper / lower do not match start_idx in length, a start row is not the first
+                tick of a `freq` bar or is outside the data, a level is NaN, or a bar is broken.
+
+        Example:
+            stops = StopSearch.load('data/zarr/tick.dat')
+            starts = stops.bar_starts('1')                               # every 1-min bar
+            entry = stops.price(starts)
+            sides = stops.first_hit_many('1', starts, entry + 40, entry - 20)   # +10 / -5 pts each
+        """
         return _many(self.data, self._chains[freq], self.price_col, freq, start_idx, upper, lower)
 
     def __getstate__(self):
