@@ -31,7 +31,7 @@ Every other raw column (`ts_recv`, `side`, `sequence`, …) is dropped.
 |---|---|
 | `raw_data/ES_c_0_trades_<date>.parquet`, `raw_data/ES_v_0_trades_<date>.parquet` | The sessions. The prefix only records which request fetched the day; each date exists once |
 | `raw_data/roll_open_blocks/ES_c_1_open_block_<date>.parquet` | New contract's ticks for the opening hours of the 27 roll days |
-| `pdt_codes.csv` | `instrument_id` + date range → contract code |
+| `config/pdt_codes.csv` | `instrument_id` + date range → contract code |
 
 Ignored: `raw_data/_superseded/`, `raw_data/_batch/`, `_manifest*.csv`, `_qc_report*.txt`, `*_partial.parquet`.
 
@@ -42,7 +42,7 @@ Ignored: `raw_data/_superseded/`, `raw_data/_batch/`, `_manifest*.csv`, `_qc_rep
 2. **Schema check** — every file must have the first file's columns and types.
 3. **Roll-day splice** (still in UTC) — see *Roll days*. Keeps only the new contract.
 4. **One contract** — the session must now hold exactly one `instrument_id`.
-5. **Contract code** — look up `pdt_code` in `pdt_codes.csv` by number **and** date.
+5. **Contract code** — look up `pdt_code` in `config/pdt_codes.csv` by number **and** date.
 6. **Clock** — `ts_event` (UTC) → New York wall clock → **+6h** → tz-naive `ts`.
    Check: every tick is inside its file's session, `[date 00:00, date 23:00)`.
 7. **Merge** — rows with the same **nanosecond** `ts` and the same price become one row,
@@ -94,7 +94,7 @@ rows, is the same contract, and price moves at most 1 tick across the seam.
 - **`ts_event`, not `ts_recv`.** Exchange match time is "when it happened"; `ts_recv` is dropped.
 - **Contract code by number + date.** Databento `instrument_id`s are just numbers and can be reused.
 
-## Contracts (`pdt_codes.csv`)
+## Contracts (`config/pdt_codes.csv`)
 
 28 contracts, `ESH0` → `ESZ6`. Built from the roll sequence (quarterly H/M/U/Z, starting from `ESH0` on
 2020-01-02) and checked: every contract's last session is 3 or 7 days before its expiry (third Friday).
@@ -105,11 +105,11 @@ A contract after `ESZ6` needs a new row, or Step 1 stops with *"no contract code
 Added in Step 1 to allow fast filtering later. Five `int8` columns (`news_fomc`, `news_nfp`, `news_cpi`, `news_ppi`, `news_gdp`).
 
 - **Window**: Exactly 5 minutes before to 5 minutes after the announcement time (`[event - 5m, event + 5m)`). Ticks exactly at the boundary are excluded.
-- **Announcement times**: Read from `news/news_events.yaml`.
+- **Announcement times**: Read from `config/news_events.yaml`.
 - **Clock**: The YAML stores times in ET (e.g. 14:00). We convert this to our `ts` clock by adding 6 hours (no timezone math needed because our `ts` is already "New York wall clock + 6h").
 - **Speed**: Vectorized parsing on import; `np.searchsorted` per session to only flag ticks inside windows overlapping that session. Very small overhead.
 
-### Data quality findings from `news_events.yaml`
+### Data quality findings from `config/news_events.yaml`
 
 Reviewed on 2026-09-24:
 - All dates are sorted and deduplicated per event type.
@@ -126,7 +126,7 @@ Reviewed on 2026-09-24:
 | Same schema as the first file | A changed download format |
 | Block: one contract, same schema, ends before the raw new-contract rows | A wrong or overlapping block |
 | One contract per session after the splice | A roll day without a block |
-| Contract code found | A contract missing from `pdt_codes.csv` |
+| Contract code found | A contract missing from `config/pdt_codes.csv` |
 | Every tick in `[date 00:00, date 23:00)` | Clock / daylight-saving mistakes, files on the wrong date |
 | Volume unchanged by the merge | A merge bug |
 
