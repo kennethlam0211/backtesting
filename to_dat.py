@@ -18,6 +18,8 @@ console = Console()
 # Second bars are appended last so every other zarr column keeps its position from the HSI layout
 FREQS = ["1", "5", "10", "15", "30", "60", "day", "1s", "15s"]
 PARQUET_FREQS = ["1", "5", "10", "15", "30", "60", "day"]
+# tick.dat column order (int64, row-major); readers must use this list, the file carries no header
+DAT_COLS = ['start_ind', 'ts', 'price'] + [c for f in FREQS for c in (f'high_{f}', f'low_{f}', f'next_ind_{f}')]
 
 def to_unix_epoch(ts: pd.Series) -> pd.Series:
     """
@@ -210,9 +212,7 @@ def main():
 
     dat_path = os.path.join(args.out, 'tick.dat')
     dat_tmp_path = os.path.join(args.out, 'tick.dat.tmp')
-    col_names = ['start_ind', 'ts', 'price']
-    for f in FREQS:
-        col_names.extend([f'high_{f}', f'low_{f}', f'next_ind_{f}'])
+    col_names = DAT_COLS
 
     # We don't know the exact final row count.
     # To append to a memmap, we can open it in 'r+' (or 'w+' initially)
