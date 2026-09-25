@@ -2,7 +2,7 @@ import numpy as np
 from numba import njit
 
 col_names = [
-    'start_ind','ts','price','volume',
+    'start_ind','ts','price',
     'high_1', 'low_1','next_ind_1',
     'high_5', 'low_5','next_ind_5',
     'high_10', 'low_10','next_ind_10',

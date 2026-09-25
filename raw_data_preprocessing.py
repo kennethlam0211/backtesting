@@ -142,7 +142,7 @@ def to_ticks(table, session_date, pdt_code):
     # RTH is 09:30 - 16:00 ET. In our +6h shifted clock, that's 15:30 to 22:00.
     rth_start = pd.Timedelta(hours=15, minutes=30)
     rth_end = pd.Timedelta(hours=22)
-    time_since_midnight = ts - ts.dt.normalize()
+    time_since_midnight = out['ts'] - out['ts'].dt.normalize()
     out['rth'] = ((time_since_midnight >= rth_start) & (time_since_midnight < rth_end)).astype('int8')
 
     # Add 8-hour sessions: 1 (Asian), 2 (Europe), 3 (US)
