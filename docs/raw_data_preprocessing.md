@@ -132,9 +132,9 @@ Added in Step 1 to allow fast filtering later. Five `int8` columns (`news_fomc`,
 
 ### `params/news_events.yaml`
 
-Corrected against federalreserve.gov, bls.gov and bea.gov on 2026-09-24; every change (54 rows: moved,
-added and removed dates, and the two FOMC time overrides) is listed in `params/news_date_audit.csv`.
-The code reads only the YAML. Dates are sorted with no duplicates; only these five event types exist.
+Corrected against federalreserve.gov, bls.gov and bea.gov on 2026-09-24 (54 changes: 24 moved dates or
+times, including the two FOMC time overrides, 25 added and 5 removed). The list of changes with sources
+was removed once applied; it is in git: `git show cea32ac:params/news_date_audit.csv`. Dates are sorted with no duplicates; only these five event types exist.
 
 | Event | Time (NY) | Dates | Per year |
 |---|---|---|---|

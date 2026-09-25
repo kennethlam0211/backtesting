@@ -1,5 +1,5 @@
 updated: '2026-09-24T20:16:04.786576'
-source: audited against federalreserve.gov, bls.gov, bea.gov; see news_date_audit.csv
+source: audited against federalreserve.gov, bls.gov, bea.gov
 fomc:
   time_et: '14:00'
   dates:
