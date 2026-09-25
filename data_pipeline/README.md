@@ -27,7 +27,9 @@ init    raw_data/ES_*_trades_<date>.parquet ─┐
         raw_data/roll_open_blocks/           ├─ 1 ─> tick parquet ─ 2 ─> tick.dat ──────────> stop_search.StopSearch / first_hit
         raw_data/pdt_codes.csv               │                           {freq}_ohlcv.parquet ─> features (template below)
         params/news_events.yaml ─────────────┘
-append  MongoDB (IB_recorder) ─ 1 (to_ticks) ─> + new sessions ─ 2 ─> + new rows and bars
+append  MongoDB (IB_recorder) ─────────┐
+        params/holidays.yaml           ├─ 1 (to_ticks) ─> + new sessions ─ 2 ─> + new rows and bars
+        params/news_events.yaml ───────┘
 ```
 
 Each step reads the previous step's output, so after changing an earlier step, rerun every step after it.
@@ -45,14 +47,15 @@ It catches up from the last Databento session, as long as MongoDB still holds th
 
 ```bash
 python -m data_pipeline.daily_update append                        # up to the last closed session (17:00 New York)
-python -m data_pipeline.daily_update append --until 2026-09-25     # up to a given session
+python -m data_pipeline.daily_update append --until 2026-09-25     # up to a given session (it must have closed)
 python -m data_pipeline.daily_update append --file trades.jsonl    # from a JSON-lines file instead of MongoDB
 ```
 
 1. Every weekday session after the last one in step 1's file, up to `--until` (default: the last
    closed session), is read from MongoDB one at a time (`ib_ticks.py`). Each is converted with step 1's
    `to_ticks` (same clock, ticks x4, merge, `rth` / `session` / `hour` / news flags) and added to the end
-   of step 1's file.
+   of step 1's file. A weekday with no ticks is skipped if it is in `params/holidays.yaml`; any other
+   weekday with no ticks stops the append there (see below).
 2. Step 2 adds every session of step 1's file that is newer than `tick.dat`'s last one to `tick.dat` and
    the bar files. It writes exactly the rows a full build would: `tests/test_daily_update.py` checks that
    `init` on four sessions equals `init` on two plus `append`.
@@ -65,15 +68,24 @@ It is safe to run it again, and a failed run is caught up by the next one:
 |---|---|
 | Already up to date | Nothing is read or written; exit 0 |
 | A missed day (cron did not run) | Caught up by the next run |
-| A weekday with no ticks in MongoDB (exchange holiday) | Skipped with a note. If it is the `--until` session itself: exit 1 (holiday, or the recorder did not run) |
-| Any error (MongoDB down, disk full, ...) | Files stay as they were. Step 1 writes a temp file and swaps it in; step 2 cuts `tick.dat` back and swaps in the new bar files only once `tick.dat` is on disk |
+| A holiday (in `params/holidays.yaml`) with no ticks | Skipped. A holiday that traded (a shortened session) is appended as usual |
+| Any other weekday with no ticks | The append stops at that day and exits 1; the sessions before it are kept. Appending later days would leave it out for good. The message says what to do: the recorder missed it (fix its data, then rerun), or it is a holiday missing from the yaml (add it, then rerun) |
+| `--until` a session that has not closed (17:00 New York) | Refused, exit 1: appended while still trading, the rest of the session would never follow. With `--file` any date is accepted |
+| A bad `--until` (e.g. `2026-13-01`) | Usage error, exit 2 |
+| Any error (MongoDB down, disk full, a price off the 0.25 grid, ...) | Files stay as they were. Step 1 writes a temp file and swaps it in; step 2 cuts `tick.dat` back and swaps in the new bar files only once they and `tick.dat` are on disk (fsync) |
 | Step 2 fails after step 1 worked | The next run finishes step 2 from step 1's file, without MongoDB |
 | A run killed part-way (power cut, OOM) | Can leave `tick.dat` longer than the bars. The next `append` detects it and stops; rebuild step 2 from step 1's file with `python -m data_pipeline.to_dat`, which keeps the appended sessions |
-| Two runs at once | The second stops: "another append is running" |
+| Two runs at once (`init` or `append`, e.g. a manual `init` during the cron run) | The second stops: "another init or append is running" (lock file next to step 1's output) |
 | A session older than the data | Never inserted. To change a past session, run `init` (then `append`) |
 
 Cost: parquet cannot be extended in place, so each `append` rewrites step 1's file, streaming it one row
-group at a time. Step 2 appends to `tick.dat` in place and rewrites the (small) bar files.
+group at a time: memory stays flat, but the time grows with the length of the history.
+Step 2 appends to `tick.dat` in place and rewrites the (small) bar files. If the daily run gets too
+slow, step 1's output can become one file per session or month; not needed yet.
+
+**Keep `params/holidays.yaml` up to date** (a placeholder for now): a list of dates, or a mapping of
+date -> name. A holiday missing from it only stops the append on that day with a clear message; it
+never loses data. Listing a shortened session does no harm either: it is appended if it has ticks.
 
 **Keep `params/news_events.yaml` up to date** with the coming FOMC / NFP / CPI / PPI / GDP dates. The
 news flags are set when a session is appended, so an event added to the yaml later only reaches that
@@ -91,7 +103,11 @@ Connection from environment variables: `MONGO_URI` (default `mongodb://localhost
 - Other field names: edit `FIELDS`.
 - `time` stored as epoch milliseconds or as a BSON date: set `TIME_UNIT` to `"ms"` or `"datetime"`.
 - `SYMBOL`: the documents to keep; set it to `None` to keep every document.
-- Index: `db.ES_trades.createIndex({symbol: 1, time: 1})`, so reading a session does not scan the whole collection.
+- Index: `db.ES_trades.createIndex({symbol: 1, time: 1, _id: 1})`. It serves the session query and its
+  sort (time, then insertion order), so MongoDB neither scans the collection nor sorts a whole session in
+  memory (which fails above 100 MB before MongoDB 6.0).
+- Prices are rounded to the 0.25 grid (float noise such as `5100.2499999`); a price clearly off it (e.g.
+  `5100.1`) stops the append with an error.
 
 The recorder must save one contract per session and roll at a session open, as the Databento files
 do after the splice. `append` does not check the contract. IB times are whole seconds, so same-price
@@ -121,7 +137,8 @@ Options: `--days N` (default 5), `--seed`, `--out`.
 
 #### Cron
 
-Run it after the 17:00 New York close, Monday to Friday New York time, from the repo root. The session
+Run it at least 30 minutes after the 17:00 New York close (so the recorder has written the last trades),
+Monday to Friday New York time, from the repo root. The session
 comes from New York time, so the machine's time zone only decides when cron fires. Cron does not load
 your shell profile, so give the full path to the environment's Python. Example for a machine on Hong
 Kong time (UTC+8): 06:30 HKT, Tuesday to Saturday, is 18:30 (summer) or 17:30 (winter) the evening

@@ -1,0 +1,9 @@
+# Exchange holidays, for `python -m data_pipeline.daily_update append` (placeholder: replace with the real list).
+# A holiday with no ticks in MongoDB is skipped. Any other weekday with no ticks stops the append there,
+# so a day the recorder missed is never skipped by mistake. A holiday that did trade (a shortened
+# session, e.g. Thanksgiving) is appended as usual.
+# Format: a list of dates, or a mapping of date -> name:
+#   - 2026-12-25
+# or
+#   2026-12-25: Christmas
+[]

@@ -13,7 +13,7 @@ python -m data_pipeline.raw_data_preprocessing --start 2024-01-01 --end 2024-12-
 Run from the repo root: `raw_data/` and the output path are relative to it; the output folder
 (`data/`) is created if missing. `params/` is read from the repo root. New sessions after the Databento
 history come from MongoDB with `python -m data_pipeline.daily_update append`, through the same `to_ticks`
-(see `data_pipeline/README.md`).
+(see *Daily sessions from IB* below, and `data_pipeline/README.md`).
 
 Full run: 1,737 sessions (2020-01-02 → 2026-09-18) in about 3 minutes; about 1 GB of RAM.
 
@@ -42,6 +42,7 @@ Every other raw column (`ts_recv`, `instrument_id`, `side`, `sequence`, …) is 
 | `raw_data/roll_open_blocks/ES_c_1_open_block_<date>.parquet` | New contract's ticks for the opening hours of the 27 roll days |
 | `raw_data/pdt_codes.csv` | `instrument_id` + date range → contract code |
 | `params/news_events.yaml` | News release dates and times (see *News flags*); a missing file stops the run |
+| MongoDB (IB recorder), `params/holidays.yaml` | Only for `daily_update append`: the sessions after the Databento history (see *Daily sessions from IB*) |
 
 Only top-level `raw_data/ES_*_trades_*.parquet` files are read, minus `*_partial.parquet`; so
 `raw_data/_superseded/`, `raw_data/_batch/`, `_manifest*.csv` and `_qc_report*.txt` are never touched.
@@ -148,6 +149,22 @@ was removed once applied; it is in git: `git show cea32ac:params/news_date_audit
 
 NFP, CPI and PPI end in September 2026: add the next releases before the data runs past them.
 
+## Daily sessions from IB (`daily_update append`)
+
+After the Databento history, new sessions come from the IB recorder's MongoDB (`data_pipeline/ib_ticks.py`)
+and go through the same `to_ticks`: same columns, clock, prices in ticks and news flags. They are added
+to the end of `data/ES_trades_concat.parquet`, and step 2 then adds them to `tick.dat` and the bars.
+Commands, cron and the MongoDB settings: `data_pipeline/README.md`.
+
+| | Databento (`init`) | IB (`append`) |
+|---|---|---|
+| Source | `raw_data/ES_*_trades_<date>.parquet`, one file per session | MongoDB, one document per trade (`time`, `price`, `size`, `symbol`) |
+| Session | The date in the file name | Trades with New York time in `[date - 1 day 18:00, date 17:00)` |
+| Contract | Checked against `raw_data/pdt_codes.csv`; roll days spliced | Not checked: the recorder must save one contract per session and roll at a session open |
+| Timestamps | Nanoseconds: the merge joins trades with the same ns and price | Whole seconds: the merge joins same-price trades within a second, so fewer rows per bar |
+| Prices | Exact multiples of 0.25 | Rounded to the 0.25 grid (float noise); a price clearly off it stops the append |
+| A weekday without data | Not in `raw_data/` (exchange closed) | Skipped if in `params/holidays.yaml`, otherwise the append stops there |
+
 ## Checks that stop the run
 
 | Check | Catches |
@@ -160,6 +177,8 @@ NFP, CPI and PPI end in September 2026: add the next releases before the data ru
 | Contract code found | A contract missing from `raw_data/pdt_codes.csv` |
 | Every tick in `[date 00:00, date 23:00)` | Clock / daylight-saving mistakes, files on the wrong date |
 | Volume unchanged by the merge | A merge bug |
+| `append`: every price on the 0.25 grid | A recorder saving wrong prices |
+| `append`: a weekday with no ticks that is not in `params/holidays.yaml` | A day the recorder missed (it would otherwise be left out for good) |
 
 ## Verified
 

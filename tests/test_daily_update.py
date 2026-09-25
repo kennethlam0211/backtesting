@@ -145,7 +145,7 @@ def assert_same_as_full(folder, full, n_sessions=len(DATES)):
 
 def test_append_matches_full_build(work, full):
     fake = FakeCollection(recorder_docs(DATES))
-    assert daily_update.append(fake, until=D) == []
+    assert daily_update.append(fake, until=D) is None
     assert_same_as_full(work, full)
     assert fake.finds == 2  # only C and D were read
 
@@ -185,21 +185,81 @@ def test_fetch_takes_only_the_session():
     assert ib_ticks.fetch_session(fake, datetime.date(2024, 3, 8)).num_rows == 0
 
 
-# ---------------------------------------------------------------- holidays, missing data
+# ---------------------------------------------------------------- closures, missing data
 
-def test_weekday_without_ticks_is_skipped(work, full):
-    fake = FakeCollection(recorder_docs([A, B, D]))  # nothing recorded for C
-    assert daily_update.append(fake, until=D) == [C]
+def test_session_without_ticks_stops_the_append(work):
+    fake = FakeCollection(recorder_docs([A, B, D]))  # the recorder missed C
+    before = snapshot(work)
+    assert daily_update.append(fake, until=D) == C
+    assert snapshot(work) == before  # D is not appended past the gap
+
+
+def test_holiday_without_ticks_is_skipped(work, monkeypatch):
+    monkeypatch.setattr(ib_ticks, "HOLIDAYS", {C})
+    fake = FakeCollection(recorder_docs([A, B, D]))
+    assert daily_update.append(fake, until=D) is None
     assert sessions_in(work) == {k: [A, B, D] for k in ["step1", "tick.dat", *BAR_FILES]}
+
+
+def test_holiday_that_traded_is_appended(work, full, monkeypatch):
+    monkeypatch.setattr(ib_ticks, "HOLIDAYS", {C})  # e.g. a shortened session listed as a holiday
+    assert daily_update.append(FakeCollection(recorder_docs(DATES)), until=D) is None
+    assert_same_as_full(work, full)
+
+
+def test_holidays_yaml_formats(tmp_path):
+    listed = tmp_path / "list.yaml"
+    listed.write_text("- 2026-12-25\n- '2027-01-01'\n")
+    named = tmp_path / "named.yaml"
+    named.write_text("2026-12-25: Christmas\n2027-01-01: New Year\n")
+    empty = tmp_path / "empty.yaml"
+    empty.write_text("# nothing yet\n")
+    expected = {datetime.date(2026, 12, 25), datetime.date(2027, 1, 1)}
+    assert ib_ticks.load_holidays(listed) == ib_ticks.load_holidays(named) == expected
+    assert ib_ticks.load_holidays(empty) == set()
+    assert ib_ticks.HOLIDAYS == ib_ticks.load_holidays()  # the placeholder in params/ loads
 
 
 def test_main_exit_codes(work, monkeypatch, capsys):
     fake = FakeCollection(recorder_docs([A, B, C]))
     monkeypatch.setattr(ib_ticks, "connect", lambda: fake)
-    assert daily_update.main(["append", "--until", str(D)]) == 1  # C appended, but D has no ticks
+    assert daily_update.main(["append", "--until", str(D)]) == 1  # C appended, then D has no ticks
     assert "no ticks for session 2024-03-07" in capsys.readouterr().err
     assert sessions_in(work)["tick.dat"] == [A, B, C]
     assert daily_update.main(["append", "--until", str(C)]) == 0  # up to date
+
+
+def test_open_session_is_refused(work, monkeypatch, capsys):
+    monkeypatch.setattr(ib_ticks, "connect", lambda: pytest.fail("MongoDB must not be read"))
+    today = ib_ticks.last_closed_session() + datetime.timedelta(days=1)
+    assert daily_update.main(["append", "--until", str(today)]) == 1
+    assert "has not closed yet" in capsys.readouterr().err
+
+
+def test_bad_until_is_a_usage_error(work):
+    with pytest.raises(SystemExit) as e:
+        daily_update.main(["append", "--until", "2026-13-01"])
+    assert e.value.code == 2
+
+
+def test_one_run_at_a_time(work):
+    fcntl = pytest.importorskip("fcntl")
+    with open("data/ES_trades_concat.parquet.lock", "w") as held:  # as init or another append holds it
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(RuntimeError, match="another init or append"):
+            daily_update.append(FakeCollection(recorder_docs(DATES)), until=D)
+
+
+def test_prices_rounded_to_the_tick_grid():
+    docs = [{"time": 1709679600, "price": 5100.2499999, "size": 1, "symbol": "ES"}]
+    assert ib_ticks.fetch_session(FakeCollection(docs), C).column("price").to_pylist() == [5100.25]
+    docs[0]["price"] = 5100.1
+    with pytest.raises(ValueError, match="off the 0.25 grid"):
+        ib_ticks.fetch_session(FakeCollection(docs), C)
+
+
+def test_default_paths_agree():
+    assert step2.DEFAULT_SRC == step1.DEFAULT_OUT  # init (step 2's default) and append read the same file
 
 
 def test_main_without_data(tmp_path, monkeypatch, capsys):
@@ -234,11 +294,11 @@ def test_step2_failure_is_caught_up_by_the_next_run(work, full, monkeypatch):
     fake = FakeCollection(recorder_docs(DATES))
     before = snapshot(work)
 
-    def disk_full(fd):
+    def disk_full(bars):
         raise OSError("no space left on device")
 
     with monkeypatch.context() as m:
-        m.setattr(step2.os, "fsync", disk_full)
+        m.setattr(step2, "bars_table", disk_full)  # after the rows went onto tick.dat
         with pytest.raises(OSError):
             daily_update.append(fake, until=D)
     # Step 1 has C and D; tick.dat and the bars are as they were

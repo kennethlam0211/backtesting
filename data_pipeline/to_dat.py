@@ -18,7 +18,7 @@ from stop_search.params import FREQS, PARQUET_FREQS, DAT_COLS
 install()
 console = Console()
 
-# Default input (step 1's output) and output folder; daily_update.py uses them too
+# Default input (must equal raw_data_preprocessing.DEFAULT_OUT; a test checks) and output folder
 DEFAULT_SRC = "data/ES_trades_concat.parquet"
 DEFAULT_OUT = "data/processed"
 
@@ -437,13 +437,15 @@ def append_sessions(out_dir: str = DEFAULT_OUT, src: str = DEFAULT_SRC) -> list[
             if not added:
                 return added
 
-            # New bar files are written next to the old ones, and swapped in only once tick.dat is on disk
+            # New bar files are written next to the old ones, and swapped in only once they and tick.dat are on disk
             for f in PARQUET_FREQS:
                 path = os.path.join(out_dir, f'{f}_ohlcv.parquet')
                 old = pq.read_table(path)
                 tmps[path] = path + '.tmp'
                 new = [bars_table(bars[f]).cast(old.schema)] if bars[f] else []
                 pq.write_table(pa.concat_tables([old, *new]), tmps[path], compression='zstd')
+                with open(tmps[path], 'rb') as tmp:
+                    os.fsync(tmp.fileno())
             fh.flush()
             os.fsync(fh.fileno())
     except BaseException:

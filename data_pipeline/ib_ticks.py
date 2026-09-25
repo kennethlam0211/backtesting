@@ -10,10 +10,12 @@ from fake_ib_data.py (`python -m data_pipeline.daily_update append --file ...`).
 import datetime
 import json
 import os
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import yaml
 
 NY = "America/New_York"
 
@@ -26,6 +28,17 @@ MONGO_COLLECTION = os.environ.get("MONGO_COLLECTION", "ES_trades")
 FIELDS = {"time": "time", "price": "price", "size": "size", "symbol": "symbol"}
 TIME_UNIT = "s"
 SYMBOL = "ES"
+
+
+def load_holidays(path=Path(__file__).resolve().parents[1] / "params" / "holidays.yaml"):
+    """Exchange holidays from params/holidays.yaml: a list of dates, or a mapping of date -> name."""
+    with open(path) as f:
+        data = yaml.safe_load(f) or []
+    return {datetime.date.fromisoformat(str(d)) for d in data}
+
+
+# A holiday with no ticks is skipped by append; any other weekday with no ticks stops it (see the yaml)
+HOLIDAYS = load_holidays()
 
 
 class LocalCollection:
@@ -115,6 +128,8 @@ def fetch_session(collection, session_date, fields=FIELDS, symbol=SYMBOL, time_u
     """
     One session's trades as a raw table (ts_event UTC, price, size), in recorded order (time, then insertion
     order), ready for raw_data_preprocessing.to_ticks. Empty if MongoDB holds no trades for the session.
+    Prices are rounded to the 0.25 grid (float noise); a price clearly off it raises ValueError.
+    The index {symbol: 1, time: 1, _id: 1} serves this query and its sort without an in-memory sort.
     """
     start, end = session_window(session_date)
     if time_unit == "datetime":
@@ -133,8 +148,13 @@ def fetch_session(collection, session_date, fields=FIELDS, symbol=SYMBOL, time_u
         ts = pd.to_datetime(times, utc=True)
     else:
         ts = pd.to_datetime(np.asarray(times, dtype=np.int64), unit=time_unit, utc=True)
+    price = np.array([float(d[fields["price"]]) for d in docs], dtype=np.float64)
+    ticks = np.rint(price * 4)
+    off = np.abs(price * 4 - ticks) > 1e-6
+    if off.any():
+        raise ValueError(f"session {session_date}: {off.sum()} prices off the 0.25 grid, e.g. {price[off][0]}")
     return pa.table({
         "ts_event": pa.array(ts, pa.timestamp("ns", tz="UTC")),
-        "price": pa.array([float(d[fields["price"]]) for d in docs], pa.float64()),
+        "price": pa.array(ticks / 4, pa.float64()),
         "size": pa.array([int(d[fields["size"]]) for d in docs], pa.int64()),
     })

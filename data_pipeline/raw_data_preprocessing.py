@@ -181,15 +181,21 @@ def to_ticks(table, session_date, pdt_code):
     return pa.Table.from_pandas(out[cols], preserve_index=False)
 
 
-def last_session(path):
-    """Session date of the last tick in a step-1 file, or None if it holds no ticks."""
+def last_value(path, column):
+    """The last tick's `column` in a step-1 file, or None if it holds no ticks. Reads only the last row group."""
     pf = pq.ParquetFile(path)
     for i in reversed(range(pf.num_row_groups)):
-        ts = pf.read_row_group(i, columns=['ts']).column('ts')
-        if len(ts):
-            # ts is New York time + 6h, so its calendar date is the session
-            return pc.max(ts).as_py().date()
+        values = pf.read_row_group(i, columns=[column]).column(column)
+        if len(values):
+            return values[-1].as_py()
     return None
+
+
+def last_session(path):
+    """Session date of the last tick in a step-1 file, or None if it holds no ticks."""
+    ts = last_value(path, 'ts')
+    # ts is New York time + 6h, so its calendar date is the session
+    return None if ts is None else ts.date()
 
 
 def append_sessions(path, days):
@@ -219,6 +225,8 @@ def append_sessions(path, days):
                 writer.write_table(day.cast(pf.schema_arrow))
                 last = date
                 added += 1
+        with open(tmp, 'rb') as f:
+            os.fsync(f.fileno())  # on disk before it replaces the file
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise

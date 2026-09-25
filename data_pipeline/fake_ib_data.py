@@ -22,7 +22,6 @@ import os
 
 import numpy as np
 import pandas as pd
-import pyarrow.parquet as pq
 
 from data_pipeline import ib_ticks
 from data_pipeline import raw_data_preprocessing as step1
@@ -32,16 +31,6 @@ DEFAULT_OUT = "data/fake_ib/ES_trades.jsonl"
 # Chance that a second has trades, and the mean number of extra trades in such a second
 RTH_ACTIVE, RTH_EXTRA = 0.9, 3.0          # New York 09:30-16:00
 OVERNIGHT_ACTIVE, OVERNIGHT_EXTRA = 0.25, 0.5
-
-
-def last_price(path):
-    """The last traded price (points) in a step-1 file."""
-    pf = pq.ParquetFile(path)
-    for i in reversed(range(pf.num_row_groups)):
-        price = pf.read_row_group(i, columns=["price"]).column("price")
-        if len(price):
-            return price[-1].as_py() / 4
-    raise ValueError(f"{path} holds no ticks")
 
 
 def fake_session(session_date, price, rng):
@@ -82,8 +71,9 @@ def main(argv=None):
     last = step1.last_session(args.src)
     if last is None:
         raise SystemExit(f"{args.src} holds no ticks")
-    price = last_price(args.src)
-    dates = ib_ticks.session_dates(last, last + datetime.timedelta(days=args.days * 2 + 3))[:args.days]
+    price = step1.last_value(args.src, "price") / 4  # ticks -> points
+    later = ib_ticks.session_dates(last, last + datetime.timedelta(days=args.days * 2 + 7))
+    dates = [d for d in later if d not in ib_ticks.HOLIDAYS][:args.days]
     rng = np.random.default_rng(args.seed)
     f = ib_ticks.FIELDS
 
