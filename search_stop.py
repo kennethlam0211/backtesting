@@ -1,7 +1,7 @@
 import os
 
 import numpy as np
-from numba import njit
+from numba import njit, prange
 
 from to_dat import DAT_COLS
 
@@ -36,6 +36,10 @@ def _chain(freq):
 
 CHAINS = {f: _chain(f) for f in CHILD}
 
+# Kernel result when the bar summaries contradict the ticks. Returned rather than raised:
+# an exception inside a prange loop is dropped silently.
+BROKEN = 2
+
 
 @njit(cache=True)
 def _search_stop(data, ind, chain, price_col, target_high, target_low):
@@ -45,10 +49,10 @@ def _search_stop(data, ind, chain, price_col, target_high, target_low):
     k = 0
     while True:
         if ind >= ends[k]:
-            raise ValueError("bar summaries inconsistent: a bar held a level but none of its sub-bars did")
+            return BROKEN  # a bar held a level but none of its sub-bars did
         nxt = data[ind, chain[k, 0]]
         if nxt == 0:
-            raise ValueError("bar summaries inconsistent: sub-bar missing")
+            return BROKEN  # sub-bar missing
         hit_high = data[ind, chain[k, 1]] >= target_high
         hit_low = data[ind, chain[k, 2]] <= target_low
         if hit_high != hit_low:
@@ -67,7 +71,7 @@ def _search_stop(data, ind, chain, price_col, target_high, target_low):
                     return 1
                 if price <= target_low:
                     return -1
-            raise ValueError("bar summaries inconsistent: a 1s bar held a level but none of its ticks did")
+            return BROKEN  # a 1s bar held a level but none of its ticks did
 
 
 def search_stop(data, target_high, target_low, freq, start_idx):
@@ -83,7 +87,39 @@ def search_stop(data, target_high, target_low, freq, start_idx):
     chain = CHAINS[freq]
     if data[start_idx, chain[0, 0]] == 0:
         raise ValueError(f"row {start_idx} is not the first tick of a {freq} bar")
-    return int(_search_stop(data, start_idx, chain, PRICE_COL, target_high, target_low))
+    side = int(_search_stop(data, start_idx, chain, PRICE_COL, target_high, target_low))
+    if side == BROKEN:
+        raise ValueError(f"bar summaries of the {freq} bar at row {start_idx} contradict its ticks")
+    return side
+
+
+@njit(parallel=True, cache=True)
+def _search_stop_batch(data, starts, chain, price_col, target_high, target_low):
+    out = np.empty(len(starts), dtype=np.int8)
+    for q in prange(len(starts)):
+        out[q] = _search_stop(data, starts[q], chain, price_col, target_high[q], target_low[q])
+    return out
+
+
+def search_stop_batch(data, target_high, target_low, freq, start_idx):
+    """
+    search_stop for many entries at once: equal-length arrays of levels and start rows, all on `freq`
+    bars. Runs in one compiled call across all cores (NUMBA_NUM_THREADS caps it); returns int8 sides.
+    """
+    start_idx = np.asarray(start_idx, dtype=np.int64)
+    target_high = np.asarray(target_high, dtype=np.int64)
+    target_low = np.asarray(target_low, dtype=np.int64)
+    if not (start_idx.ndim == 1 and start_idx.shape == target_high.shape == target_low.shape):
+        raise ValueError("start_idx, target_high and target_low must be 1-D arrays of equal length")
+    chain = CHAINS[freq]
+    not_start = data[start_idx, chain[0, 0]] == 0
+    if not_start.any():
+        raise ValueError(f"{not_start.sum()} start rows are not the first tick of a {freq} bar, e.g. row {start_idx[not_start][0]}")
+    sides = _search_stop_batch(data, start_idx, chain, PRICE_COL, target_high, target_low)
+    broken = sides == BROKEN
+    if broken.any():
+        raise ValueError(f"bar summaries contradict the ticks for {broken.sum()} entries, e.g. the {freq} bar at row {start_idx[broken][0]}")
+    return sides
 
 
 def load_dat(path):
