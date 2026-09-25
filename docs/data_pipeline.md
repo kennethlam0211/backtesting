@@ -1,13 +1,13 @@
-# Step 1 — `pipeline/raw_data_preprocessing.py`
+# Step 1 — `data_pipeline/raw_data_preprocessing.py`
 
 Turns the raw Databento ES trade files (one per session) into **one clean, time-ordered tick file**
 with one contract per session, prices in ticks, and a clock that looks the same in summer and winter.
-Step 2 (`pipeline/to_dat.py`) reads its output and writes `tick.dat` (for the stop search, `stop_search.first_hit`)
+Step 2 (`data_pipeline/to_dat.py`) reads its output and writes `tick.dat` (for the stop search, `stop_search.first_hit`)
 and the OHLCV bar files (`open`/`high`/`low`/`close` in ticks, int32, like `price` here).
 
 ```bash
-python -m pipeline.raw_data_preprocessing                      # all sessions -> data/ES_trades_concat.parquet
-python -m pipeline.raw_data_preprocessing --start 2024-01-01 --end 2024-12-31 --out data/ES_trades_2024.parquet
+python -m data_pipeline.raw_data_preprocessing                      # all sessions -> data/ES_trades_concat.parquet
+python -m data_pipeline.raw_data_preprocessing --start 2024-01-01 --end 2024-12-31 --out data/ES_trades_2024.parquet
 ```
 
 Run from the repo root: `raw_data/` and the output path are relative to it, and the output folder

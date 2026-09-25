@@ -241,7 +241,7 @@ def first_hit_many(data, freq, start_idx, upper, lower):
 
 
 def load_dat(path, n_cols=len(DAT_COLS)):
-    """Memory-map tick.dat read-only; n_cols is the column count pipeline/to_dat.py wrote (len(DAT_COLS))."""
+    """Memory-map tick.dat read-only; n_cols is the column count data_pipeline/to_dat.py wrote (len(DAT_COLS))."""
     row_bytes = n_cols * 8
     size = os.path.getsize(path)
     if size % row_bytes:

@@ -1,4 +1,4 @@
 [tool.pytest.ini_options]
-# Tests import the packages (stop_search, pipeline, ...) from the repo root without sys.path changes
+# Tests import the packages (stop_search, data_pipeline, ...) from the repo root without sys.path changes
 pythonpath = ["."]
 testpaths = ["tests"]

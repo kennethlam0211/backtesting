@@ -3,7 +3,7 @@ import pandas as pd
 import pyarrow as pa
 import numpy as np
 import datetime
-from pipeline.raw_data_preprocessing import to_ticks, SHIFT
+from data_pipeline.raw_data_preprocessing import to_ticks, SHIFT
 
 def create_mock_table(ts_events, prices, sizes):
     """Creates a raw parquet-like pyarrow table."""
@@ -62,7 +62,7 @@ def test_news_flags_exact_bounds():
 def test_news_flags_two_events_same_time():
     # CPI and PPI can be at 08:30 on the same day? The yaml has them separate, but we test the logic
     # In the mock, we can just inject a fake event or use a known one. Let's monkeypatch NEWS_EVENTS.
-    from pipeline.raw_data_preprocessing import NEWS_EVENTS
+    from data_pipeline.raw_data_preprocessing import NEWS_EVENTS
 
     # Fake session: 2024-01-01
     # We will fake a CPI and PPI event on this day at 08:30 ET
@@ -102,7 +102,7 @@ def test_news_flags_cross_midnight():
     # Window + 5m = 00:03 the next day.
     # But our session is exactly [00:00, 23:00). So it wouldn't cross midnight in our session (it would cross the gap).
     # Still, let's test a window that overlaps the session bounds.
-    from pipeline.raw_data_preprocessing import NEWS_EVENTS
+    from data_pipeline.raw_data_preprocessing import NEWS_EVENTS
 
     # Fake event at 22:58 ts (which is 16:58 ET). Window is [22:53, 23:03)
     fake_start = np.array([pd.Timestamp("2024-01-02 22:53:00").to_datetime64()])
