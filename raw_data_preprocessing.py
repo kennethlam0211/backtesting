@@ -141,8 +141,11 @@ def to_ticks(table, session_date, pdt_code):
     assert ((since_open >= pd.Timedelta(0)) & (since_open < pd.Timedelta(hours=23))).all(), f"tick outside session {session_date.date()}"
 
     df = pd.DataFrame({'ts': ts, 'price': df['price'], 'size': df['size'].astype('int64')})
-    # Price is recorded in 0.25 tick increments; multiply by 100 to make it an exact integer (e.g. 4000.25 -> 400025)
-    df['price'] = (df['price'] * 100).astype('int64')
+    # ES trades in 0.25-point ticks; price x4 is the price in ticks, an exact integer (4000.25 -> 16001).
+    # OHLC downstream is built from it, so every price column is in ticks.
+    ticks = df['price'] * 4
+    assert (ticks == ticks.round()).all(), f"price off the 0.25 grid {session_date.date()}"
+    df['price'] = ticks.round().astype('int64')
 
     out = df.groupby(['ts', 'price'], sort=False).agg(volume=('size', 'sum')).reset_index()
     out['pdt_code'] = pdt_code

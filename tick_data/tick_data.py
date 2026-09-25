@@ -88,7 +88,7 @@ def _first_hit_many(data, starts, chain, price_col, upper, lower):
     return out
 
 
-# Float levels are clipped here (inf means "no level"); far beyond any price x100
+# Float levels are clipped here (inf means "no level"); far beyond any price in ticks
 _LEVEL_LIMIT = 2 ** 62
 
 
@@ -162,9 +162,9 @@ def first_hit(data, freq, start_idx, upper, lower):
         freq: bar size to look inside, shared by all entries: 'day', '60', '30', '15', '10', '5',
             '1', '15s' or '1s'.
         start_idx: entry row(s); each must be the first tick of a `freq` bar.
-        upper: upper level(s), price x100 (4000.25 -> 400025); hit when price >= upper.
-        lower: lower level(s), price x100; hit when price <= lower.
-            Float levels are exact (upper is rounded up, lower down, to whole price units);
+        upper: upper level(s) in ticks, price x4 (4000.25 -> 16001); hit when price >= upper.
+        lower: lower level(s) in ticks; hit when price <= lower.
+            Float levels are exact (upper is rounded up, lower down, to whole ticks);
             inf / -inf means no upper / lower level; NaN raises.
 
     Returns:
@@ -186,12 +186,12 @@ def first_hit(data, freq, start_idx, upper, lower):
         starts = np.flatnonzero(data[:, DAT_COLS.index('next_ind_1')])  # first tick of every 1-min bar
         entry = data[starts, PRICE_COL]
 
-        # one entry: +10 pts / -5 pts inside the first minute
-        side = first_hit(data, '1', starts[0], entry[0] + 1000, entry[0] - 500)
+        # one entry: +10 pts / -5 pts (40 / 20 ticks) inside the first minute
+        side = first_hit(data, '1', starts[0], entry[0] + 40, entry[0] - 20)
         # side == 1: +10 came first; -1: -5 came first; 0: neither within that minute
 
         # every minute at once, same offsets from each entry price
-        sides = first_hit(data, '1', starts, entry + 1000, entry - 500)
+        sides = first_hit(data, '1', starts, entry + 40, entry - 20)
         print((sides == 1).mean(), (sides == -1).mean(), (sides == 0).mean())  # share of each outcome
     """
     return _first_hit(data, CHAINS[freq], PRICE_COL, freq, start_idx, upper, lower)
@@ -244,7 +244,7 @@ class TickData:
                 return self.ticks.first_hit(freq, starts, entry + tp, entry - sl)  # 1 / -1 / 0 each
 
         bt = Backtester('data/zarr/tick.dat')
-        sides = bt.label('1', 1000, 500)                          # +10 / -5 pts on every 1-min bar
+        sides = bt.label('1', 40, 20)                             # +10 / -5 pts (ticks) on every 1-min bar
     """
 
     def __init__(self, data, path=None, cols=DAT_COLS, child=CHILD):
@@ -269,7 +269,7 @@ class TickData:
         return self.data.shape[0]
 
     def price(self, idx):
-        """Price x100 at row(s) idx."""
+        """Price in ticks (x4) at row(s) idx."""
         return self.data[idx, self.price_col]
 
     def bar_starts(self, freq):

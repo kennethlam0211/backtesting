@@ -53,7 +53,7 @@ def process_session(session_df: pd.DataFrame, session_date: datetime.date) -> tu
 
     sess_len = len(merged_ts)
 
-    # Price storage: price is already multiplied by 100 in step 1, so it arrives as an exact integer
+    # Price storage: step 1 already stores price x4 (0.25-pt ticks), so it arrives as an exact integer
     merged_price = session_df['price'].values.astype(np.int64)
 
     tick_res = pd.DataFrame({

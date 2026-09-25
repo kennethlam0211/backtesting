@@ -21,13 +21,13 @@ LOW = {f: DAT_COLS.index(f'low_{f}') for f in FREQS}
 
 
 def make_session(rng, date):
-    """One session of step-1 ticks: bursts and quiet gaps, several ticks per second, 0.25-pt steps."""
+    """One session of step-1 ticks: bursts and quiet gaps, several ticks per second, price in ticks (x4)."""
     secs = np.cumsum(rng.exponential(rng.choice([0.1, 1.0, 20.0], size=40_000)))
     secs = secs[secs < 23 * 3600].astype(np.int64)
     n = len(secs)
     df = pd.DataFrame({
         'ts': pd.Timestamp(date) + pd.to_timedelta(secs, unit='s'),
-        'price': 500_000 + 25 * np.cumsum(rng.integers(-1, 2, n)),
+        'price': 20_000 + np.cumsum(rng.integers(-1, 2, n)),
         'volume': rng.integers(1, 5, n),
     })
     df['ts'] = df['ts'].astype('datetime64[s]')
@@ -87,8 +87,8 @@ def test_matches_tick_scan(data, freq):
     for i in sample:
         p0 = data[i, PRICE_COL]
         for _ in range(max(5, 1500 // len(sample))):
-            hi = p0 + 25 * int(rng.integers(0, 80))
-            lo = p0 - 25 * int(rng.integers(0, 80))
+            hi = p0 + int(rng.integers(0, 80))
+            lo = p0 - int(rng.integers(0, 80))
             want = tick_scan(data, i, data[i, NEXT[freq]], hi, lo)
             assert first_hit(data, freq, i, hi, lo) == want, f"{freq} bar at row {i}, levels {hi}/{lo}"
             sides.append(want)
@@ -106,7 +106,7 @@ def test_both_levels_in_one_second_walks_ticks(data):
 
 def test_clean_bar_is_skipped_even_if_a_later_bar_hits(data):
     for i in np.flatnonzero(data[:, NEXT['5']]):
-        hi, lo = data[i, HIGH['5']] + 25, data[i, LOW['5']] - 25
+        hi, lo = data[i, HIGH['5']] + 1, data[i, LOW['5']] - 1
         if tick_scan(data, i, len(data), hi, lo) != 0:
             break
     else:
@@ -118,7 +118,7 @@ def test_start_must_be_first_tick_of_the_bar(data):
     i = int(np.flatnonzero(data[:, NEXT['60']] == 0)[0])
     p0 = data[i, PRICE_COL]
     with pytest.raises(ValueError):
-        first_hit(data, '60', i, p0 + 100_000, p0 - 100_000)
+        first_hit(data, '60', i, p0 + 4000, p0 - 4000)
 
 
 def test_inconsistent_summaries_raise(data):
@@ -126,9 +126,9 @@ def test_inconsistent_summaries_raise(data):
     bad = data.copy()
     i = int(np.flatnonzero(bad[:, NEXT['1']])[10])
     p0 = bad[i, PRICE_COL]
-    bad[i, HIGH['1']], bad[i, LOW['1']] = p0 + 100_000, p0 - 100_000
+    bad[i, HIGH['1']], bad[i, LOW['1']] = p0 + 4000, p0 - 4000
     with pytest.raises(ValueError):
-        first_hit(bad, '1', i, p0 + 50_000, p0 - 50_000)
+        first_hit(bad, '1', i, p0 + 2000, p0 - 2000)
 
 
 @pytest.mark.parametrize('freq', list(CHILD))
@@ -136,8 +136,8 @@ def test_arrays_match_single_calls(data, freq):
     rng = np.random.default_rng(2)
     starts = rng.choice(np.flatnonzero(data[:, NEXT[freq]]), size=2000)
     p0 = data[starts, PRICE_COL]
-    hi = p0 + 25 * rng.integers(0, 80, len(starts))
-    lo = p0 - 25 * rng.integers(0, 80, len(starts))
+    hi = p0 + rng.integers(0, 80, len(starts))
+    lo = p0 - rng.integers(0, 80, len(starts))
     sides = first_hit(data, freq, starts, hi, lo)
     assert sides.dtype == np.int64  # safe for P&L arithmetic (sides * tp)
     assert sides.tolist() == [first_hit(data, freq, int(s), int(h), int(l)) for s, h, l in zip(starts, hi, lo)]
@@ -146,26 +146,26 @@ def test_arrays_match_single_calls(data, freq):
 def test_one_entry_gives_int_and_scalars_broadcast(data):
     starts = np.flatnonzero(data[:, NEXT['15']])[:300]
     p0 = int(data[starts[0], PRICE_COL])
-    side = first_hit(data, '15', starts[0], np.int64(p0 + 2500), p0 - 2500)
+    side = first_hit(data, '15', starts[0], np.int64(p0 + 100), p0 - 100)
     assert type(side) is int
     # the same two levels for every entry
-    sides = first_hit(data, '15', starts, p0 + 2500, p0 - 2500)
-    assert sides.tolist() == [first_hit(data, '15', int(s), p0 + 2500, p0 - 2500) for s in starts]
-    assert first_hit(data, '15', starts[:0], p0 + 2500, p0 - 2500).shape == (0,)
+    sides = first_hit(data, '15', starts, p0 + 100, p0 - 100)
+    assert sides.tolist() == [first_hit(data, '15', int(s), p0 + 100, p0 - 100) for s in starts]
+    assert first_hit(data, '15', starts[:0], p0 + 100, p0 - 100).shape == (0,)
     with pytest.raises(ValueError):
-        first_hit(data, '15', starts[:3], np.array([p0, p0]), p0 - 2500)  # lengths 2 and 3
+        first_hit(data, '15', starts[:3], np.array([p0, p0]), p0 - 100)  # lengths 2 and 3
 
 
 def test_arrays_reject_bad_starts_and_broken_summaries(data):
     starts = np.flatnonzero(data[:, NEXT['1']])[:500]
     p0 = data[starts, PRICE_COL]
     with pytest.raises(ValueError):
-        first_hit(data, '1', starts + 1, p0 + 2500, p0 - 2500)  # rows after a bar start
+        first_hit(data, '1', starts + 1, p0 + 100, p0 - 100)  # rows after a bar start
     bad = data.copy()
     i = starts[10]
-    bad[i, HIGH['1']], bad[i, LOW['1']] = p0[10] + 100_000, p0[10] - 100_000
+    bad[i, HIGH['1']], bad[i, LOW['1']] = p0[10] + 4000, p0[10] - 4000
     with pytest.raises(ValueError):
-        first_hit(bad, '1', starts, p0 + 50_000, p0 - 50_000)
+        first_hit(bad, '1', starts, p0 + 2000, p0 - 2000)
 
 
 def test_load_dat_reads_to_dat_layout(data, tmp_path):
@@ -175,7 +175,7 @@ def test_load_dat_reads_to_dat_layout(data, tmp_path):
     assert mm.shape == data.shape
     i = int(np.flatnonzero(mm[:, NEXT['60']])[3])
     p0 = mm[i, PRICE_COL]
-    assert first_hit(mm, '60', i, p0 + 2500, p0 - 2500) == tick_scan(data, i, data[i, NEXT['60']], p0 + 2500, p0 - 2500)
+    assert first_hit(mm, '60', i, p0 + 100, p0 - 100) == tick_scan(data, i, data[i, NEXT['60']], p0 + 100, p0 - 100)
 
     with open(path, 'ab') as f:
         f.write(b'\0' * 8)
@@ -186,8 +186,8 @@ def test_load_dat_reads_to_dat_layout(data, tmp_path):
 def test_zero_d_arrays_count_as_one_entry(data):
     i = int(np.flatnonzero(data[:, NEXT['5']])[7])
     p0 = data[i, PRICE_COL]
-    side = first_hit(data, '5', np.array(i), np.array(p0 + 2500), np.array(p0 - 2500))
-    assert type(side) is int and side == first_hit(data, '5', i, int(p0) + 2500, int(p0) - 2500)
+    side = first_hit(data, '5', np.array(i), np.array(p0 + 100), np.array(p0 - 100))
+    assert type(side) is int and side == first_hit(data, '5', i, int(p0) + 100, int(p0) - 100)
 
 
 class Backtester:
@@ -203,7 +203,7 @@ class Backtester:
 
 
 def _label_in_worker(bt, freq):
-    return bt.label(freq, 1000, 500)
+    return bt.label(freq, 40, 20)
 
 
 @pytest.fixture(scope='module')
@@ -222,9 +222,9 @@ def test_tickdata_matches_function(data):
         assert ticks.bar_starts(freq) is starts  # cached
         assert np.array_equal(ticks.bar_end(freq, starts), data[starts, NEXT[freq]])
         entry = ticks.price(starts)
-        want = first_hit(data, freq, starts, entry + 1000, entry - 500)
-        assert np.array_equal(ticks.first_hit(freq, starts, entry + 1000, entry - 500), want)
-        assert ticks.first_hit(freq, int(starts[0]), int(entry[0]) + 1000, int(entry[0]) - 500) == want[0]
+        want = first_hit(data, freq, starts, entry + 40, entry - 20)
+        assert np.array_equal(ticks.first_hit(freq, starts, entry + 40, entry - 20), want)
+        assert ticks.first_hit(freq, int(starts[0]), int(entry[0]) + 40, int(entry[0]) - 20) == want[0]
 
 
 def test_tickdata_rejects_child_tables_that_do_not_tile(data):
@@ -241,7 +241,7 @@ def test_tickdata_pickles_by_path(data, dat_file):
     assert len(blob) < 10_000 < data.nbytes  # the path, not the ticks
     bt = pickle.loads(blob)
     assert isinstance(bt.ticks.data, np.memmap)
-    assert np.array_equal(bt.label('1', 1000, 500), Backtester(TickData(data)).label('1', 1000, 500))
+    assert np.array_equal(bt.label('1', 40, 20), Backtester(TickData(data)).label('1', 40, 20))
 
 
 def test_in_memory_tickdata_pickles_with_its_ticks(data):
@@ -253,16 +253,16 @@ def test_owner_class_works_in_worker_processes(dat_file):
     bt = Backtester(TickData.load(dat_file))
     with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context('spawn')) as pool:
         results = list(pool.map(_label_in_worker, [bt, bt], ['1', '15']))
-    assert np.array_equal(results[0], bt.label('1', 1000, 500))
-    assert np.array_equal(results[1], bt.label('15', 1000, 500))
+    assert np.array_equal(results[0], bt.label('1', 40, 20))
+    assert np.array_equal(results[1], bt.label('15', 40, 20))
 
 
 def test_float_levels_are_exact(data):
     rng = np.random.default_rng(3)
     starts = rng.choice(np.flatnonzero(data[:, NEXT['1']]), size=1500)
     p0 = data[starts, PRICE_COL].astype(float)
-    upper = p0 + 25 * rng.integers(0, 40, len(starts)) + rng.uniform(-24, 24, len(starts))
-    lower = p0 - 25 * rng.integers(0, 40, len(starts)) + rng.uniform(-24, 24, len(starts))
+    upper = p0 + rng.integers(0, 40, len(starts)) + rng.uniform(-0.96, 0.96, len(starts))
+    lower = p0 - rng.integers(0, 40, len(starts)) + rng.uniform(-0.96, 0.96, len(starts))
     want = [tick_scan(data, s, data[s, NEXT['1']], u, l) for s, u, l in zip(starts, upper, lower)]
     assert first_hit(data, '1', starts, upper, lower).tolist() == want
     assert first_hit(data, '1', int(starts[0]), float(upper[0]), float(lower[0])) == want[0]
@@ -271,11 +271,11 @@ def test_float_levels_are_exact(data):
 def test_inf_means_no_level_and_nan_raises(data):
     starts = np.flatnonzero(data[:, NEXT['60']])[:200]
     p0 = data[starts, PRICE_COL]
-    only_lower = first_hit(data, '60', starts, np.inf, p0 - 2500)
+    only_lower = first_hit(data, '60', starts, np.inf, p0 - 100)
     assert set(only_lower.tolist()) <= {0, -1}
-    assert only_lower.tolist() == [tick_scan(data, s, data[s, NEXT['60']], np.inf, l) for s, l in zip(starts, p0 - 2500)]
+    assert only_lower.tolist() == [tick_scan(data, s, data[s, NEXT['60']], np.inf, l) for s, l in zip(starts, p0 - 100)]
     with pytest.raises(ValueError):
-        first_hit(data, '60', starts, np.where(np.arange(len(starts)) == 5, np.nan, p0 + 2500.0), p0 - 2500)
+        first_hit(data, '60', starts, np.where(np.arange(len(starts)) == 5, np.nan, p0 + 100.0), p0 - 100)
 
 
 def test_cut_or_negative_rows_raise_instead_of_reading_outside(data):
@@ -287,9 +287,9 @@ def test_cut_or_negative_rows_raise_instead_of_reading_outside(data):
     with pytest.raises(ValueError):
         first_hit(cut, 'day', np.array([day0]), p0 + 10**7, p0 - 10**7)
     with pytest.raises(ValueError):
-        first_hit(data, '1', -1, int(p0) + 2500, int(p0) - 2500)
+        first_hit(data, '1', -1, int(p0) + 100, int(p0) - 100)
     with pytest.raises(ValueError):
-        first_hit(data, '1', np.array([-1, 0]), p0 + 2500, p0 - 2500)
+        first_hit(data, '1', np.array([-1, 0]), p0 + 100, p0 - 100)
 
 
 def test_bar_starts_cache_is_read_only(data):

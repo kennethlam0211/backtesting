@@ -26,7 +26,7 @@ def brute_force_search(data: np.ndarray, start_idx: int, end_idx: int, upper: in
 def make_queries(data, freq, num_queries=10_000, seed=42):
     """
     Random entries on the first tick of `freq` bars, each with an upper and a lower level 10 to 50 pts
-    from the entry price (price is x100). Shared with run_benchmark_mismatch.py so both scripts check
+    from the entry price (price is x4, in 0.25-pt ticks: 40 to 200 ticks). Shared with run_benchmark_mismatch.py so both scripts check
     exactly the same queries. Returns (starts, bar ends, uppers, lowers).
     """
     next_col = DAT_COLS.index(f'next_ind_{freq}')
@@ -34,7 +34,7 @@ def make_queries(data, freq, num_queries=10_000, seed=42):
     starts = rng.choice(np.flatnonzero(data[:, next_col]), size=num_queries)
     ends = data[starts, next_col]
     prices = data[starts, PRICE_COL]
-    return starts, ends, prices + rng.integers(1000, 5000, num_queries), prices - rng.integers(1000, 5000, num_queries)
+    return starts, ends, prices + rng.integers(40, 200, num_queries), prices - rng.integers(40, 200, num_queries)
 
 
 def main():
