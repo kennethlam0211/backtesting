@@ -14,5 +14,5 @@ CHILD = {'day': '60', '60': '30', '30': '10', '10': '5', '15': '5',
          '5': '1', '1': '15s', '15s': '5s', '5s': '1s', '1s': None}
 
 # tick.dat that StopSearch.load() opens when no path is given (pipeline/to_dat.py writes it there
-# with its default --out ./data/zarr)
-DAT_PATH = 'data/zarr/tick.dat'
+# with its default --out ./data/dat)
+DAT_PATH = 'data/dat/tick.dat'

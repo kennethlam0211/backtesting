@@ -23,7 +23,7 @@ def brute_force_search(data: np.ndarray, start_idx: int, end_idx: int, upper: in
 def main():
     freq = sys.argv[1] if len(sys.argv) > 1 else '1'
     console.print("[cyan]Opening memory-mapped .dat array...[/cyan]")
-    memmap_path = 'data/zarr_test/tick.dat'
+    memmap_path = 'data/dat_test/tick.dat'
 
     if not os.path.exists(memmap_path):
         console.print(f"[red]Could not find test data at {memmap_path}[/red]")

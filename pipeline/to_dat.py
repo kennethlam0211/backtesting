@@ -69,12 +69,12 @@ def process_session(session_df: pd.DataFrame, session_date: datetime.date) -> tu
     # A session starts 00:00 on its date (step 1 put the Globex reopen there); bar edges count from it
     day0 = pd.Timestamp(session_date).value
 
-    # For zarr columns, initialize arrays filled with zeros
-    zarr_cols = {}
+    # tick.dat bar columns (high / low / next_ind per bar size): zero except on each bar's first row
+    bar_cols = {}
     for freq in FREQS:
-        zarr_cols[f'high_{freq}'] = np.zeros(sess_len, dtype=np.int64)
-        zarr_cols[f'low_{freq}'] = np.zeros(sess_len, dtype=np.int64)
-        zarr_cols[f'next_ind_{freq}'] = np.zeros(sess_len, dtype=np.int64)
+        bar_cols[f'high_{freq}'] = np.zeros(sess_len, dtype=np.int64)
+        bar_cols[f'low_{freq}'] = np.zeros(sess_len, dtype=np.int64)
+        bar_cols[f'next_ind_{freq}'] = np.zeros(sess_len, dtype=np.int64)
 
     for freq in FREQS:
         if freq == "day":
@@ -141,10 +141,10 @@ def process_session(session_df: pd.DataFrame, session_date: datetime.date) -> tu
 
 
 
-        # Populate Zarr columns (local indices)
-        zarr_cols[f'high_{freq}'][starts] = bar_high
-        zarr_cols[f'low_{freq}'][starts] = bar_low
-        zarr_cols[f'next_ind_{freq}'][starts] = ends # local next_ind
+        # Fill the bar columns on each bar's first row (local indices)
+        bar_cols[f'high_{freq}'][starts] = bar_high
+        bar_cols[f'low_{freq}'][starts] = bar_low
+        bar_cols[f'next_ind_{freq}'][starts] = ends # local next_ind
 
         if freq == "1":
             tick_res.loc[starts, 'start_ind'] = starts # local start_ind
@@ -178,7 +178,7 @@ def process_session(session_df: pd.DataFrame, session_date: datetime.date) -> tu
 
         resampled_res[freq] = struct_arr
 
-    for col_name, col_data in zarr_cols.items():
+    for col_name, col_data in bar_cols.items():
         tick_res[col_name] = col_data
 
     # console.print(f"Session {session_date} processed, rows: {len(session_df)} -> {sess_len}")
@@ -189,7 +189,7 @@ def process_session(session_df: pd.DataFrame, session_date: datetime.date) -> tu
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=None, help="Process only first N sessions")
-    parser.add_argument("--out", type=str, default="./data/zarr", help="Output directory")
+    parser.add_argument("--out", type=str, default="./data/dat", help="Output directory")
     parser.add_argument("--start", type=str, default=None, help="Skip to date YYYY-MM-DD")
     parser.add_argument("--src", type=str, default="./data/ES_trades_concat.parquet", help="Step 1 output")
     args = parser.parse_args()

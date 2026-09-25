@@ -43,7 +43,7 @@ def generate_features(parquet_path: str | Path) -> pl.DataFrame:
 def main():
     parser = argparse.ArgumentParser(description="Feature Engineering for RL using Polars")
     parser.add_argument("--freq", type=str, default="1", help="Timeframe frequency to process (e.g. 1, 5, 15, day)")
-    parser.add_argument("--data-dir", type=str, default="data/zarr", help="Directory containing the OHLCV parquets")
+    parser.add_argument("--data-dir", type=str, default="data/dat", help="Directory containing the OHLCV parquets")
     args = parser.parse_args()
 
     parquet_file = Path(args.data_dir) / f"{args.freq}_ohlcv.parquet"
