@@ -57,7 +57,7 @@ def process_session(session_df: pd.DataFrame, session_date: datetime.date) -> tu
     merged_price = session_df['price'].values.astype(np.int64)
 
     tick_res = pd.DataFrame({
-        'ts': to_unix_epoch(session_df['ts']),  # zarr stores ts as whole seconds in true UTC
+        'ts': to_unix_epoch(session_df['ts']),  # ts is now New York + 6h (stored as absolute seconds)
         'price': merged_price,
         'start_ind': np.full(sess_len, -1, dtype=np.int64)
     })

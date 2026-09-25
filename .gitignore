@@ -2,4 +2,4 @@ data/
 raw_data/
 .venv/
 __pycache__/
-.lock
+.claude/*.lock

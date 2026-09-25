@@ -29,8 +29,8 @@ PRICE_COL = col_to_ind_dict['price']
 
 
 @njit(cache=True)
-def _search(data, start_idx, end_idx, target_high, target_low, jump_cols, price_col, side_only):
-    n = end_idx
+def _search(data, start_idx, target_high, target_low, jump_cols, price_col, side_only):
+    n = data.shape[0]
     i = start_idx
     while i < n:
         price = data[i, price_col]
@@ -59,15 +59,12 @@ def _search(data, start_idx, end_idx, target_high, target_low, jump_cols, price_
     return -1, 0
 
 
-def search(data: np.ndarray, start_idx: int, target_high: int, target_low: int, side_only: bool = False, end_idx: int = -1):
+def search(data: np.ndarray, start_idx: int, target_high: int, target_low: int, side_only: bool = False):
     """
     Finds the first tick from start_idx onwards where price >= target_high or price <= target_low.
-    If end_idx is provided (>= 0), the search will strictly stop checking ticks at end_idx.
     """
-    if end_idx < 0:
-        end_idx = data.shape[0]
 
-    idx, side = _search(data, start_idx, end_idx, target_high, target_low, JUMP_COLS, PRICE_COL, side_only)
+    idx, side = _search(data, start_idx, target_high, target_low, JUMP_COLS, PRICE_COL, side_only)
     if side == 0:
         return None, None
     return (None if idx < 0 else int(idx)), int(side)
