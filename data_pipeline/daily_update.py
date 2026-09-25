@@ -19,17 +19,176 @@ Exit code 0 when the outputs are up to date to --until; 1 otherwise.
 import argparse
 import contextlib
 import datetime
+import itertools
 import os
 import sys
 
+import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.parquet as pq
 
 from data_pipeline import ib_ticks
 from data_pipeline import raw_data_preprocessing as step1
 from data_pipeline import to_dat as step2
+from stop_search.params import DAT_COLS, PARQUET_FREQS
 
 INIT_FIRST = "build the data first with `python -m data_pipeline.daily_update init`"
 
+
+# ---------------------------------------------------------------- step 1's file (to_ticks rows, one per tick)
+
+def last_value(path, column):
+    """The last tick's `column` in a step-1 file, or None if it holds no ticks. Reads only the last row group."""
+    pf = pq.ParquetFile(path)
+    for i in reversed(range(pf.num_row_groups)):
+        values = pf.read_row_group(i, columns=[column]).column(column)
+        if len(values):
+            return values[-1].as_py()
+    return None
+
+
+def step1_last_session(path):
+    """Session date of the last tick in a step-1 file, or None if it holds no ticks."""
+    ts = last_value(path, 'ts')
+    # ts is New York time + 6h, so its calendar date is the session
+    return None if ts is None else ts.date()
+
+
+def step1_append(path, days):
+    """
+    Add sessions to the end of the step-1 file. `days` holds to_ticks tables, one session each, oldest
+    first, all newer than the file's last session; it can be a generator (append() reads MongoDB one
+    session at a time). Parquet cannot be extended in place, so the file is copied to a temp file with the
+    sessions added and swapped in; on any error the file is left as it was. Returns the number of sessions added.
+    """
+    pf = pq.ParquetFile(path)
+    last = step1_last_session(path)
+    days = (day for day in days if day.num_rows)
+    first = next(days, None)
+    if first is None:
+        return 0
+    tmp = str(path) + '.tmp'
+    added = 0
+    try:
+        with pq.ParquetWriter(tmp, pf.schema_arrow, compression='zstd') as writer:
+            for i in range(pf.num_row_groups):
+                writer.write_table(pf.read_row_group(i))
+            for day in itertools.chain([first], days):
+                date = pc.min(day.column('ts')).as_py().date()
+                if last is not None and date <= last:
+                    raise ValueError(f"session {date} is not newer than the last one in {path} ({last}); run init to rebuild")
+                writer.write_table(day.cast(pf.schema_arrow))
+                last = date
+                added += 1
+        with open(tmp, 'rb') as f:
+            os.fsync(f.fileno())  # on disk before it replaces the file
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+    os.replace(tmp, path)
+    return added
+
+
+# ---------------------------------------------------------------- step 2's folder (tick.dat and the bar files)
+
+def _read_row(dat_path, i):
+    """Row i of tick.dat (its DAT_COLS values), or an empty array past the end."""
+    row_bytes = len(DAT_COLS) * 8
+    with open(dat_path, 'rb') as f:
+        f.seek(i * row_bytes)
+        return np.frombuffer(f.read(row_bytes), dtype=np.int64)
+
+
+def step2_last_session(out_dir):
+    """Session date of the last row in out_dir/tick.dat, or None if the file is empty."""
+    dat_path = os.path.join(out_dir, 'tick.dat')
+    row_bytes = len(DAT_COLS) * 8
+    size = os.path.getsize(dat_path)
+    if size % row_bytes:
+        raise ValueError(f"{dat_path}: {size} bytes is not a whole number of {len(DAT_COLS)}-column rows")
+    if size == 0:
+        return None
+    last_ts = int(_read_row(dat_path, size // row_bytes - 1)[DAT_COLS.index('ts')])
+    # ts is the shifted clock stored as if UTC, so its calendar date is the session
+    return datetime.datetime.fromtimestamp(last_ts, datetime.timezone.utc).date()
+
+
+def step2_committed_rows(out_dir):
+    """
+    Rows of out_dir/tick.dat the bar files account for: where the last day bar ends. A full build or a
+    finished append leaves this equal to tick.dat's row count; an append killed part-way leaves it smaller.
+    """
+    day = pq.read_table(os.path.join(out_dir, 'day_ohlcv.parquet'), columns=['start_ind']).column('start_ind')
+    if len(day) == 0:
+        return 0
+    row = _read_row(os.path.join(out_dir, 'tick.dat'), int(day[-1].as_py()))  # first row of the last session
+    return int(row[DAT_COLS.index('next_ind_day')]) if len(row) else -1
+
+
+def step2_append(out_dir=step2.DEFAULT_OUT, src=step2.DEFAULT_SRC):
+    """
+    Add every session of the step-1 file `src` newer than the last one in out_dir/tick.dat to tick.dat and
+    the OHLCV bar files, exactly as a full build (to_dat.main) would have written them: same
+    process_session / offset_session / bars_table. Returns the dates added (empty when tick.dat is already
+    up to date). On any error tick.dat is cut back to its old size and the bar files are left as they were.
+    """
+    last = step2_last_session(out_dir)
+    start = None if last is None else last + datetime.timedelta(days=1)
+    dat_path = os.path.join(out_dir, 'tick.dat')
+    size = os.path.getsize(dat_path)
+    n_rows = size // (len(DAT_COLS) * 8)
+    if step2_committed_rows(out_dir) != n_rows:
+        raise ValueError(f"{dat_path} holds rows the bar files do not (an append was cut off?); "
+                         f"rebuild step 2 from step 1's file with `python -m data_pipeline.to_dat`")
+
+    added = []
+    bars = {f: [] for f in PARQUET_FREQS}
+    tmps = {}
+    try:
+        # Rows go straight onto the end of tick.dat; bars are collected and written once at the end
+        with open(dat_path, 'r+b') as fh:
+            fh.seek(size)
+            for sess_date, sess_df in step2.iter_sessions(src, start):
+                step2.check_session(sess_df, sess_date)
+                tick_res, resampled_res, sess_len = step2.process_session(sess_df, sess_date)
+                fh.write(step2.offset_session(tick_res, resampled_res, n_rows).tobytes())
+                n_rows += sess_len
+                for f in PARQUET_FREQS:
+                    if len(resampled_res[f]) > 0:
+                        bars[f].append(resampled_res[f])
+                added.append(sess_date)
+            if not added:
+                return added
+
+            # New bar files are written next to the old ones, and swapped in only once they and tick.dat are on disk
+            for f in PARQUET_FREQS:
+                path = os.path.join(out_dir, f'{f}_ohlcv.parquet')
+                old = pq.read_table(path)
+                tmps[path] = path + '.tmp'
+                new = [step2.bars_table(bars[f]).cast(old.schema)] if bars[f] else []
+                pq.write_table(pa.concat_tables([old, *new]), tmps[path], compression='zstd')
+                with open(tmps[path], 'rb') as tmp:
+                    os.fsync(tmp.fileno())
+            fh.flush()
+            os.fsync(fh.fileno())
+    except BaseException:
+        with open(dat_path, 'r+b') as fh:
+            fh.truncate(size)
+        for tmp in tmps.values():
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        raise
+
+    # day_ohlcv.parquet goes last: it is the commit record step2_committed_rows() checks
+    for path in sorted(tmps, key=lambda path: path.endswith('day_ohlcv.parquet')):
+        os.replace(tmps[path], path)
+    return added
+
+
+# ---------------------------------------------------------------- the two modes
 
 @contextlib.contextmanager
 def _lock(step1_out):
@@ -71,7 +230,7 @@ def append(collection, until=None, step1_out=step1.DEFAULT_OUT, step2_out=step2.
     missing = None
 
     with _lock(step1_out):
-        last = step1.last_session(step1_out)
+        last = step1_last_session(step1_out)
         if last is None:
             raise ValueError(f"{step1_out} holds no ticks; {INIT_FIRST}")
 
@@ -90,10 +249,10 @@ def append(collection, until=None, step1_out=step1.DEFAULT_OUT, step2_out=step2.
                 log(f"{date}: {raw.num_rows:,} trades -> {day.num_rows:,} ticks")
                 yield day
 
-        added1 = step1.append_sessions(step1_out, fetched())
-        log(f"{step1_out}: {added1} session(s) added, last {step1.last_session(step1_out)}")
-        added2 = step2.append_sessions(step2_out, step1_out)
-        log(f"{step2_out}: {len(added2)} session(s) added, last {step2.last_session(step2_out)}")
+        added1 = step1_append(step1_out, fetched())
+        log(f"{step1_out}: {added1} session(s) added, last {step1_last_session(step1_out)}")
+        added2 = step2_append(step2_out, step1_out)
+        log(f"{step2_out}: {len(added2)} session(s) added, last {step2_last_session(step2_out)}")
     return missing
 
 

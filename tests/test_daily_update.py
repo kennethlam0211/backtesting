@@ -317,8 +317,8 @@ def test_cut_off_append_is_detected(work):
     with open(work / "data/processed/tick.dat", "ab") as f:
         f.write(bytes(ROW_BYTES * 3))
     with pytest.raises(ValueError, match="python -m data_pipeline.to_dat"):
-        step2.append_sessions()
-    assert step2.committed_rows("data/processed") < os.path.getsize("data/processed/tick.dat") // ROW_BYTES
+        daily_update.step2_append()
+    assert daily_update.step2_committed_rows("data/processed") < os.path.getsize("data/processed/tick.dat") // ROW_BYTES
 
 
 def test_fake_ib_data_appends_from_file(work, tmp_path, capsys):
@@ -329,7 +329,7 @@ def test_fake_ib_data_appends_from_file(work, tmp_path, capsys):
     assert daily_update.main(["append", "--file", str(jsonl), "--until", str(D)]) == 0
     assert sessions_in(work) == {k: DATES for k in ["step1", "tick.dat", *BAR_FILES]}  # the 2 weekdays after B
     rows = os.path.getsize("data/processed/tick.dat") // ROW_BYTES
-    assert step2.committed_rows("data/processed") == rows
+    assert daily_update.step2_committed_rows("data/processed") == rows
     assert rows == pq.ParquetFile("data/ES_trades_concat.parquet").metadata.num_rows
     # The fake prices carry on from the last real one
     ticks = pq.read_table("data/ES_trades_concat.parquet", columns=["ts", "price"]).to_pandas()
@@ -353,7 +353,7 @@ def test_append_to_other_paths(work, full, tmp_path):
 def test_step1_refuses_older_session(work):
     day = step1.to_ticks(RAW[A], pd.Timestamp(A), "ESH4")
     with pytest.raises(ValueError, match="not newer"):
-        step1.append_sessions(step1.DEFAULT_OUT, [day])
+        daily_update.step1_append(step1.DEFAULT_OUT, [day])
     assert not list(work.glob("data/*.tmp"))
 
 

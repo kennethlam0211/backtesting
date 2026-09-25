@@ -36,6 +36,9 @@ Each step reads the previous step's output, so after changing an earlier step, r
 
 ## Modes: `daily_update.py`
 
+The append code lives in `daily_update.py`, not in the steps. It reuses step 1's `to_ticks` and step 2's
+`process_session` (the code a full build runs), so the two steps stay standalone scripts.
+
 ### `init` — the whole history, once
 
 Steps 1 and 2 on every session in `raw_data/`, with the default paths. Every output is rebuilt from

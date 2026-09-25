@@ -1,6 +1,4 @@
 import argparse
-import itertools
-import os
 from pathlib import Path
 
 import numpy as np
@@ -179,59 +177,6 @@ def to_ticks(table, session_date, pdt_code):
 
     cols = ['ts', 'price', 'volume', 'rth', 'session', 'hour', 'news_fomc', 'news_nfp', 'news_cpi', 'news_ppi', 'news_gdp']
     return pa.Table.from_pandas(out[cols], preserve_index=False)
-
-
-def last_value(path, column):
-    """The last tick's `column` in a step-1 file, or None if it holds no ticks. Reads only the last row group."""
-    pf = pq.ParquetFile(path)
-    for i in reversed(range(pf.num_row_groups)):
-        values = pf.read_row_group(i, columns=[column]).column(column)
-        if len(values):
-            return values[-1].as_py()
-    return None
-
-
-def last_session(path):
-    """Session date of the last tick in a step-1 file, or None if it holds no ticks."""
-    ts = last_value(path, 'ts')
-    # ts is New York time + 6h, so its calendar date is the session
-    return None if ts is None else ts.date()
-
-
-def append_sessions(path, days):
-    """
-    Append mode: add sessions to the end of the step-1 file. `days` holds to_ticks tables, one session each,
-    oldest first, all newer than the file's last session; it can be a generator (daily_update.py reads
-    MongoDB one session at a time). Parquet cannot be extended in place, so the file is copied to a temp file
-    with the sessions added and swapped in; on any error the file is left as it was. Returns the number of
-    sessions added.
-    """
-    pf = pq.ParquetFile(path)
-    last = last_session(path)
-    days = (day for day in days if day.num_rows)
-    first = next(days, None)
-    if first is None:
-        return 0
-    tmp = Path(str(path) + '.tmp')
-    added = 0
-    try:
-        with pq.ParquetWriter(tmp, pf.schema_arrow, compression='zstd') as writer:
-            for i in range(pf.num_row_groups):
-                writer.write_table(pf.read_row_group(i))
-            for day in itertools.chain([first], days):
-                date = pc.min(day.column('ts')).as_py().date()
-                if last is not None and date <= last:
-                    raise ValueError(f"session {date} is not newer than the last one in {path} ({last}); run init to rebuild")
-                writer.write_table(day.cast(pf.schema_arrow))
-                last = date
-                added += 1
-        with open(tmp, 'rb') as f:
-            os.fsync(f.fileno())  # on disk before it replaces the file
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
-    os.replace(tmp, path)
-    return added
 
 
 def main(argv=None):

@@ -23,7 +23,7 @@ import os
 import numpy as np
 import pandas as pd
 
-from data_pipeline import ib_ticks
+from data_pipeline import daily_update, ib_ticks
 from data_pipeline import raw_data_preprocessing as step1
 
 DEFAULT_OUT = "data/fake_ib/ES_trades.jsonl"
@@ -68,10 +68,10 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args(argv)
 
-    last = step1.last_session(args.src)
+    last = daily_update.step1_last_session(args.src)
     if last is None:
         raise SystemExit(f"{args.src} holds no ticks")
-    price = step1.last_value(args.src, "price") / 4  # ticks -> points
+    price = daily_update.last_value(args.src, "price") / 4  # ticks -> points
     later = ib_ticks.session_dates(last, last + datetime.timedelta(days=args.days * 2 + 7))
     dates = [d for d in later if d not in ib_ticks.HOLIDAYS][:args.days]
     rng = np.random.default_rng(args.seed)
