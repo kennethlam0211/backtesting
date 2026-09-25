@@ -1,18 +1,21 @@
 import numpy as np
 from numba import njit
 
-col_names = [
-    'start_ind','ts','price',
-    'high_1', 'low_1','next_ind_1',
-    'high_5', 'low_5','next_ind_5',
-    'high_10', 'low_10','next_ind_10',
-    'high_15', 'low_15','next_ind_15',
-    'high_30', 'low_30', 'next_ind_30',
-    'high_60', 'low_60','next_ind_60',
-    'high_day', 'low_day','next_ind_day',
-    'high_1s', 'low_1s','next_ind_1s',
-    'high_15s', 'low_15s','next_ind_15s'
-]
+import json
+import zarr
+
+def load_col_names_from_zarr(zarr_path='data/zarr/tick.zarr'):
+    try:
+        z = zarr.open(zarr_path, mode='r')
+        return z.attrs['column_names']
+    except Exception:
+        # Fallback if building fresh without Zarr
+        base = ['start_ind', 'ts', 'price']
+        for f in ['day', '60', '30', '15', '10', '5', '1', '15s', '1s']:
+            base.extend([f'high_{f}', f'low_{f}', f'next_ind_{f}'])
+        return base
+
+col_names = load_col_names_from_zarr()
 
 col_to_ind_dict = {col_name: index for index, col_name in enumerate(col_names)}
 
@@ -26,8 +29,8 @@ PRICE_COL = col_to_ind_dict['price']
 
 
 @njit(cache=True)
-def _search(data, start_idx, target_high, target_low, jump_cols, price_col, side_only):
-    n = data.shape[0]
+def _search(data, start_idx, end_idx, target_high, target_low, jump_cols, price_col, side_only):
+    n = end_idx
     i = start_idx
     while i < n:
         price = data[i, price_col]
@@ -56,17 +59,15 @@ def _search(data, start_idx, target_high, target_low, jump_cols, price_col, side
     return -1, 0
 
 
-def search(data: np.ndarray, start_idx: int, target_high: int, target_low: int, side_only: bool = False):
+def search(data: np.ndarray, start_idx: int, target_high: int, target_low: int, side_only: bool = False, end_idx: int = -1):
     """
     Finds the first tick from start_idx onwards where price >= target_high or price <= target_low.
-    data must be an in-memory int64 numpy array in the tick zarr layout.
-    Returns: (tick_index, 1) if target_high hit first
-             (tick_index, -1) if target_low hit first
-             (None, None) if neither is hit before the end of the array.
-    side_only=True may stop early once the side is certain; tick_index is then None
-    whenever the exact tick was not needed to decide the side.
+    If end_idx is provided (>= 0), the search will strictly stop checking ticks at end_idx.
     """
-    idx, side = _search(data, start_idx, target_high, target_low, JUMP_COLS, PRICE_COL, side_only)
+    if end_idx < 0:
+        end_idx = data.shape[0]
+
+    idx, side = _search(data, start_idx, end_idx, target_high, target_low, JUMP_COLS, PRICE_COL, side_only)
     if side == 0:
         return None, None
     return (None if idx < 0 else int(idx)), int(side)

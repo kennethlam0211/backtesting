@@ -40,16 +40,16 @@ def process_session(session_df: pd.DataFrame, session_date: datetime.date) -> tu
     merged_vol = session_df['volume'].values.astype(np.int64)
 
     # Extract news flags from tick data
-    merged_fomc = session_df.get('news_fomc', pd.Series(np.zeros(len(session_df)))).values.astype(np.int8)
-    merged_nfp = session_df.get('news_nfp', pd.Series(np.zeros(len(session_df)))).values.astype(np.int8)
-    merged_cpi = session_df.get('news_cpi', pd.Series(np.zeros(len(session_df)))).values.astype(np.int8)
-    merged_ppi = session_df.get('news_ppi', pd.Series(np.zeros(len(session_df)))).values.astype(np.int8)
-    merged_gdp = session_df.get('news_gdp', pd.Series(np.zeros(len(session_df)))).values.astype(np.int8)
+    merged_fomc = session_df['news_fomc'].values.astype(np.int8)
+    merged_nfp = session_df['news_nfp'].values.astype(np.int8)
+    merged_cpi = session_df['news_cpi'].values.astype(np.int8)
+    merged_ppi = session_df['news_ppi'].values.astype(np.int8)
+    merged_gdp = session_df['news_gdp'].values.astype(np.int8)
 
     # Extract RTH and session from tick data
-    merged_rth = session_df.get('rth', pd.Series(np.zeros(len(session_df)))).values.astype(bool)
-    merged_session = session_df.get('session', pd.Series(np.zeros(len(session_df)))).values.astype(np.int8)
-    merged_hour = session_df.get('hour', pd.Series(np.zeros(len(session_df)))).values.astype(np.int8)
+    merged_rth = session_df['rth'].values.astype(bool)
+    merged_session = session_df['session'].values.astype(np.int8)
+    merged_hour = session_df['hour'].values.astype(np.int8)
 
     sess_len = len(merged_ts)
 
@@ -290,8 +290,8 @@ def main():
 
     start_date = pd.Timestamp(args.start) if args.start else None
 
-    # We iterate chunks
-    for batch in pf.iter_batches(columns=['ts', 'price', 'volume']):
+    # We iterate chunks, reading all columns
+    for batch in pf.iter_batches():
         df_batch = batch.to_pandas()
 
         if start_date is not None:

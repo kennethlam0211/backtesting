@@ -29,7 +29,7 @@ PDT_CODES = pd.read_csv(Path(__file__).with_name("pdt_codes.csv"))
 NEWS_WINDOW = pd.Timedelta(minutes=5)
 
 def load_news_events():
-    yaml_path = Path(__file__).parent.parent / "news" / "news_events.yaml"
+    yaml_path = Path(__file__).with_name("news_events.yaml")
     if not yaml_path.exists():
         raise FileNotFoundError(f"News events file not found at {yaml_path}")
 
@@ -42,11 +42,18 @@ def load_news_events():
             continue
 
         time_et = data[ev_type]['time_et']
-        # Convert each date + time to our shifted ts coordinate:
-        # event_ts = pd.Timestamp(f"{date} {time_et}") + 6h
-
-        # Fast vectorised parsing:
+        # Default all dates to the standard time
         dt_strings = pd.Series(data[ev_type]['dates']) + ' ' + str(time_et)
+
+        # Apply specific date time overrides if they exist
+        if 'times' in data[ev_type]:
+            overrides = data[ev_type]['times']
+            for o_date, o_time in overrides.items():
+                if o_date in data[ev_type]['dates']:
+                    idx = data[ev_type]['dates'].index(o_date)
+                    dt_strings.iloc[idx] = o_date + ' ' + str(o_time)
+
+        # Convert to datetime and apply shift
         ts = pd.to_datetime(dt_strings) + SHIFT
 
         # Store as sorted array of windows (start, end)
@@ -148,10 +155,8 @@ def to_ticks(table, session_date, pdt_code):
     # Add 8-hour sessions: 1 (Asian), 2 (Europe), 3 (US)
     out['session'] = ((time_since_midnight.dt.components.hours // 8) + 1).astype('int8')
 
-    # The `out` dataframe was the result of a groupby, so we map the unshifted wall clock back.
-    # The simplest way is to map the timezone back from our shifted `ts` directly on `out`.
-    # ts is tz-naive +6h from NY. So ts - 6h = naive NY time.
-    out['hour'] = (out['ts'] - SHIFT).dt.hour.astype('int8')
+    # Add hour column directly from the shifted ts
+    out['hour'] = out['ts'].dt.hour.astype('int8')
 
     # Floor to seconds and store as integer Unix timestamps directly to avoid datetime overhead in step 2
     out['ts'] = out['ts'].dt.floor('s').astype('datetime64[s]')
@@ -176,7 +181,7 @@ def main():
     # Get all files matching pattern, excluding "_partial".
     # Sort by the session date, not the full name: ES_c_0_ and ES_v_0_ dates interleave.
     all_files = sorted(raw_dir.glob("ES_*_trades_*.parquet"), key=lambda f: f.stem.split("_trades_")[1])
-    files = [f for f in all_files if args.start <= f.stem.split("_trades_")[1] <= args.end]
+    files = [f for f in all_files if args.start <= f.stem.split("_trades_")[1] <= args.end and not f.name.endswith("_partial.parquet")]
 
     if not files:
         print("No files found!")
@@ -194,8 +199,14 @@ def main():
     first_ts = None
     last_ts = None
 
+    seen_dates = set()
+
     try:
         for i, f in enumerate(files, 1):
+            date = f.stem.split("_trades_")[1]
+            assert date not in seen_dates, f"Duplicate session date {date} in {f.name}"
+            seen_dates.add(date)
+
             table = pq.read_table(f)
             # Fail on any real schema difference instead of silently casting it away
             assert table.schema.remove_metadata().equals(base_schema), f"schema differs: {f.name}"
