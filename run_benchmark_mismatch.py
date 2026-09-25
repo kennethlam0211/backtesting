@@ -1,22 +1,27 @@
-import time
 import os
+import sys
+
 import numpy as np
 from rich.console import Console
-from search import search, col_to_ind_dict, PRICE_COL
+
+from to_dat import DAT_COLS
+from search_stop import search_stop, load_dat, PRICE_COL
 
 console = Console()
 
-def brute_force_search(data: np.ndarray, start_idx: int, target_high: int, target_low: int):
-    n = data.shape[0]
-    for i in range(start_idx, n):
+
+def brute_force_search(data: np.ndarray, start_idx: int, end_idx: int, target_high: int, target_low: int):
+    for i in range(start_idx, end_idx):
         price = data[i, PRICE_COL]
         if price >= target_high:
             return i, 1
         if price <= target_low:
             return i, -1
-    return None, None
+    return None, 0
+
 
 def main():
+    freq = sys.argv[1] if len(sys.argv) > 1 else '1'
     console.print("[cyan]Opening memory-mapped .dat array...[/cyan]")
     memmap_path = 'data/zarr_test/tick.dat'
 
@@ -24,70 +29,53 @@ def main():
         console.print(f"[red]Could not find test data at {memmap_path}[/red]")
         return
 
-    num_cols = len(col_to_ind_dict)
-    file_size = os.path.getsize(memmap_path)
-    num_ticks = file_size // (num_cols * 8)
-
-    data = np.memmap(memmap_path, dtype='i8', mode='r', shape=(num_ticks, num_cols))
+    data = load_dat(memmap_path)
+    next_col = DAT_COLS.index(f'next_ind_{freq}')
+    bar_starts = np.flatnonzero(data[:, next_col])
 
     np.random.seed(42)
     NUM_QUERIES = 10_000
-    start_indices = np.random.randint(0, num_ticks - 1_000_000, size=NUM_QUERIES)
+    start_indices = np.random.choice(bar_starts, size=NUM_QUERIES)
 
     queries = []
     for idx in start_indices:
         start_price = data[idx, PRICE_COL]
         tp_offset = np.random.randint(1000, 5000)
         sl_offset = np.random.randint(1000, 5000)
-        queries.append((idx, start_price + tp_offset, start_price - sl_offset))
+        queries.append((int(idx), int(start_price + tp_offset), int(start_price - sl_offset)))
 
-    # Warm up Numba JIT
-    search(data, queries[0][0], queries[0][1], queries[0][2])
+    for idx, tp, sl in queries:
+        end_idx = int(data[idx, next_col])
+        hit_idx, bf_side = brute_force_search(data, idx, end_idx, tp, sl)
+        stop_side = search_stop(data, tp, sl, freq, idx)
 
-    for i, (idx, tp, sl) in enumerate(queries):
-        bf_res = brute_force_search(data, idx, tp, sl)
-        numba_res = search(data, idx, tp, sl)
-
-        if bf_res != numba_res:
+        if bf_side != stop_side:
             print("\n" + "="*50)
             print("MISMATCH FOUND!")
             print(f"Input Parameters:")
-            print(f"  start_idx: {idx}")
+            print(f"  freq: {freq}")
+            print(f"  start_idx: {idx} (bar ends at {end_idx})")
             print(f"  target_high: {tp}")
             print(f"  target_low: {sl}")
             print(f"\nResults:")
-            print(f"  Brute Force returned: {bf_res}")
-            print(f"  Numba returned:       {numba_res}")
+            print(f"  Brute Force returned: {bf_side} (tick {hit_idx})")
+            print(f"  search_stop returned: {stop_side}")
 
-            end_idx = None
-            if bf_res[0] is not None and numba_res[0] is not None:
-                end_idx = max(bf_res[0], numba_res[0])
-            elif bf_res[0] is not None:
-                end_idx = bf_res[0]
-            elif numba_res[0] is not None:
-                end_idx = numba_res[0]
-            else:
-                end_idx = idx + 10  # fallback
-
-            print("\nData Subset (start_idx to returned indices):")
+            last = min(end_idx, (hit_idx if hit_idx is not None else end_idx) + 2, idx + 200)
+            print("\nData Subset (start_idx up to the first hit, at most 200 ticks):")
             print("Index | Price")
             print("-" * 20)
-            # Show data up to slightly past the mismatch
-            for j in range(idx, end_idx + 2):
-                if j < num_ticks:
-                    price = data[j, PRICE_COL]
-                    marker = " <-- START" if j == idx else ""
-                    if bf_res[0] == j and numba_res[0] == j:
-                        marker += " <-- BF & NUMBA MATCH"
-                    elif bf_res is not None and bf_res[0] == j:
-                        marker += " <-- BF RESULT"
-                    elif numba_res is not None and numba_res[0] == j:
-                        marker += " <-- NUMBA RESULT"
-
-                    print(f"{j:<5} | {price}{marker}")
+            for j in range(idx, last):
+                marker = " <-- START" if j == idx else ""
+                if j == hit_idx:
+                    marker += " <-- BF FIRST HIT"
+                print(f"{j:<5} | {data[j, PRICE_COL]}{marker}")
 
             print("="*50 + "\n")
             return
+
+    console.print(f"[green]No mismatch in {NUM_QUERIES:,} queries on {freq} bars.[/green]")
+
 
 if __name__ == "__main__":
     main()
