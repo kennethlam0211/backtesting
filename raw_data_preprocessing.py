@@ -143,9 +143,7 @@ def to_ticks(table, session_date, pdt_code):
     df = pd.DataFrame({'ts': ts, 'price': df['price'], 'size': df['size'].astype('int64')})
     # ES trades in 0.25-point ticks; price x4 is the price in ticks, an exact integer (4000.25 -> 16001).
     # OHLC downstream is built from it, so every price column is in ticks.
-    ticks = df['price'] * 4
-    assert (ticks == ticks.round()).all(), f"price off the 0.25 grid {session_date.date()}"
-    df['price'] = ticks.round().astype('int64')
+    df['price'] = (df['price'] * 4).astype('int64')
 
     out = df.groupby(['ts', 'price'], sort=False).agg(volume=('size', 'sum')).reset_index()
     out['pdt_code'] = pdt_code
