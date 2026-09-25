@@ -12,8 +12,8 @@ import pyarrow.parquet as pq
 from rich.console import Console
 from rich.traceback import install
 
-# Bar sizes and the tick.dat column layout are shared with the reader (tick_data.TickData)
-from tick_data.params import FREQS, PARQUET_FREQS, DAT_COLS
+# Bar sizes and the tick.dat column layout are shared with the reader (stop_search.StopSearch)
+from stop_search.params import FREQS, PARQUET_FREQS, DAT_COLS
 
 install()
 console = Console()

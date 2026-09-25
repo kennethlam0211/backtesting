@@ -1,7 +1,7 @@
 # Pipeline: how to run it
 
 Three steps, run **in this order**, each from the **repo root** with `python -m` (so the packages
-`pipeline` and `tick_data` import without any path setup):
+`pipeline` and `stop_search` import without any path setup):
 
 ```bash
 pip install -r requirements.txt                     # once
@@ -13,7 +13,7 @@ python -m pipeline.data_preprocessing --freq 5      # 3. bar features (optional;
 
 ```
 raw_data/ES_*_trades_<date>.parquet ─┐
-raw_data/roll_open_blocks/           ├─ 1 ─> data/ES_trades_concat.parquet ─ 2 ─> data/zarr/tick.dat ────────> tick_data.TickData / first_hit
+raw_data/roll_open_blocks/           ├─ 1 ─> data/ES_trades_concat.parquet ─ 2 ─> data/zarr/tick.dat ────────> stop_search.StopSearch / first_hit
 raw_data/pdt_codes.csv               │                                           data/zarr/{freq}_ohlcv.parquet ─ 3 ─> features (printed)
 params/news_events.yaml ─────────────┘
 ```
@@ -48,12 +48,12 @@ python -m pipeline.to_dat --limit 5 --out data/zarr_test                    # fi
 | | |
 |---|---|
 | Reads | `--src`, default `./data/ES_trades_concat.parquet` (step 1's output) |
-| Writes | into `--out` (default `./data/zarr`, created if missing): `tick.dat` (all ticks with their bar summaries, int64, columns = `tick_data.DAT_COLS`) and `{freq}_ohlcv.parquet` for `1 5 10 15 30 60 day` |
+| Writes | into `--out` (default `./data/zarr`, created if missing): `tick.dat` (all ticks with their bar summaries, int64, columns = `stop_search.DAT_COLS`) and `{freq}_ohlcv.parquet` for `1 5 10 15 30 60 day` |
 | Options | `--limit N`: only the first N sessions; `--start YYYY-MM-DD`: skip sessions before that date |
 | Notes | Runs sessions in parallel (up to 24 processes). `tick.dat` is written as `tick.dat.tmp` and renamed only when the run finishes, so an existing `tick.dat` is always complete; the bar files are written in place |
 
-Bar sizes and the `tick.dat` layout come from `tick_data/params.py`. Changing `FREQS` there changes
-the file layout: rerun this step before using `tick_data` again.
+Bar sizes and the `tick.dat` layout come from `stop_search/params.py`. Changing `FREQS` there changes
+the file layout: rerun this step before using `stop_search` again.
 
 ## 3. `data_preprocessing.py` — bar features (preview)
 
@@ -69,9 +69,9 @@ array. **It does not write a file yet.**
 ## Using the output
 
 ```python
-from tick_data import TickData
+from stop_search import StopSearch
 
-ticks = TickData.load('data/zarr/tick.dat')
+ticks = StopSearch.load('data/zarr/tick.dat')
 starts = ticks.bar_starts('1')                                       # first tick of every 1-min bar
 entry = ticks.price(starts)
 sides = ticks.first_hit_many('1', starts, entry + 40, entry - 20)    # 1 upper first, -1 lower first, 0 neither

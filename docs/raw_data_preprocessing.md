@@ -2,7 +2,7 @@
 
 Turns the raw Databento ES trade files (one per session) into **one clean, time-ordered tick file**
 with one contract per session, prices in ticks, and a clock that looks the same in summer and winter.
-Step 2 (`pipeline/to_dat.py`) reads its output and writes `tick.dat` (for the stop search, `tick_data.first_hit`)
+Step 2 (`pipeline/to_dat.py`) reads its output and writes `tick.dat` (for the stop search, `stop_search.first_hit`)
 and the OHLCV bar files (`open`/`high`/`low`/`close` in ticks, int32, like `price` here).
 
 ```bash
@@ -104,7 +104,7 @@ rows, is the same contract, and price moves at most 1 tick across the seam.
   order. Summing keeps volume exact; dropping would lose ~0.3%.
 - **Merge before flooring to seconds.** Only truly simultaneous fills at one price are combined.
   After flooring, several rows can share a second and price; they stay separate rows, and **row order is
-  the true trade order** (the stop search, `tick_data.first_hit`, walks rows in order).
+  the true trade order** (the stop search, `stop_search.first_hit`, walks rows in order).
 - **Prices in ticks (x4).** One unit is one 0.25-point tick, so prices, OHLC bars and stop/target levels
   downstream are all whole numbers of ticks (10 points = 40). There is no grid check: a price off the
   0.25 grid would be truncated, which ES data does not have.

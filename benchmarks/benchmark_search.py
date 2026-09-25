@@ -5,7 +5,7 @@ import time
 import numpy as np
 from rich.console import Console
 
-from tick_data import first_hit, first_hit_many, load_dat, DAT_COLS, PRICE_COL
+from stop_search import first_hit, first_hit_many, load_dat, DAT_COLS, PRICE_COL
 
 console = Console()
 

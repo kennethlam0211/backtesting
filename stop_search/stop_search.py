@@ -153,7 +153,7 @@ def _many(data, chain, price_col, freq, start_idx, upper, lower):
 def first_hit(data, freq, start_idx, upper, lower):
     """
     Which level one entry's `freq` bar touches first, looking only inside that bar.
-    For many entries at once use first_hit_many; for use from another class, TickData holds the
+    For many entries at once use first_hit_many; for use from another class, StopSearch holds the
     loaded ticks and offers both calls.
 
     Same logic as search_org.search_stop: one level inside a bar decides it; both inside splits the bar
@@ -181,7 +181,7 @@ def first_hit(data, freq, start_idx, upper, lower):
 
     Example:
         import numpy as np
-        from tick_data import first_hit, load_dat, DAT_COLS, PRICE_COL
+        from stop_search import first_hit, load_dat, DAT_COLS, PRICE_COL
 
         data = load_dat('data/zarr/tick.dat')
         i = np.flatnonzero(data[:, DAT_COLS.index('next_ind_1')])[0]    # first tick of the first 1-min bar
@@ -217,7 +217,7 @@ def first_hit_many(data, freq, start_idx, upper, lower):
 
     Example:
         import numpy as np
-        from tick_data import first_hit_many, load_dat, DAT_COLS, PRICE_COL
+        from stop_search import first_hit_many, load_dat, DAT_COLS, PRICE_COL
 
         data = load_dat('data/zarr/tick.dat')
         starts = np.flatnonzero(data[:, DAT_COLS.index('next_ind_1')])  # first tick of every 1-min bar
@@ -251,7 +251,7 @@ def _stamp(path):
     return st.st_size, st.st_mtime_ns
 
 
-class TickData:
+class StopSearch:
     """
     tick.dat loaded once, with its bar layout, for another class (backtester, RL env) to hold and query.
 
@@ -263,11 +263,11 @@ class TickData:
     threads do not survive fork).
 
     Example:
-        from tick_data import TickData
+        from stop_search import StopSearch
 
         class Backtester:
             def __init__(self, path):
-                self.ticks = TickData.load(path)                  # once
+                self.ticks = StopSearch.load(path)                  # once
 
             def label(self, freq, tp, sl):
                 starts = self.ticks.bar_starts(freq)              # first tick of every `freq` bar (cached)

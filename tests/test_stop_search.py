@@ -11,7 +11,7 @@ import pandas as pd
 import pytest
 
 from pipeline.to_dat import process_session
-from tick_data import first_hit, first_hit_many, load_dat, TickData, CHILD, DAT_COLS, FREQS, PRICE_COL
+from stop_search import first_hit, first_hit_many, load_dat, StopSearch, CHILD, DAT_COLS, FREQS, PRICE_COL
 
 NEXT = {f: DAT_COLS.index(f'next_ind_{f}') for f in FREQS}
 HIGH = {f: DAT_COLS.index(f'high_{f}') for f in FREQS}
@@ -189,7 +189,7 @@ def test_zero_d_arrays_count_as_one_entry(data):
 
 
 class Backtester:
-    """Stand-in for the class that owns a TickData."""
+    """Stand-in for the class that owns a StopSearch."""
 
     def __init__(self, ticks):
         self.ticks = ticks
@@ -211,8 +211,8 @@ def dat_file(data, tmp_path_factory):
     return path
 
 
-def test_tickdata_matches_function(data):
-    ticks = TickData(data)
+def test_stopsearch_matches_function(data):
+    ticks = StopSearch(data)
     assert len(ticks) == len(data)
     for freq in CHILD:
         starts = ticks.bar_starts(freq)
@@ -225,30 +225,30 @@ def test_tickdata_matches_function(data):
         assert ticks.first_hit(freq, int(starts[0]), int(entry[0]) + 40, int(entry[0]) - 20) == want[0]
 
 
-def test_tickdata_rejects_child_tables_that_do_not_tile(data):
+def test_stopsearch_rejects_child_tables_that_do_not_tile(data):
     with pytest.raises(ValueError):
-        TickData(data, child={**CHILD, '15': '10'})
+        StopSearch(data, child={**CHILD, '15': '10'})
     with pytest.raises(ValueError):
-        TickData(data, child={**CHILD, '5': '2'})
+        StopSearch(data, child={**CHILD, '5': '2'})
 
 
-def test_tickdata_pickles_by_path(data, dat_file):
-    ticks = TickData.load(dat_file)
+def test_stopsearch_pickles_by_path(data, dat_file):
+    ticks = StopSearch.load(dat_file)
     ticks.bar_starts('1')
     blob = pickle.dumps(Backtester(ticks))
     assert len(blob) < 10_000 < data.nbytes  # the path, not the ticks
     bt = pickle.loads(blob)
     assert isinstance(bt.ticks.data, np.memmap)
-    assert np.array_equal(bt.label('1', 40, 20), Backtester(TickData(data)).label('1', 40, 20))
+    assert np.array_equal(bt.label('1', 40, 20), Backtester(StopSearch(data)).label('1', 40, 20))
 
 
-def test_in_memory_tickdata_pickles_with_its_ticks(data):
-    ticks = pickle.loads(pickle.dumps(TickData(data)))
+def test_in_memory_stopsearch_pickles_with_its_ticks(data):
+    ticks = pickle.loads(pickle.dumps(StopSearch(data)))
     assert np.array_equal(ticks.data, data)
 
 
 def test_owner_class_works_in_worker_processes(dat_file):
-    bt = Backtester(TickData.load(dat_file))
+    bt = Backtester(StopSearch.load(dat_file))
     with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context('spawn')) as pool:
         results = list(pool.map(_label_in_worker, [bt, bt], ['1', '15']))
     assert np.array_equal(results[0], bt.label('1', 40, 20))
@@ -291,7 +291,7 @@ def test_cut_or_negative_rows_raise_instead_of_reading_outside(data):
 
 
 def test_bar_starts_cache_is_read_only(data):
-    starts = TickData(data).bar_starts('1')
+    starts = StopSearch(data).bar_starts('1')
     with pytest.raises(ValueError):
         starts += 1
 
@@ -299,31 +299,31 @@ def test_bar_starts_cache_is_read_only(data):
 def test_child_table_cycles_raise(data):
     for bad in ({**CHILD, '1s': '1s'}, {**CHILD, '5': '5'}):
         with pytest.raises(ValueError):
-            TickData(data, child=bad)
+            StopSearch(data, child=bad)
 
 
 def test_params_import_does_not_load_numba():
-    code = "import sys; from tick_data.params import FREQS, DAT_COLS; assert 'numba' not in sys.modules"
+    code = "import sys; from stop_search.params import FREQS, DAT_COLS; assert 'numba' not in sys.modules"
     subprocess.run([sys.executable, '-c', code], check=True, cwd=os.path.join(os.path.dirname(__file__), '..'))
 
 
 def test_pickle_uses_absolute_path_and_memmap_file(data, dat_file, tmp_path, monkeypatch):
     monkeypatch.chdir(dat_file.parent)
-    ticks = TickData.load(dat_file.name)  # relative path
+    ticks = StopSearch.load(dat_file.name)  # relative path
     assert os.path.isabs(ticks.path)
     monkeypatch.chdir(tmp_path)  # a worker with another working directory
     assert np.array_equal(pickle.loads(pickle.dumps(ticks)).data, data)
     # built from load_dat: the memmap knows its file, so pickling still carries only the path
-    assert len(pickle.dumps(TickData(load_dat(dat_file)))) < 10_000
+    assert len(pickle.dumps(StopSearch(load_dat(dat_file)))) < 10_000
     # a slice of the memmap is not the whole file: pickled with its ticks
     part = load_dat(dat_file)[:100]
-    assert np.array_equal(pickle.loads(pickle.dumps(TickData(part))).data, part)
+    assert np.array_equal(pickle.loads(pickle.dumps(StopSearch(part))).data, part)
 
 
 def test_unpickle_refuses_a_changed_file(data, tmp_path):
     path = tmp_path / 'tick.dat'
     data.tofile(path)
-    blob = pickle.dumps(TickData.load(path))
+    blob = pickle.dumps(StopSearch.load(path))
     data[:10].tofile(path)  # to_dat.py wrote a new tick.dat
     with pytest.raises(ValueError):
         pickle.loads(blob)
