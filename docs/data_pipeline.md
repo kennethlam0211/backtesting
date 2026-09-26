@@ -23,7 +23,7 @@ Full run: 1,737 sessions (2020-01-02 → 2026-09-18) in about 3 minutes; about 1
 
 | Column | Type | Meaning |
 |---|---|---|
-| `ts` | timestamp, whole seconds | New York time + 6h (see *Clock*). Session = `ts.date` |
+| `ts` | timestamp, whole seconds | New York time + 6h (see *Clock*). Session = `ts.date`. Parquet has no seconds unit, so it reads back as milliseconds (always `.000`); `df.ts.astype('datetime64[s]')` gives the seconds |
 | `price` | int32 | Trade price **in ticks**: points x 4 (4000.25 -> 16001). Raw, not adjusted across rolls |
 | `volume` | int64 | Contracts traded (sum of merged raw `size`) |
 | `rth` | int8 | `1` in regular hours, New York `[09:30, 16:00)` = `ts` `[15:30, 22:00)` |

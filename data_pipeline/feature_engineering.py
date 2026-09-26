@@ -1,8 +1,8 @@
 """
 Bar features for the RL agent: the polars version of reference/preprocessing_pandas.py. Runs after step 2:
 
-    python -m data_pipeline.data_preprocessing                  # step 2's default output -> training_data.parquet in it
-    python -m data_pipeline.data_preprocessing --data-dir data/processed_2024 --out data/features_2024.parquet
+    python -m data_pipeline.feature_engineering                  # step 2's default output -> training_data.parquet in it
+    python -m data_pipeline.feature_engineering --data-dir data/processed_2024 --out data/features_2024.parquet
 
 Reads {data-dir}/{freq}_ohlcv.parquet for every freq in params.FREQS and adds, per freq (window 20): SMA, std,
 Bollinger bands (2 sigma), ATR, SMA-RSI, FVG, bar-to-bar moves and bar score. Every higher freq is then
@@ -251,6 +251,10 @@ class DataPreprocessor:
         """Load and process a single timeframe."""
         file_path = os.path.join(self.data_dir, f'{freq}_ohlcv.parquet')
         lf = pl.scan_parquet(file_path)
+        # The bar files store ts as the shifted-clock timestamp; everything here works in its whole seconds
+        # (bar files written before that already hold the seconds)
+        if lf.collect_schema()['ts'].is_temporal():
+            lf = lf.with_columns(pl.col('ts').dt.epoch('s'))
 
         # Ensure sorted by time
         lf = lf.sort('ts')
@@ -313,6 +317,11 @@ class DataPreprocessor:
             std = live_std(df_1m, freq)
             df_1m = df_1m.with_columns([pl.Series(f'20_std_live_{freq}', std), *ud_columns(df_1m['close_1'], std, 20, f'_{freq}')])
             df_1m = df_1m.drop([f'_live_mean_{freq}', f'_live_m2_{freq}'])
+
+        # ts back to exactly what the bar files hold: the 1-min bar's start on the shifted clock, a timestamp
+        # without a time zone (the joins above work in its seconds). As plain seconds, viewers took it for a
+        # UTC instant and showed it in local time
+        df_1m = df_1m.with_columns(pl.from_epoch('ts', time_unit='s').cast(pl.Datetime('ms')))
 
         if not keep_warmup:
             first = warmup_rows(df_1m, FREQS)

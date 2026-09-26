@@ -116,8 +116,7 @@ def sessions_in(folder):
     tick_ts = np.fromfile(folder / "data/processed/tick.dat", dtype=np.int64).reshape(-1, len(DAT_COLS))[:, DAT_COLS.index("ts")]
     out = {"step1": sorted(set(ts.dt.date)), "tick.dat": sorted(set(pd.to_datetime(tick_ts, unit="s").date))}
     for f in BAR_FILES:
-        bar_ts = pq.read_table(folder / "data/processed" / f, columns=["ts"]).column("ts").to_numpy()
-        out[f] = sorted(set(pd.to_datetime(bar_ts, unit="s").date))
+        out[f] = sorted(set(pq.read_table(folder / "data/processed" / f, columns=["ts"]).column("ts").to_pandas().dt.date))
     return out
 
 
@@ -136,7 +135,7 @@ def assert_same_as_full(folder, full, n_sessions=len(DATES)):
     for f in BAR_FILES:
         bars = pq.read_table(folder / "data/processed" / f)
         full_bars = pq.read_table(full / "data/processed" / f)
-        keep = pd.to_datetime(full_bars.column("ts").to_numpy(), unit="s").date <= dates[-1]
+        keep = full_bars.column("ts").to_pandas().dt.date <= dates[-1]
         assert bars.equals(full_bars.filter(pa.array(keep))), f
     assert not list(folder.glob("data/**/*.tmp"))
 
@@ -183,6 +182,20 @@ def test_fetch_takes_only_the_session():
     for date in DATES:
         assert ib_ticks.fetch_session(fake, date).column("ts_event").equals(RAW[date].column("ts_event"))
     assert ib_ticks.fetch_session(fake, datetime.date(2024, 3, 8)).num_rows == 0
+
+
+def test_bar_files_keep_the_shifted_clock(full):
+    # ts is each bar's start on the shifted clock (New York + 6h), a timestamp stored like step 1's ts
+    step1_ts = pq.read_table(full / "data/ES_trades_concat.parquet", columns=["ts"]).column("ts")
+    assert pa.types.is_timestamp(step1_ts.type) and step1_ts.type.tz is None
+    ticks = step1_ts.to_pandas()
+    for f in BAR_FILES:
+        ts = pq.read_table(full / "data/processed" / f, columns=["ts"]).column("ts")
+        assert ts.type == step1_ts.type, f
+    day = pq.read_table(full / "data/processed/day_ohlcv.parquet").column("ts").to_pandas()
+    assert day.tolist() == [pd.Timestamp(d) for d in DATES]  # a session opens at 00:00 on its date
+    one = pq.read_table(full / "data/processed/1_ohlcv.parquet").column("ts").to_pandas()
+    assert (one == one.dt.floor("min")).all() and one.iloc[0] == ticks.iloc[0].floor("min")
 
 
 # ---------------------------------------------------------------- closures, missing data

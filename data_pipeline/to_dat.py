@@ -208,11 +208,13 @@ def offset_session(tick_res: pd.DataFrame, resampled_res: dict[str, np.ndarray],
 
 
 def bars_table(bars: list[np.ndarray]) -> pa.Table:
-    """Bar arrays from process_session -> one parquet table, ts as unix seconds on the shifted clock."""
+    """
+    Bar arrays from process_session -> one parquet table. ts is the bar's start on the shifted clock
+    (New York + 6h), a timestamp in whole seconds like step 1's ts.
+    """
     df = pd.DataFrame(np.concatenate(bars))
-    # Convert bar_labels (ns shifted time) back to proper datetimes, then to absolute unix seconds
-    shifted_ts = pd.to_datetime(df['ts'], unit='ns')
-    df['ts'] = to_unix_epoch(shifted_ts)
+    # bar labels are ns on the shifted clock
+    df['ts'] = pd.to_datetime(df['ts'], unit='ns').astype('datetime64[s]')
     return pa.Table.from_pandas(df, preserve_index=False)
 
 
