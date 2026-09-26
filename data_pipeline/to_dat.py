@@ -213,8 +213,8 @@ def bars_table(bars: list[np.ndarray]) -> pa.Table:
     (New York + 6h), a timestamp in whole seconds like step 1's ts.
     """
     df = pd.DataFrame(np.concatenate(bars))
-    # bar labels are ns on the shifted clock
-    df['ts'] = pd.to_datetime(df['ts'], unit='ns').astype('datetime64[s]')
+    # Convert bar_labels (ns shifted time) back to proper datetimes
+    df['ts'] = pd.to_datetime(df['ts'], unit='ns')
     return pa.Table.from_pandas(df, preserve_index=False)
 
 
