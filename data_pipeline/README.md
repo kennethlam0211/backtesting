@@ -182,7 +182,7 @@ python -m data_pipeline.to_dat --limit 5 --out data/processed_test              
 | | |
 |---|---|
 | Reads | `--src` (default: step 1's default output) |
-| Writes | into `--out` (default set in the script, created if missing): `tick.dat` (all ticks with their bar summaries, int64, columns = `stop_search.DAT_COLS`; its `ts` is seconds on the shifted clock) and `{freq}_ohlcv.parquet` for `1 5 10 15 30 60 day` (`ts` is the bar's start on the shifted clock, a timestamp like step 1's `ts`: whole seconds, stored with Parquet's millisecond unit) |
+| Writes | into `--out` (default set in the script, created if missing): `tick.dat` (all ticks with their bar summaries, int64, columns = `stop_search.DAT_COLS`; its `ts` is seconds on the shifted clock) and `{freq}_ohlcv.parquet` for `1 5 10 15 30 60 day` (`ts` is the bar's start on the shifted clock, a timestamp like step 1's `ts`: whole seconds, since step 1 floors to seconds after its merge. Parquet has no seconds unit, so it is stored and read back in milliseconds, always `.000`; `df.ts.astype('datetime64[s]')` gives the seconds without loss) |
 | Options | `--limit N`: only the first N sessions; `--start YYYY-MM-DD`: skip sessions before that date (default: all sessions) |
 | Notes | Runs sessions in parallel (up to 24 processes). `tick.dat` is written as `tick.dat.tmp` and renamed only when the run finishes, so an existing `tick.dat` is always complete; the bar files are written in place |
 
