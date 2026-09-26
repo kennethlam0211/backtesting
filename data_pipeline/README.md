@@ -246,7 +246,14 @@ Prices are in ticks (x4): 10 points = 40.
 
 ```bash
 pytest                                                        # unit tests (append against a fake MongoDB), no data needed
+python -m scripts.sample_output                               # step 2 on the first 10,000 ticks of step 1's output -> data/sample/
 python -m data_pipeline.to_dat --limit 5 --out data/processed_test # the benchmarks read data/processed_test/tick.dat
 python -m benchmarks.run_benchmark_mismatch 1                 # first_hit vs a tick-by-tick scan (also 5, 15, 60, day)
 python -m benchmarks.benchmark_search 1                       # the same, with timings
 ```
+
+`scripts/sample_output.py` runs step 2 exactly as a full build does, on the first `--rows` ticks (default
+10,000) of `ES_trades_concat.parquet`. It prints the input, the bars (`--freq`, default 1) and `tick.dat`,
+and checks every bar against `tick.dat` and the input ticks: open / high / low / close, volume, `ts`, the
+bar summary and consecutive bars. It saves `tick.dat`, the bar files and CSVs (`step1_ticks.csv`,
+`tick_dat.csv` with every column, `{freq}_ohlcv.csv`) in `data/sample/`, and exits 1 if a check fails.
