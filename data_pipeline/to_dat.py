@@ -14,13 +14,14 @@ from rich.traceback import install
 
 # Bar sizes and the tick.dat column layout are shared with the reader (stop_search.StopSearch)
 from stop_search.params import FREQS, PARQUET_FREQS, DAT_COLS
+from params import DATA_PATH
 
 install()
 console = Console()
 
-# Default input (must equal raw_data_preprocessing.DEFAULT_OUT; a test checks) and output folder
+# Default input (must equal raw_data_preprocessing.DEFAULT_OUT; a test checks) and output folder (params/params.py)
 DEFAULT_SRC = "data/ES_trades_concat.parquet"
-DEFAULT_OUT = "data/processed"
+DEFAULT_OUT = DATA_PATH
 
 
 # One bar per row: the OHLCV parquet columns. ts is the bar's start on the shifted clock (a timestamp)

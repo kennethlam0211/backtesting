@@ -10,8 +10,8 @@ joined onto the 1-min bars: a bar appears on the 1-min row during which it close
 one closes, so a row holds nothing from the future once that 1-min bar has closed.
 U/D, as the reference: for every freq on the 1-min closes, with that freq's std as the reversal threshold
 (for a higher freq its live std: the last 19 closes shown so far plus the current 1-min close, once 19 have
-closed), with the flag and the last params.UD_PIVOTS pivots. The output starts once every freq has its
-pivots (as the reference's take_away_burnout_period); --keep-warmup keeps the rows before.
+closed), with the flag and the last params.UD_PIVOTS pivots. The output starts on the first session that
+begins with every freq's pivots (as the reference's take_away_burnout_period); --keep-warmup keeps the rows before.
 Prices are in ticks (x4), like the bar files.
 """
 import argparse
@@ -22,8 +22,8 @@ import numpy as np
 import polars as pl
 from numba import njit
 
-from data_pipeline.to_dat import DEFAULT_OUT as DATA_DIR
-from params import FEATURES, FREQS, NORM_FACTOR, UD_PIVOTS, WINDOW_SIZE, VOL_METHODS
+from params import DATA_PATH as DATA_DIR
+from params import FEATURES, FREQS, NORM_FACTOR, TRAINING_DATA_PATH, UD_PIVOTS, WINDOW_SIZE, VOL_METHODS
 
 # A session is [00:00, 23:00) on the shifted clock (New York + 6h): no bar runs past 23:00
 SESSION_SECONDS = 23 * 3600
@@ -133,7 +133,8 @@ def ud_columns(high_px, low_px, kv, window, suffix=""):
         # pl.Series(f"{window}_U{suffix}", u).cast(pl.Int32),
         # pl.Series(f"{window}_D{suffix}", d).cast(pl.Int32),
         pl.Series(f"{window}_UD_flag{suffix}", flag).cast(pl.Int8),
-        *[pl.Series(f"{window}_UD_last{k + 1}{suffix}", pivots[:, k]).cast(pl.Int32) for k in range(UD_PIVOTS)],
+        # NaN (not enough pivots yet) -> null: an integer column cannot hold NaN
+        *[pl.Series(f"{window}_UD_last{k + 1}{suffix}", pivots[:, k], nan_to_null=True).cast(pl.Int32) for k in range(UD_PIVOTS)],
     ]
 
 
@@ -161,14 +162,20 @@ def live_std(df: pl.DataFrame, freq: str, window: int = 20) -> np.ndarray:
 
 def warmup_rows(df: pl.DataFrame, freqs) -> int:
     """
-    Rows before every freq has its UD_PIVOTS pivots (as the reference's take_away_burnout_period). The
-    pivot columns never go back to NaN once filled, so every later row has them all.
+    Rows before the first session that starts with every freq's UD_PIVOTS pivots (as the reference's
+    take_away_burnout_period), so the output starts on a new date, never partway through a session. The
+    pivot columns never go back to empty once filled, so every later row has them all.
     """
-    full = np.logical_and.reduce([~np.isnan(df[f'{WINDOW_SIZE}_UD_last{UD_PIVOTS}_{freq}'].to_numpy()) for freq in freqs])
-    if not full.any():
-        raise ValueError(f"no row has {UD_PIVOTS} U/D pivots for every freq in {list(freqs)} yet: more data is "
-                         f"needed (or --keep-warmup)")
-    return int(full.argmax())
+    # Empty pivots are null (Int32 columns); to_numpy turns them into NaN
+    full = np.logical_and.reduce([~np.isnan(df[f'{WINDOW_SIZE}_UD_last{UD_PIVOTS}_{freq}'].to_numpy().astype(np.float64))
+                                  for freq in freqs])
+    date = df['ts'].dt.date().to_numpy()
+    session_starts = np.flatnonzero(np.r_[True, date[1:] != date[:-1]])
+    ready = session_starts[full[session_starts]]
+    if not len(ready):
+        raise ValueError(f"no session starts with {UD_PIVOTS} U/D pivots for every freq in {list(freqs)} yet: "
+                         f"more data is needed (or --keep-warmup)")
+    return int(ready[0])
 
 
 def calc_sma(lf: pl.LazyFrame, window: int) -> pl.LazyFrame:
@@ -357,17 +364,17 @@ class DataPreprocessor:
         if not keep_warmup:
             first = warmup_rows(df_base, FREQS)
             if first:
-                print(f"Warm-up dropped: the first {first:,} rows, until every freq has {UD_PIVOTS} U/D pivots")
+                print(f"Warm-up dropped: the first {first:,} rows, until the first session that starts with every freq's {UD_PIVOTS} U/D pivots")
             df_base = df_base.slice(first)
         return df_base
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Bar features, higher freqs joined onto the 1-min bars.")
     parser.add_argument("--data-dir", default=DATA_DIR, help="step 2's output folder with the {freq}_ohlcv.parquet files")
-    parser.add_argument("--out", default=None, help="output parquet (default: training_data.parquet in --data-dir)")
-    parser.add_argument("--keep-warmup", action="store_true", help="keep the rows before every freq has its U/D pivots")
+    parser.add_argument("--out", default=None, help="output parquet (default: params.TRAINING_DATA_PATH's file name in --data-dir)")
+    parser.add_argument("--keep-warmup", action="store_true", help="keep the rows before the first session that starts with every freq's U/D pivots")
     args = parser.parse_args(argv)
-    out = args.out or os.path.join(args.data_dir, "training_data.parquet")
+    out = args.out or os.path.join(args.data_dir, os.path.basename(TRAINING_DATA_PATH))
 
     t0 = time.time()
     final_df = DataPreprocessor(data_dir=args.data_dir).build_merged_dataset(keep_warmup=args.keep_warmup)

@@ -363,8 +363,14 @@ def test_load_defaults_to_params_dat_path(data, tmp_path, monkeypatch):
     assert stops.path == os.path.abspath(DAT_PATH) and stops.data.shape == data.shape
 
 
-def test_default_paths_agree_with_to_dat():
-    # to_dat.py keeps its own output path; StopSearch.load() must follow it (feature_engineering imports it)
+def test_paths_come_from_params_and_are_relative():
+    # Every path lives in params/params.py; StopSearch.load() opens the tick.dat to_dat.py writes
+    import params
     from stop_search import DAT_PATH
     from data_pipeline.to_dat import DEFAULT_OUT as out
-    assert os.path.normpath(os.path.join(out, 'tick.dat')) == os.path.normpath(DAT_PATH), "update DAT_PATH in stop_search/params.py"
+    assert DAT_PATH == params.TICK_DATA_PATH
+    assert os.path.normpath(os.path.join(out, 'tick.dat')) == os.path.normpath(DAT_PATH)
+    # Relative to the repo root: tests like the one above chdir into a temp folder and write fake files at these
+    # paths, so an absolute path would overwrite the real data
+    paths = {k: v for k, v in vars(params).items() if k.endswith(('_PATH', '_DIR')) and isinstance(v, str)}
+    assert paths and all(not os.path.isabs(p) and not p.startswith('~') for p in paths.values()), paths

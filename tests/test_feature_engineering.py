@@ -4,8 +4,11 @@ data_pipeline/feature_engineering.py (polars) against reference/preprocessing_pa
 - cutting the data off at any time T leaves every row that ended by T exactly as it was (nothing reads ahead).
 The bars come from the real pipeline (to_ticks -> process_session), with many minutes without trades.
 """
+import itertools
+
 import numpy as np
 import pandas as pd
+import polars as pl
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -81,13 +84,11 @@ def test_features_match_the_pandas_reference(data_dir):
     old = pd.read_parquet(data_dir / "1_ohlcv.parquet").sort_values("ts").reset_index(drop=True)
     ref.sma(old, 20)
     ref.std(old, 20)
-    ref.atr(old, 20)
     ref.sma_rsi(old, 20)
-    old = ref.fvg(old, 20)
     old["20_std_1"] = old["20_std"]
     old = ref.UD_cal(old, "close", 20, "1")
 
-    for col in ["20_sma", "20_std", "20_atr", "20_sma_rsi", "20_fvg"]:
+    for col in ["20_sma", "20_std", "20_sma_rsi"]:  # ATR and FVG are not in params.FEATURES
         np.testing.assert_allclose(new[f"{col}_1"].to_numpy(float), old[col].to_numpy(float),
                                    rtol=0, atol=1e-6, equal_nan=True, err_msg=col)
 
@@ -231,3 +232,73 @@ def test_main_writes_next_to_the_bars(data_dir, capsys, monkeypatch):
     assert "Warm-up dropped" in capsys.readouterr().out
     fe.main(["--data-dir", str(data_dir), "--keep-warmup"])
     assert len(pd.read_parquet(data_dir / "training_data.parquet")) == len(pd.read_parquet(data_dir / "1_ohlcv.parquet"))
+
+
+# ---------------------------------------------------------------- fe.warmup_rows
+W_DATES = [("2024-01-02", 3), ("2024-01-03", 3), ("2024-01-04", 3)]  # session starts at rows 0, 3, 6
+WFREQS = ["1", "15"]
+
+
+def warmup_df(fill_from, as_nan):
+    """3 dates x 3 rows; freq f's 20_UD_last5 column is empty (null/NaN) before global row fill_from[f]."""
+    ms = [pd.Timestamp(d).value // 10**6 + i * 60_000 for d, n in W_DATES for i in range(n)]
+    cols = {"ts": pl.Series(ms, dtype=pl.Int64).cast(pl.Datetime("ms"))}
+    for f in WFREQS:
+        k = fill_from[f]
+        if as_nan:  # an empty pivot is a NaN in a Float64 column ...
+            vals = [float("nan")] * k + [4500.0 + i for i in range(len(ms) - k)]
+            cols[f"20_UD_last5_{f}"] = pl.Series(vals, dtype=pl.Float64)
+        else:       # ... or a null in an Int32 column; both must work
+            vals = [None] * k + [4500 + i for i in range(len(ms) - k)]
+            cols[f"20_UD_last5_{f}"] = pl.Series(vals, dtype=pl.Int32)
+    return pl.DataFrame(cols)
+
+
+@pytest.mark.parametrize("fill_from,expected", [
+    ({"1": 1, "15": 4}, 6),   # all filled from row 4, mid-session -> the next session's first row
+    ({"1": 3, "15": 3}, 3),   # complete exactly on Jan-3's first row -> that row
+    ({"1": 0, "15": 0}, 0),   # complete on the very first row -> 0
+], ids=["mid-session", "on-a-session-start", "on-row-0"])
+@pytest.mark.parametrize("as_nan", [False, True], ids=["Int32-null", "Float64-NaN"])
+def test_warmup_rows_returns_a_session_start(fill_from, expected, as_nan):
+    assert fe.warmup_rows(warmup_df(fill_from, as_nan), WFREQS) == expected
+
+
+@pytest.mark.parametrize("as_nan", [False, True], ids=["Int32-null", "Float64-NaN"])
+def test_warmup_rows_raises_when_no_session_start_is_complete(as_nan):
+    with pytest.raises(ValueError, match="more data is needed"):  # '15' fills mid-session on Jan 4 only
+        fe.warmup_rows(warmup_df({"1": 0, "15": 7}, as_nan), WFREQS)
+
+
+# ---------------------------------------------------------------- fe.ud_columns
+def test_ud_columns_with_nan_pivots():
+    rng = np.random.default_rng(11)
+    n = 300
+    px = 5100 + np.cumsum(rng.integers(-2, 3, n)).astype(float)
+    high, low = px + rng.uniform(0, 2, n), px - rng.uniform(0, 2, n)
+    kv = pd.Series(px).rolling(20, min_periods=1).std(ddof=0).to_numpy().copy()  # pandas 3: to_numpy() is read-only
+    kv[:15] = np.nan  # the warm-up: NaN kv -> NaN U/D pivots, which must become nulls, not raise
+
+    out = fe.ud_columns(high, low, kv, 20)
+    assert [s.name for s in out] == ["20_UD_flag"] + [f"20_UD_last{i}" for i in range(1, 6)]
+    flag, lasts = out[0], out[1:]
+    assert flag.dtype == pl.Int8 and len(flag) == n
+    assert set(flag.drop_nulls().unique().to_list()) <= {1, -1}
+    for s in lasts:
+        assert s.dtype == pl.Int32 and len(s) == n
+        assert s.is_null().any()  # the NaN-pivot rows are null, never NaN
+    for newer, older in itertools.pairwise(lasts):  # last_{i+1} known => last_i known (last1 is the newest)
+        assert not (older.is_not_null() & newer.is_null()).any()
+
+
+# ------------------------------------------------- build_merged_dataset warm-up
+def test_build_without_warmup_starts_at_a_session_start(data_dir):
+    try:
+        trimmed = build(data_dir, ["1", "15"], keep_warmup=False)
+    except ValueError as e:
+        pytest.skip(f"no session start has all pivots in this data: {e}")
+    full = build(data_dir, ["1", "15"], keep_warmup=True)
+    assert trimmed["ts"].iloc[0].strftime("%H:%M:%S") == "00:00:00"  # a session start
+    start = int((full["ts"] == trimmed["ts"].iloc[0]).to_numpy().argmax())
+    assert 0 < start  # a real warm-up was dropped
+    pd.testing.assert_frame_equal(trimmed, full.iloc[start:].reset_index(drop=True), check_dtype=False)

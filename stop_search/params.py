@@ -1,3 +1,9 @@
+# tick.dat that StopSearch.load() opens when no path is given, set in params/params.py (the repo's settings).
+# Only this name is imported: params.FREQS (the feature freqs) is not the FREQS below.
+from params import TICK_DATA_PATH
+
+DAT_PATH = TICK_DATA_PATH
+
 # Bar sizes built by data_pipeline/to_dat.py. Second bars are appended last so every other column keeps its
 # position from the HSI layout.
 FREQS = ["1", "5", "10", "15", "30", "60", "day", "1s", "15s", "5s"]
@@ -12,7 +18,3 @@ DAT_COLS = ['start_ind', 'ts', 'price'] + [c for f in FREQS for c in (f'high_{f}
 # None: a 1s bar holding both levels is walked tick by tick.
 CHILD = {'day': '60', '60': '30', '30': '10', '10': '5', '15': '5',
          '5': '1', '1': '15s', '15s': '5s', '5s': '1s', '1s': None}
-
-# tick.dat that StopSearch.load() opens when no path is given: the one data_pipeline/to_dat.py writes with
-# its default --out (tests/test_stop_search.py checks the two agree)
-DAT_PATH = 'data/processed/tick.dat'

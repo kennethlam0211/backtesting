@@ -12,3 +12,6 @@ credentials/
 *.pem
 *.key
 log/*
+# Backtest results (params.RESULTS_DIR): one subfolder per run, kept local
+results/*
+!results/.gitkeep
