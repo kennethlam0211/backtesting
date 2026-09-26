@@ -130,10 +130,10 @@ def ud_columns(high_px, low_px, kv, window, suffix=""):
     u, d, flag = _calc_ud_levels(high_px, low_px, kv)
     pivots = _last_pivots(u, d, UD_PIVOTS)
     return [
-        # pl.Series(f"{window}_U{suffix}", u),
-        # pl.Series(f"{window}_D{suffix}", d),
-        pl.Series(f"{window}_UD_flag{suffix}", flag),
-        *[pl.Series(f"{window}_UD_last{k + 1}{suffix}", pivots[:, k]) for k in range(UD_PIVOTS)],
+        # pl.Series(f"{window}_U{suffix}", u).cast(pl.Int32),
+        # pl.Series(f"{window}_D{suffix}", d).cast(pl.Int32),
+        pl.Series(f"{window}_UD_flag{suffix}", flag).cast(pl.Int8),
+        *[pl.Series(f"{window}_UD_last{k + 1}{suffix}", pivots[:, k]).cast(pl.Int32) for k in range(UD_PIVOTS)],
     ]
 
 
