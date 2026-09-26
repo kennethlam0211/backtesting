@@ -318,6 +318,11 @@ class DataPreprocessor:
             df_1m = df_1m.with_columns([pl.Series(f'20_std_live_{freq}', std), *ud_columns(df_1m['close_1'], std, 20, f'_{freq}')])
             df_1m = df_1m.drop([f'_live_mean_{freq}', f'_live_m2_{freq}'])
 
+        # ts back to exactly what the bar files hold: the 1-min bar's start on the shifted clock, a timestamp
+        # without a time zone (the joins above work in its seconds). As plain seconds, viewers took it for a
+        # UTC instant and showed it in local time
+        df_1m = df_1m.with_columns(pl.from_epoch('ts', time_unit='s').cast(pl.Datetime('ms')))
+
         if not keep_warmup:
             first = warmup_rows(df_1m, FREQS)
             if first:

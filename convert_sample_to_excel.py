@@ -7,8 +7,8 @@ df = pl.read_parquet('data/processed/sample/feature_engineering_sample_10h.parqu
 # Convert to pandas
 df_pd = df.to_pandas()
 
-# Convert the unix timestamp to human-readable datetime for easier viewing in Excel
-df_pd.insert(1, 'datetime_NY', pd.to_datetime(df_pd['ts'], unit='s'))
+# ts is the shifted clock (New York + 6h); next to it, the New York wall clock
+df_pd.insert(1, 'datetime_NY', df_pd['ts'] - pd.Timedelta(hours=6))
 
 # Save to Excel
 excel_path = 'data/processed/sample/feature_engineering_sample_10h.xlsx'

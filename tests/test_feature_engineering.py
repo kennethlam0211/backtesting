@@ -39,9 +39,9 @@ RNG = np.random.default_rng(5)
 TICKS = {date: step1.to_ticks(raw_session(date, RNG), pd.Timestamp(date), "ESH4").to_pandas() for date in SESSIONS}
 
 
-def bar_seconds(bars):
-    """A bar file's ts (the bar's start on the shifted clock) as whole seconds, as feature_engineering uses it."""
-    return (bars["ts"] - pd.Timestamp(0)) // pd.Timedelta(seconds=1)
+def seconds(df):
+    """ts (a bar's start on the shifted clock, a timestamp) as whole seconds, as feature_engineering joins on."""
+    return (df["ts"] - pd.Timestamp(0)) // pd.Timedelta(seconds=1)
 
 
 def write_bars(folder, cutoff=None):
@@ -105,8 +105,8 @@ def reference_live_std(merged, bars, freq):
     Unlike the reference, NaN until 19 bars have closed (no std of a partial window).
     """
     length = 24 * 3600 if freq == "day" else int(freq) * 60
-    closes = np.minimum(bar_seconds(bars) + length, bar_seconds(bars) // 86400 * 86400 + 23 * 3600).to_numpy()
-    shown = np.searchsorted(closes, merged["ts"].to_numpy() + 60, side="right") - 1
+    closes = np.minimum(seconds(bars) + length, seconds(bars) // 86400 * 86400 + 23 * 3600).to_numpy()
+    shown = np.searchsorted(closes, seconds(merged).to_numpy() + 60, side="right") - 1
     px = bars["close"].to_numpy(float)
     return np.array([np.std((list(px[max(0, k - 20):k + 1]) + [c])[-20:]) if k >= 18 else np.nan
                      for k, c in zip(shown, merged["close_1"].to_numpy(float))])
@@ -139,6 +139,13 @@ def test_last_pivots(merged, freq):
     assert len(seen) > UD_PIVOTS
 
 
+def test_output_ts_is_the_bar_files_ts(data_dir, merged):
+    # Unchanged from the 1-min bar file: the shifted-clock timestamp, no time zone (so no viewer moves it)
+    bars = pd.read_parquet(data_dir / "1_ohlcv.parquet").sort_values("ts").reset_index(drop=True)
+    assert merged["ts"].dtype == bars["ts"].dtype
+    pd.testing.assert_series_equal(merged["ts"], bars["ts"])
+
+
 def test_bollinger_bands_are_2_sigma(data_dir):
     new = fe.DataPreprocessor(str(data_dir)).process_frequency("1").to_pandas()
     sma, std = new["20_sma_1"], new["20_std_1"]
@@ -152,9 +159,9 @@ def test_bollinger_bands_are_2_sigma(data_dir):
 def test_higher_freq_bar_appears_when_it_closes(data_dir, merged, freq):
     bars = pd.read_parquet(data_dir / f"{freq}_ohlcv.parquet").sort_values("ts").reset_index(drop=True)
     length = 24 * 3600 if freq == "day" else int(freq) * 60
-    closes = np.minimum(bar_seconds(bars) + length, bar_seconds(bars) // 86400 * 86400 + 23 * 3600)  # sessions end at 23:00
+    closes = np.minimum(seconds(bars) + length, seconds(bars) // 86400 * 86400 + 23 * 3600)  # sessions end at 23:00
 
-    rows = merged["ts"].to_numpy()
+    rows = seconds(merged).to_numpy()
     # The newest bar that has closed by the end of each 1-min row (row ts + 60 s)
     k = np.searchsorted(closes.to_numpy(), rows + 60, side="right") - 1
     expected = np.where(k >= 0, bars["close"].to_numpy()[np.maximum(k, 0)], np.nan)
@@ -166,7 +173,7 @@ def test_higher_freq_bar_appears_when_it_closes(data_dir, merged, freq):
 
 
 def test_day_bar_waits_for_the_session_end(merged):
-    ts = pd.to_datetime(merged["ts"], unit="s")
+    ts = merged["ts"]
     first_day = ts.dt.date == pd.Timestamp(SESSIONS[0]).date()
     before_close = first_day & (ts.dt.time < pd.Timestamp("22:59").time())
     assert merged.loc[before_close, "close_day"].isna().all()  # no day bar before its session closes
@@ -202,7 +209,7 @@ def test_no_look_ahead_cut_the_data_at_any_time(merged, tmp_path):
         folder = tmp_path / str(i)
         folder.mkdir()
         part = build(write_bars(folder, cutoff=cut))
-        done = lambda df: df[df["ts"] + 60 <= int(cut.timestamp())].reset_index(drop=True)
+        done = lambda df: df[df["ts"] + pd.Timedelta(seconds=60) <= cut].reset_index(drop=True)
         pd.testing.assert_frame_equal(done(part), done(merged), obj=f"rows ended by {cut}")
 
 
@@ -221,8 +228,8 @@ def test_ud_levels_never_read_ahead():
 
 def test_live_std_needs_19_closed_bars(merged, data_dir):
     bars = pd.read_parquet(data_dir / "60_ohlcv.parquet").sort_values("ts").reset_index(drop=True)
-    closes = np.minimum(bar_seconds(bars) + 3600, bar_seconds(bars) // 86400 * 86400 + 23 * 3600).to_numpy()
-    shown = np.searchsorted(closes, merged["ts"].to_numpy() + 60, side="right")  # bars closed by each row
+    closes = np.minimum(seconds(bars) + 3600, seconds(bars) // 86400 * 86400 + 23 * 3600).to_numpy()
+    shown = np.searchsorted(closes, seconds(merged).to_numpy() + 60, side="right")  # bars closed by each row
     std = merged["20_std_live_60"].to_numpy(float)
     assert np.isnan(std[shown < 19]).all() and not np.isnan(std[shown >= 19]).any()
     assert np.isnan(merged["20_U_60"].to_numpy(float)[shown < 19]).all()  # no pivot on a partial window

@@ -1,6 +1,7 @@
-import polars as pl
-import pandas as pd
+import datetime
 import os
+
+import polars as pl
 
 # Create sample directory if it doesn't exist
 os.makedirs('data/processed/sample', exist_ok=True)
@@ -11,8 +12,8 @@ df = pl.read_parquet('data/processed/training_data.parquet')
 # Find the first timestamp in the dataset
 start_ts = df.select(pl.col('ts').min()).item()
 
-# Calculate the timestamp for 10 hours later (10 hours * 60 mins * 60 seconds)
-end_ts = start_ts + (10 * 3600)
+# 10 hours later (ts is the shifted-clock timestamp, as in the bar files)
+end_ts = start_ts + datetime.timedelta(hours=10)
 
 # Filter the dataframe for the first 10 hours
 sample_df = df.filter(pl.col('ts') <= end_ts)
@@ -24,8 +25,6 @@ sample_df.write_parquet(output_path)
 print(f"Generated 10-hour sample with {sample_df.height} rows.")
 print(f"Saved to: {output_path}")
 
-# Display a quick snapshot with readable dates
-df_pd = sample_df.select(['ts', 'open_1', 'close_1', 'open_15', 'close_15', 'open_60', 'close_60']).tail(10).to_pandas()
-df_pd['dt'] = pd.to_datetime(df_pd['ts'], unit='s')
+# Display a quick snapshot (ts is already a readable timestamp)
 print("\nEnd of the 10-hour snapshot:")
-print(df_pd[['dt', 'open_1', 'close_1', 'open_15', 'close_15', 'open_60', 'close_60']])
+print(sample_df.select(['ts', 'open_1', 'close_1', 'open_15', 'close_15', 'open_60', 'close_60']).tail(10).to_pandas())
