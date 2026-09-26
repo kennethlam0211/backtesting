@@ -18,9 +18,9 @@ TICK_DATA_PATH = '~/Desktop/projects/backtesting/data/processed/tick.dat'
 
 DATA_PATH = '~/Desktop/projects/backtesting/data/processed'
 
-FREQS = ['1','15','60','day']
+FREQS = ['1','5','15','60','day']
 
-BEGIN_DATE = datetime.datetime(2023, 1, 1, 0, 0, 0)
+BEGIN_DATE = datetime.datetime(2020, 1, 1, 0, 0, 0)
 
 UD_PIVOTS = 5  # last U/D pivots kept per freq (data_pipeline/feature_engineering.py)
 

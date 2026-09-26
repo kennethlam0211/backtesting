@@ -11,3 +11,4 @@ credentials/
 *.env
 *.pem
 *.key
+log/*
