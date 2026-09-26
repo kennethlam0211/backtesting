@@ -132,7 +132,7 @@ class StrategyFamilyEncoder(nn.Module):
         # log(sigmoid(g)) ≤ 0 → low-gated variants get suppressed in attention.
         gate_logit = torch.log(torch.sigmoid(self.variant_gate) + 1e-8)   # (N,)
         scores = scores + gate_logit.unsqueeze(0)                           # broadcast over batch
-        # Note: env applies a hard mask on negative ewm_mean post-softmax (env_v2._update_consensus_from_variants).
+        # Note: env applies a hard mask on negative ewm_mean post-softmax (env._update_consensus_from_variants).
 
         # Full softmax over all N variants — gradient flows to every variant.
         attn_weights = F.softmax(scores / 0.5, dim=-1)  # temp=0.5 sharper softmax

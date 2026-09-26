@@ -23,10 +23,10 @@ from typing import Dict, Optional
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from network_v2 import TradingNetworkV2
+from network import TradingNetwork
 import params
 from utils.app_logger import get_logger
-logger = get_logger('ppo_v2', level=params.LOG_LEVEL)
+logger = get_logger('ppo', level=params.LOG_LEVEL)
 
 
 # ==================== Reward Normalization ====================
@@ -245,7 +245,7 @@ class PPOTrainer:
         single_env.close()
 
         # Network
-        self.network = (network or TradingNetworkV2(selector_mode=params.SELECTOR_MODE)).to(self.device)
+        self.network = (network or TradingNetwork(selector_mode=params.SELECTOR_MODE)).to(self.device)
         # Separate weight decay: exclude biases, LayerNorm, PReLU slopes, InputGate
         decay_params = []
         no_decay_params = []
@@ -282,7 +282,7 @@ class PPOTrainer:
         self._val_obs = None  # stateful val: keep env state between val calls
         self._val_steps_done = 0  # cumulative val steps for val cyc
         self.training_dir = os.path.dirname(os.path.abspath(__file__))
-        self.run_name = f'ppo_v2_{params.TRAINING_MODE}_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
+        self.run_name = f'ppo_{params.TRAINING_MODE}_{datetime.now().strftime("%Y%m%d_%H%M%S")}'
         self.model_dir = os.path.join(self.training_dir, 'models', self.run_name)
         self.runs_dir = os.path.join(self.training_dir, 'runs', self.run_name)
         os.makedirs(self.model_dir, exist_ok=True)
@@ -1048,4 +1048,4 @@ class PPOTrainer:
 
 
 if __name__ == '__main__':
-    logger.info('PPO v2 Vectorized — use run_ppo_v2.py to train with data.')
+    logger.info('PPO v2 Vectorized — use run_ppo.py to train with data.')

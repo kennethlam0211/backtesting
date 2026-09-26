@@ -4,8 +4,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
-from env_v2 import TradingEnvV2
-from ppo_v2 import PPOTrainer
+from env import TradingEnv
+from ppo import PPOTrainer
 
 
 def make_fake_data(n_bars=2000):
@@ -73,7 +73,7 @@ if __name__ == '__main__':
     data = make_fake_data(5000)
 
     print('Creating env...')
-    env = TradingEnvV2(data)
+    env = TradingEnv(data)
 
     print('Creating PPO trainer...')
     trainer = PPOTrainer(env, config={

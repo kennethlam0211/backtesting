@@ -31,7 +31,7 @@ from pm import PM
 from utils.app_logger import get_logger
 import params
 
-logger = get_logger('env_v2', level=params.LOG_LEVEL)
+logger = get_logger('env', level=params.LOG_LEVEL)
 
 
 def symlog(x):

@@ -1,9 +1,9 @@
 """Evaluate best model on test chunks.
 
 Usage:
-    python eval_v2.py [model_dir]
-    python eval_v2.py models/ppo_v2_20260403_111349
-    python eval_v2.py  # uses latest model dir
+    python eval.py [model_dir]
+    python eval.py models/ppo_20260403_111349
+    python eval.py  # uses latest model dir
 """
 import sys, os, glob
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -17,10 +17,10 @@ import topstep_for_evaluate
 import sys
 sys.modules['topstep'] = topstep_for_evaluate
 
-from env_v2 import TradingEnvV2
-from network_v2 import TradingNetworkV2
+from env import TradingEnv
+from network import TradingNetwork
 from data_pipeline.to_numpy import convert_to_numpy
-from run_ppo_v2 import create_chunks, CONFIG
+from run_ppo import create_chunks, CONFIG
 import pandas as pd
 
 
@@ -32,7 +32,7 @@ def evaluate(model_dir, test_chunks, device='cpu'):
         print(f'No best model at {best_path}')
         return
 
-    net = TradingNetworkV2(selector_mode=params.SELECTOR_MODE)
+    net = TradingNetwork(selector_mode=params.SELECTOR_MODE)
     net.load_state_dict(torch.load(best_path, map_location=device))
     net.to(device)
     net.eval()
@@ -46,7 +46,7 @@ def evaluate(model_dir, test_chunks, device='cpu'):
     print(f'{"="*70}')
 
     for ci, chunk in enumerate(test_chunks):
-        env = TradingEnvV2(data=chunk, data_pool=[chunk], env_id=0, num_envs=1)
+        env = TradingEnv(data=chunk, data_pool=[chunk], env_id=0, num_envs=1)
         obs, _ = env.reset()
         done = False
         step_count = 0
@@ -85,7 +85,7 @@ def evaluate(model_dir, test_chunks, device='cpu'):
     print(f'CONTINUOUS EVALUATION (kelly carries over)')
     print(f'{"="*70}')
 
-    env = TradingEnvV2(data=test_chunks[0], data_pool=test_chunks, env_id=0, num_envs=1)
+    env = TradingEnv(data=test_chunks[0], data_pool=test_chunks, env_id=0, num_envs=1)
 
     for ci in range(len(test_chunks)):
         obs, _ = env.reset()
@@ -132,7 +132,7 @@ if __name__ == '__main__':
         model_dir = sys.argv[1]
     else:
         base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        dirs = sorted(glob.glob(os.path.join(base, 'models/ppo_v2_*')))
+        dirs = sorted(glob.glob(os.path.join(base, 'models/ppo_*')))
         model_dir = dirs[-1] if dirs else ''
         print(f'Using latest: {model_dir}')
 

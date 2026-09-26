@@ -12,12 +12,12 @@ import torch
 from gym.vector import SyncVectorEnv
 import pandas as pd
 import datetime
-from env_v2 import TradingEnvV2
-from ppo_v2 import PPOTrainer
+from env import TradingEnv
+from ppo import PPOTrainer
 from data_pipeline.to_numpy import convert_to_numpy
 import params
 from utils.app_logger import get_logger
-logger = get_logger('run_ppo_v2', level=params.LOG_LEVEL)
+logger = get_logger('run_ppo', level=params.LOG_LEVEL)
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'data')
 
@@ -192,21 +192,21 @@ if __name__ == '__main__':
         }
 
     def make_train_env(i):
-        return TradingEnvV2(
+        return TradingEnv(
             data=train_chunks[i % len(train_chunks)],
             data_pool=train_chunks,
             env_id=i, num_envs=CONFIG['num_train_envs'],
             obs_noise_std=0.02, mode=mode, **exam_kwargs)
 
     def make_val_env(i):
-        return TradingEnvV2(
+        return TradingEnv(
             data=val_chunks[i % len(val_chunks)],
             data_pool=val_chunks,
             env_id=i, num_envs=CONFIG['num_val_envs'],
             mode=mode, **exam_kwargs)
 
     def make_test_env(i):
-        return TradingEnvV2(
+        return TradingEnv(
             data=test_chunks[i % len(test_chunks)],
             data_pool=test_chunks,
             env_id=i, num_envs=CONFIG['num_test_envs'])
@@ -259,7 +259,7 @@ if __name__ == '__main__':
                 combined[key] = np.concatenate([c[key] for c in test_chunks], axis=0)
 
             test_env = SyncVectorEnv([
-                lambda: TradingEnvV2(data=combined, data_pool=[combined], env_id=0, num_envs=1, mode='eval')
+                lambda: TradingEnv(data=combined, data_pool=[combined], env_id=0, num_envs=1, mode='eval')
             ])
             obs, _ = test_env.reset()
             e = test_env.envs[0]

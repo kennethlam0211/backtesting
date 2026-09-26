@@ -1,4 +1,4 @@
-"""Test env_v2 step function with comprehensive scenarios."""
+"""Test env step function with comprehensive scenarios."""
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -7,7 +7,7 @@ import numpy as np
 
 
 def make_fake_data(n_bars, price_series, consensus_schedule):
-    """Build fake np_data for env_v2."""
+    """Build fake np_data for env."""
     N = n_bars
     closes = np.array(price_series, dtype=np.float64)
     opens = closes + np.random.normal(0, 0.3, N)
@@ -58,10 +58,10 @@ def make_fake_data(n_bars, price_series, consensus_schedule):
 
 
 def run_scenario(name, n_bars, prices, consensus, action, verbose=True):
-    from env_v2 import TradingEnvV2
+    from env import TradingEnv
     np.random.seed(42)
     data = make_fake_data(n_bars, prices, consensus)
-    env = TradingEnvV2(data)
+    env = TradingEnv(data)
     obs, _ = env.reset()
 
     print(f'\n{"="*70}')
@@ -243,8 +243,8 @@ print('  PASS')
 prices = [44000.0 + i * 1 for i in range(180)]
 data = make_fake_data(180, prices, {60: 'long'})
 data['ohlc'][150, 8] = 1  # session end at bar 150
-from env_v2 import TradingEnvV2
-env = TradingEnvV2(data)
+from env import TradingEnv
+env = TradingEnv(data)
 obs, _ = env.reset()
 print(f'\n{"="*70}')
 print('SCENARIO: 13. Session end mid-trade')
