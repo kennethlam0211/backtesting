@@ -23,6 +23,16 @@ DEFAULT_SRC = "data/ES_trades_concat.parquet"
 DEFAULT_OUT = "data/processed"
 
 
+# One bar per row: the OHLCV parquet columns. ts is the bar's start on the shifted clock (a timestamp)
+BAR_DTYPE = [
+    ('start_ind', 'i8'), ('ts', 'M8[s]'), ('open', 'i4'),
+    ('high', 'i4'), ('low', 'i4'), ('close', 'i4'),
+    ('volume', 'i8'), ('hl', '?'), ('rth', '?'),
+    ('session', 'i1'), ('hour', 'i8'),
+    ('news_fomc', 'i1'), ('news_nfp', 'i1'), ('news_cpi', 'i1'), ('news_ppi', 'i1'), ('news_gdp', 'i1')
+]
+
+
 def to_unix_epoch(ts: pd.Series) -> pd.Series:
     """
     Converts naive datetimes to absolute Unix timestamps (in integer seconds)
@@ -62,7 +72,7 @@ def process_session(session_df: pd.DataFrame, session_date: datetime.date) -> tu
     merged_price = session_df['price'].values.astype(np.int64)
 
     tick_res = pd.DataFrame({
-        'ts': to_unix_epoch(session_df['ts']),  # ts is now New York + 6h (stored as absolute seconds)
+        'ts': session_df['ts'].values.astype('datetime64[s]'),  # New York + 6h; seconds only in tick.dat (offset_session)
         'price': merged_price,
         'start_ind': np.full(sess_len, -1, dtype=np.int64)
     })
@@ -98,12 +108,7 @@ def process_session(session_df: pd.DataFrame, session_date: datetime.date) -> tu
         num_bars = len(starts)
 
         if num_bars == 0:
-            resampled_res[freq] = np.zeros(0, dtype=[
-                ('start_ind', 'i8'), ('ts', 'i8'), ('open', 'i4'),
-                ('high', 'i4'), ('low', 'i4'), ('close', 'i4'),
-                ('volume', 'i8'), ('avg_px', 'f8'), ('hl', '?'), ('rth', '?'),
-                ('hour', 'i8')
-            ])
+            resampled_res[freq] = np.zeros(0, dtype=BAR_DTYPE)
             continue
 
         bar_labels = day0 + bar_key[starts] * f_ns
@@ -154,17 +159,9 @@ def process_session(session_df: pd.DataFrame, session_date: datetime.date) -> tu
             tick_res.loc[starts, 'start_ind'] = starts # local start_ind
 
         # Create structured array
-        dtype_list = [
-            ('start_ind', 'i8'), ('ts', 'i8'), ('open', 'i4'),
-            ('high', 'i4'), ('low', 'i4'), ('close', 'i4'),
-            ('volume', 'i8'), ('hl', '?'), ('rth', '?'),
-            ('session', 'i1'), ('hour', 'i8'),
-            ('news_fomc', 'i1'), ('news_nfp', 'i1'), ('news_cpi', 'i1'), ('news_ppi', 'i1'), ('news_gdp', 'i1')
-        ]
-
-        struct_arr = np.zeros(num_bars, dtype=dtype_list)
+        struct_arr = np.zeros(num_bars, dtype=BAR_DTYPE)
         struct_arr['start_ind'] = starts # local start_ind
-        struct_arr['ts'] = bar_labels
+        struct_arr['ts'] = bar_labels.astype('datetime64[ns]').astype('datetime64[s]')  # labels are ns
         struct_arr['open'] = bar_open
         struct_arr['high'] = bar_high
         struct_arr['low'] = bar_low
@@ -204,6 +201,8 @@ def offset_session(tick_res: pd.DataFrame, resampled_res: dict[str, np.ndarray],
         tick_res[next_col] = np.where(tick_res[next_col] > 0, tick_res[next_col] + offset, 0)
         if f in PARQUET_FREQS and len(resampled_res[f]) > 0:
             resampled_res[f]['start_ind'] += offset
+    # tick.dat is plain int64: only here does ts become seconds on the shifted clock (unix-style)
+    tick_res['ts'] = to_unix_epoch(tick_res['ts'])
     return tick_res[DAT_COLS].values.astype(np.int64)
 
 
@@ -212,10 +211,8 @@ def bars_table(bars: list[np.ndarray]) -> pa.Table:
     Bar arrays from process_session -> one parquet table. ts is the bar's start on the shifted clock
     (New York + 6h), a timestamp in whole seconds like step 1's ts.
     """
-    df = pd.DataFrame(np.concatenate(bars))
-    # Convert bar_labels (ns shifted time) back to proper datetimes
-    df['ts'] = pd.to_datetime(df['ts'], unit='ns')
-    return pa.Table.from_pandas(df, preserve_index=False)
+    return pa.Table.from_pandas(pd.DataFrame(np.concatenate(bars)), preserve_index=False)
+
 
 
 def iter_sessions(src: str, start=None):
