@@ -1,8 +1,8 @@
 """
 Bar features for the RL agent: the polars version of reference/preprocessing_pandas.py. Runs after step 2:
 
-    python -m data_pipeline.data_preprocessing                  # step 2's default output -> training_data.parquet in it
-    python -m data_pipeline.data_preprocessing --data-dir data/processed_2024 --out data/features_2024.parquet
+    python -m data_pipeline.feature_engineering                  # step 2's default output -> training_data.parquet in it
+    python -m data_pipeline.feature_engineering --data-dir data/processed_2024 --out data/features_2024.parquet
 
 Reads {data-dir}/{freq}_ohlcv.parquet for every freq in params.FREQS and adds, per freq (window 20): SMA, std,
 Bollinger bands (2 sigma), ATR, SMA-RSI, FVG, bar-to-bar moves and bar score. Every higher freq is then
@@ -251,6 +251,10 @@ class DataPreprocessor:
         """Load and process a single timeframe."""
         file_path = os.path.join(self.data_dir, f'{freq}_ohlcv.parquet')
         lf = pl.scan_parquet(file_path)
+        # The bar files store ts as the shifted-clock timestamp; everything here works in its whole seconds
+        # (bar files written before that already hold the seconds)
+        if lf.collect_schema()['ts'].is_temporal():
+            lf = lf.with_columns(pl.col('ts').dt.epoch('s'))
 
         # Ensure sorted by time
         lf = lf.sort('ts')

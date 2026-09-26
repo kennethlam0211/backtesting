@@ -1,5 +1,5 @@
 """
-data_pipeline/data_preprocessing.py (polars) against reference/preprocessing_pandas.py, and no look-ahead:
+data_pipeline/feature_engineering.py (polars) against reference/preprocessing_pandas.py, and no look-ahead:
 - every higher-freq bar appears on the 1-min row during which it closes, not sooner and not later;
 - cutting the data off at any time T leaves every row that ended by T exactly as it was (nothing reads ahead).
 The bars come from the real pipeline (to_ticks -> process_session), with many minutes without trades.
@@ -11,7 +11,7 @@ import pyarrow.parquet as pq
 import pytest
 
 import reference.preprocessing_pandas as ref
-from data_pipeline import data_preprocessing as dp
+from data_pipeline import feature_engineering as fe
 from data_pipeline import raw_data_preprocessing as step1
 from data_pipeline import to_dat as step2
 from params import UD_PIVOTS
@@ -39,6 +39,11 @@ RNG = np.random.default_rng(5)
 TICKS = {date: step1.to_ticks(raw_session(date, RNG), pd.Timestamp(date), "ESH4").to_pandas() for date in SESSIONS}
 
 
+def bar_seconds(bars):
+    """A bar file's ts (the bar's start on the shifted clock) as whole seconds, as feature_engineering uses it."""
+    return (bars["ts"] - pd.Timestamp(0)) // pd.Timedelta(seconds=1)
+
+
 def write_bars(folder, cutoff=None):
     """The bar files of the three sessions as step 2 writes them; with `cutoff`, only the ticks before it."""
     bars = {f: [] for f in PARQUET_FREQS}
@@ -57,8 +62,8 @@ def write_bars(folder, cutoff=None):
 def build(folder, freqs=FREQS, keep_warmup=True):
     """The merged table; the warm-up is kept by default (3 sessions are too few for 5 day pivots)."""
     with pytest.MonkeyPatch.context() as m:
-        m.setattr(dp, "FREQS", freqs)
-        return dp.DataPreprocessor(str(folder)).build_merged_dataset(keep_warmup=keep_warmup).to_pandas()
+        m.setattr(fe, "FREQS", freqs)
+        return fe.DataPreprocessor(str(folder)).build_merged_dataset(keep_warmup=keep_warmup).to_pandas()
 
 
 @pytest.fixture(scope="module")
@@ -72,7 +77,7 @@ def merged(data_dir):
 
 
 def test_features_match_the_pandas_reference(data_dir):
-    new = dp.DataPreprocessor(str(data_dir)).process_frequency("1").to_pandas()
+    new = fe.DataPreprocessor(str(data_dir)).process_frequency("1").to_pandas()
     old = pd.read_parquet(data_dir / "1_ohlcv.parquet").sort_values("ts").reset_index(drop=True)
     ref.sma(old, 20)
     ref.std(old, 20)
@@ -100,7 +105,7 @@ def reference_live_std(merged, bars, freq):
     Unlike the reference, NaN until 19 bars have closed (no std of a partial window).
     """
     length = 24 * 3600 if freq == "day" else int(freq) * 60
-    closes = np.minimum(bars["ts"] + length, bars["ts"] // 86400 * 86400 + 23 * 3600).to_numpy()
+    closes = np.minimum(bar_seconds(bars) + length, bar_seconds(bars) // 86400 * 86400 + 23 * 3600).to_numpy()
     shown = np.searchsorted(closes, merged["ts"].to_numpy() + 60, side="right") - 1
     px = bars["close"].to_numpy(float)
     return np.array([np.std((list(px[max(0, k - 20):k + 1]) + [c])[-20:]) if k >= 18 else np.nan
@@ -135,7 +140,7 @@ def test_last_pivots(merged, freq):
 
 
 def test_bollinger_bands_are_2_sigma(data_dir):
-    new = dp.DataPreprocessor(str(data_dir)).process_frequency("1").to_pandas()
+    new = fe.DataPreprocessor(str(data_dir)).process_frequency("1").to_pandas()
     sma, std = new["20_sma_1"], new["20_std_1"]
     ok = std > 0
     np.testing.assert_allclose(new["20_bbands_1"][ok], ((new["close_1"] - sma) / (2 * std))[ok])
@@ -147,7 +152,7 @@ def test_bollinger_bands_are_2_sigma(data_dir):
 def test_higher_freq_bar_appears_when_it_closes(data_dir, merged, freq):
     bars = pd.read_parquet(data_dir / f"{freq}_ohlcv.parquet").sort_values("ts").reset_index(drop=True)
     length = 24 * 3600 if freq == "day" else int(freq) * 60
-    closes = np.minimum(bars["ts"] + length, bars["ts"] // 86400 * 86400 + 23 * 3600)  # sessions end at 23:00
+    closes = np.minimum(bar_seconds(bars) + length, bar_seconds(bars) // 86400 * 86400 + 23 * 3600)  # sessions end at 23:00
 
     rows = merged["ts"].to_numpy()
     # The newest bar that has closed by the end of each 1-min row (row ts + 60 s)
@@ -208,15 +213,15 @@ def test_ud_levels_never_read_ahead():
         if trial % 2:
             px[:11] = px[0] + np.arange(11)  # rising at the start: where the reference peeked 10 bars ahead
         kv = pd.Series(px).rolling(20).std(ddof=0).to_numpy()
-        full = dp._calc_ud_levels(px, kv)
+        full = fe._calc_ud_levels(px, kv)
         for k in (1, 5, 11, 25, 500):
-            for a, b in zip(dp._calc_ud_levels(px[:k], kv[:k]), full):
+            for a, b in zip(fe._calc_ud_levels(px[:k], kv[:k]), full):
                 np.testing.assert_array_equal(a, b[:k])
 
 
 def test_live_std_needs_19_closed_bars(merged, data_dir):
     bars = pd.read_parquet(data_dir / "60_ohlcv.parquet").sort_values("ts").reset_index(drop=True)
-    closes = np.minimum(bars["ts"] + 3600, bars["ts"] // 86400 * 86400 + 23 * 3600).to_numpy()
+    closes = np.minimum(bar_seconds(bars) + 3600, bar_seconds(bars) // 86400 * 86400 + 23 * 3600).to_numpy()
     shown = np.searchsorted(closes, merged["ts"].to_numpy() + 60, side="right")  # bars closed by each row
     std = merged["20_std_live_60"].to_numpy(float)
     assert np.isnan(std[shown < 19]).all() and not np.isnan(std[shown >= 19]).any()
@@ -237,10 +242,10 @@ def test_warmup_is_dropped(data_dir):
 
 
 def test_main_writes_next_to_the_bars(data_dir, capsys, monkeypatch):
-    monkeypatch.setattr(dp, "FREQS", ["1", "15", "60"])
-    dp.main(["--data-dir", str(data_dir)])
+    monkeypatch.setattr(fe, "FREQS", ["1", "15", "60"])
+    fe.main(["--data-dir", str(data_dir)])
     out = pd.read_parquet(data_dir / "training_data.parquet")
     assert 0 < len(out) < len(pd.read_parquet(data_dir / "1_ohlcv.parquet"))  # the warm-up is dropped
     assert "Warm-up dropped" in capsys.readouterr().out
-    dp.main(["--data-dir", str(data_dir), "--keep-warmup"])
+    fe.main(["--data-dir", str(data_dir), "--keep-warmup"])
     assert len(pd.read_parquet(data_dir / "training_data.parquet")) == len(pd.read_parquet(data_dir / "1_ohlcv.parquet"))

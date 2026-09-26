@@ -25,7 +25,7 @@ date range, a subset, or other paths.
 ```
 init    raw_data/ES_*_trades_<date>.parquet ─┐
         raw_data/roll_open_blocks/           ├─ 1 ─> tick parquet ─ 2 ─> tick.dat ──────────> stop_search.StopSearch
-        raw_data/pdt_codes.csv               │                           {freq}_ohlcv.parquet ─> data_preprocessing.py ─> training_data.parquet
+        raw_data/pdt_codes.csv               │                           {freq}_ohlcv.parquet ─> feature_engineering.py ─> training_data.parquet
         params/news_events.yaml ─────────────┘
 append  MongoDB (IB_recorder) ─────────┐
         params/holidays.yaml           ├─ 1 (to_ticks) ─> + new sessions ─ 2 ─> + new rows and bars
@@ -182,31 +182,31 @@ python -m data_pipeline.to_dat --limit 5 --out data/processed_test              
 | | |
 |---|---|
 | Reads | `--src` (default: step 1's default output) |
-| Writes | into `--out` (default set in the script, created if missing): `tick.dat` (all ticks with their bar summaries, int64, columns = `stop_search.DAT_COLS`) and `{freq}_ohlcv.parquet` for `1 5 10 15 30 60 day` |
+| Writes | into `--out` (default set in the script, created if missing): `tick.dat` (all ticks with their bar summaries, int64, columns = `stop_search.DAT_COLS`; its `ts` is seconds on the shifted clock) and `{freq}_ohlcv.parquet` for `1 5 10 15 30 60 day` (`ts` is the bar's start on the shifted clock, a timestamp like step 1's `ts`: whole seconds, stored with Parquet's millisecond unit) |
 | Options | `--limit N`: only the first N sessions; `--start YYYY-MM-DD`: skip sessions before that date (default: all sessions) |
 | Notes | Runs sessions in parallel (up to 24 processes). `tick.dat` is written as `tick.dat.tmp` and renamed only when the run finishes, so an existing `tick.dat` is always complete; the bar files are written in place |
 
 Bar sizes and the `tick.dat` layout come from `stop_search/params.py`. Changing `FREQS` there changes
 the file layout: rerun this step before using `stop_search` again. If you change the default `--out`,
-update `DAT_PATH` in `stop_search/params.py` and `--data-dir` in `data_preprocessing(template).py` to
-match (`pytest` fails until they agree).
+update `DAT_PATH` in `stop_search/params.py` to match (`pytest` fails until they agree);
+`feature_engineering.py` follows it by itself.
 
-## 3. `data_preprocessing.py` — bar features for the RL agent
+## 3. `feature_engineering.py` — bar features for the RL agent
 
 ```bash
-python -m data_pipeline.data_preprocessing                                             # step 2's default output
-python -m data_pipeline.data_preprocessing --data-dir data/processed_2024 --out data/features_2024.parquet
+python -m data_pipeline.feature_engineering                                            # step 2's default output
+python -m data_pipeline.feature_engineering --data-dir data/processed_2024 --out data/features_2024.parquet
 ```
 
 | | |
 |---|---|
 | Reads | `{--data-dir}/{freq}_ohlcv.parquet` for every freq in `params.FREQS` (default folder: step 2's default output) |
-| Writes | `--out` (default `training_data.parquet` in `--data-dir`): one row per 1-min bar, with every freq's bars and features as columns suffixed `_{freq}`. It starts once every freq has its 5 U/D pivots (the warm-up is dropped, as the reference's `take_away_burnout_period`); `--keep-warmup` keeps those rows |
+| Writes | `--out` (default `training_data.parquet` in `--data-dir`): one row per 1-min bar, with every freq's bars and features as columns suffixed `_{freq}`. `ts` is the 1-min bar's start in seconds on the shifted clock (`pd.to_datetime(ts, unit='s')` shows it). It starts once every freq has its 5 U/D pivots (the warm-up is dropped, as the reference's `take_away_burnout_period`); `--keep-warmup` keeps those rows |
 | Features | Per freq, window 20: SMA, std, Bollinger bands (2 sigma), ATR (Wilder, 14), SMA-RSI (14), FVG, bar-to-bar moves `HO HH HL HC`, `bar_score` (`params.NORM_FACTOR`), and U/D (below) |
 | U/D | For every freq (1, 15, 60, day), as the reference: a zigzag on the **1-min closes**, reversing when price moves more than that freq's std from the last extreme. For a higher freq that is its live std, `20_std_live_{freq}`: the last 19 closes shown so far plus the current 1-min close, so the levels move every minute. It needs a full window: NaN until 19 bars have closed (the 1-min std needs 20 closes), so no pivot forms on a too-small std at the start. Columns `20_U_{freq}`, `20_D_{freq}` (the level on the bar where it is confirmed, else NaN), `20_UD_flag_{freq}`, and the last `params.UD_PIVOTS` (5) pivots, U and D in one sequence: `20_UD_last1_{freq}` (newest) … `20_UD_last5_{freq}`, in ticks, NaN until there are enough |
 
 The polars version of `reference/preprocessing_pandas.py`. It gives the same values
-(`tests/test_data_preprocessing.py` checks this, U/D included), with these differences:
+(`tests/test_feature_engineering.py` checks this, U/D included), with these differences:
 - Bollinger bands are 2 sigma; the reference used 4.
 - U/D no longer peeks 10 bars ahead to choose its starting side. The levels differ from the reference
   for the first bars only, until the state first resets (about 35 bars at most).
@@ -227,20 +227,6 @@ last minute, 22:59. So a row holds nothing that happens after that 1-min bar clo
 close, and enter on the next bar. The join is on time, not row order, so minutes without trades change
 nothing. The test cuts the data off at many times T, including inside a bar's last minute, rebuilds
 everything, and checks that every row that ended by T is unchanged.
-
-## Template: `data_preprocessing(template).py` — bar features
-
-Not a pipeline step: a starting point for bar features. The parentheses in the name keep it from being
-imported, so run it by path:
-
-```bash
-python "data_pipeline/data_preprocessing(template).py"                      # 1-min bars from step 2's default output
-python "data_pipeline/data_preprocessing(template).py" --freq 5 --data-dir data/processed_2024
-```
-
-Reads `{--data-dir}/{--freq}_ohlcv.parquet` (defaults: step 2's default output folder, `1`), adds log
-return, SMA 10 / 50, 20-bar volatility and high-low range with polars, and prints the table and the
-shape of the RL state array. It does not write a file.
 
 ## Using the output
 
