@@ -61,3 +61,16 @@ if __name__ == "__main__":
         'data/processed/sample/1_ohlcv_sample.xlsx',
         limit=5000
     )
+
+def convert_training_data_to_excel():
+    print(f"Reading data/processed/training_data.parquet...")
+    df = pd.read_parquet('data/processed/training_data.parquet')
+    
+    # Save a sample of the first 5000 rows
+    sample_path = 'data/processed/sample/training_data_sample.xlsx'
+    print(f"Loaded {len(df)} rows. Converting first 5000 rows to Excel...")
+    df.head(5000).to_excel(sample_path, index=False)
+    print(f"Saved to {sample_path}")
+
+if __name__ == "__main__":
+    convert_training_data_to_excel()

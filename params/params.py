@@ -4,15 +4,15 @@ import datetime
 
 NORM_FACTOR = 320 #{'1':50,'15':80,'30':100,'60':120,'720':300,'W':1500}
 
-WINDOW_SIZE = 20#40
+WINDOW_SIZE = 20
 
-COMMISSION = 0.6
+COMMISSION = 0
 
-WINDOWS = [20] # 1minute >>60 mins
+VOL_METHODS = 'std' # 'atr','aevdev
 
-FEATURES = ['fvg','std','atr','sma_rsi','sma','bbands','price_session']
+FEATURES = ['sma','sma_rsi','bbands','UD']#,'price_session','fvg']
 
-UNIT_TAS = ['std','atr','UD','sma_rsi','bbands','bband_targets']
+#UNIT_TAS = ['std','atr','UD','sma_rsi','bbands']
 
 TICK_DATA_PATH = '~/Desktop/projects/backtesting/data/processed/tick.dat'
 
@@ -28,7 +28,7 @@ UD_PIVOTS = 5  # last U/D pivots kept per freq (data_pipeline/feature_engineerin
 
 
 
-
+#1.25 or 12.5
 
 
 

@@ -274,6 +274,15 @@ def main(argv=None):
 
     os.makedirs(args.out, exist_ok=True)
 
+    # In init mode (when not explicitly updating/appending), clear old processed files
+    # to ensure a clean run. (Excluding step 1's source file if it is in the same dir)
+    import glob
+    print("Clearing old processed data...")
+    for ext in ['*.parquet', '*.dat', '*.tmp']:
+        for f in glob.glob(os.path.join(args.out, ext)):
+            if os.path.basename(f) != os.path.basename(args.src) and not f.endswith('training_data.parquet'):
+                os.remove(f)
+
     sessions_processed = 0
     t_start_all = time.monotonic()
 
