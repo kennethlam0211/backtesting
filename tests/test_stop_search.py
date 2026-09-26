@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from data_pipeline.to_dat import process_session
+from data_pipeline.to_dat import offset_session, process_session
 from stop_search import StopSearch, CHILD, DAT_COLS, FREQS
 
 PRICE_COL = DAT_COLS.index('price')
@@ -37,16 +37,11 @@ def make_session(rng, date):
 
 
 def build_dat(rng, dates):
-    """tick.dat rows for consecutive sessions, offset to global indices the way to_dat.write_result does."""
+    """tick.dat rows for consecutive sessions, offset to global row numbers as to_dat does."""
     blocks, offset = [], 0
     for d in dates:
-        tick_res, _, n = process_session(make_session(rng, d), d)
-        start = tick_res['start_ind'].values
-        tick_res['start_ind'] = np.where(start != -1, start + offset, 0)
-        for f in FREQS:
-            col = f'next_ind_{f}'
-            tick_res[col] = np.where(tick_res[col] > 0, tick_res[col] + offset, 0)
-        blocks.append(tick_res[DAT_COLS].values.astype(np.int64))
+        tick_res, bars, n = process_session(make_session(rng, d), d)
+        blocks.append(offset_session(tick_res, bars, offset))
         offset += n
     return np.concatenate(blocks)
 
