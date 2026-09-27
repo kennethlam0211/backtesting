@@ -20,7 +20,7 @@ TRAINING_DATA_PATH = f'{DATA_PATH}/training_data.parquet'  # feature_engineering
 RESULTS_DIR = 'results'                                    # backtest results
 TRADES_PATH = f'{RESULTS_DIR}/trades.parquet'              # every trade of the last backtest run: the analysis input
 
-FREQS = ['1','5','15','60','day']
+FREQS = ['1','5','10','15','30','60','day']
 
 BEGIN_DATE = datetime.datetime(2020, 1, 1, 0, 0, 0)
 

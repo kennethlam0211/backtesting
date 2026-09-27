@@ -1,18 +1,22 @@
 """
-Ensemble functions for config.ENSEMBLE: `(df, names) -> side`, where df holds one signal column per strategy (1 / -1
-while its condition holds, else 0) named in `names`. The result is a state too; strategy.ensemble() keeps only the bar
-it turns 1 / -1 as the signal.
+Ensemble functions for config.ENSEMBLE: `(df, signals, search_mode) -> side`, where df holds one signal column per
+strategy (1 / -1 while its condition holds, else 0) and `signals` maps each column's name to the side it signals
+(1 long only, -1 short only, 0 either). The result is a state too (1 / -1 while it holds); find_exits picks the
+entries from it by config.SEARCH_MODE.
 """
 import polars as pl
 
 
-def ensemble_function(df: pl.DataFrame, names: list[str], share: float = 0.3) -> pl.Expr:
+def ensemble_function(df: pl.DataFrame, signals: dict[str, int], search_mode: bool = False) -> pl.Expr:
     """
-    For the time being, a vote of the active signals: with s the sum of the signals on a bar and n how many are not 0,
-    1 when s >= share * n, -1 when s <= -share * n, else 0 (and 0 when none is active).
+    Search mode, lenient: 1 while any long signal is 1, -1 while any short signal is -1; which fired is the trades'
+    `signals` label, for the analysis to find the patterns that pay. Normal mode, strict: 1 while every long signal
+    is 1, -1 while every short signal is -1. 0 when neither or both. A signal of either side counts for both; a side
+    with no signals never trades.
     """
-    s = pl.sum_horizontal(pl.col(names).cast(pl.Int32))
-    n = pl.sum_horizontal((pl.col(names) != 0).cast(pl.Int32))
-    return (pl.when((n > 0) & (s >= share * n)).then(1)
-            .when((n > 0) & (s <= -share * n)).then(-1)
-            .otherwise(0).cast(pl.Int8))
+    agree = pl.any_horizontal if search_mode else pl.all_horizontal
+    longs = [name for name, side in signals.items() if side >= 0]
+    shorts = [name for name, side in signals.items() if side <= 0]
+    long = agree(pl.col(longs) == 1) if longs else pl.lit(False)
+    short = agree(pl.col(shorts) == -1) if shorts else pl.lit(False)
+    return pl.when(long & ~short).then(1).when(short & ~long).then(-1).otherwise(0).cast(pl.Int8)

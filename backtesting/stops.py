@@ -15,3 +15,20 @@ def grid(tp: list[int], sl: list[int]):
                 .with_columns(stops=pl.format('{}/{}', 'tp', 'sl')))
 
     return grid_stops
+
+
+def vol_grid(tp: list[float], sl: list[float], column: str):
+    """
+    Every signal with every (tp, sl) pair of multiples of its signal bar's volatility `column` (units, e.g. config's
+    VOL_COLUMN), all in one walk: wider in a volatile market, tighter in a quiet one. tp / sl = ceil(k x volatility),
+    at least 1 unit; `stops` = '{tp}x/{sl}x'.
+    """
+    levels = pl.DataFrame([(a, b, f'{a}x/{b}x') for a in tp for b in sl],
+                          schema={'_tp_k': pl.Float64, '_sl_k': pl.Float64, 'stops': pl.Utf8}, orient='row')
+
+    def vol_stops(signals: pl.DataFrame) -> pl.DataFrame:
+        level = lambda k: (pl.col(k) * pl.col(column)).ceil().clip(lower_bound=1).cast(pl.Int64)
+        return (signals.drop(['tp', 'sl', 'stops'], strict=False).join(levels, how='cross')
+                .with_columns(tp=level('_tp_k'), sl=level('_sl_k')).drop('_tp_k', '_sl_k'))
+
+    return vol_stops

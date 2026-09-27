@@ -6,7 +6,18 @@ import polars as pl
 import pyarrow.parquet as pq
 import pytest
 
-from backtesting.backtest import find_exits, read_training_data
+from backtesting import backtest
+
+
+# These tests trade 1-min bars unless they say otherwise, whatever config.FREQ is
+def read_training_data(path, **kw):
+    return backtest.read_training_data(path, **{'freq': '1', **kw})
+
+
+def find_exits(stops, df, **kw):
+    return backtest.find_exits(stops, df, **{'freq': '1', **kw})
+
+
 from data_pipeline.to_dat import bars_table, offset_session, process_session
 from params import FREQS, UD_PIVOTS, WINDOW_SIZE
 from stop_search import DAT_COLS, StopSearch
@@ -81,10 +92,11 @@ def training(market, tmp_path, warmup=0):
     return path
 
 
-def tick_scan(data, df, row, side, tp, sl, flat_at, freq='1'):
+def tick_scan(data, df, row, side, tp, sl, flat_at, freq='1', search=False, pattern=None):
     """
     Expected trade by walking every tick from the entry until the session's first `freq` bar that ends after flat_at
-    (or the session end when it has none), or until the bar after df's next opposite `side` when that comes first:
+    (or the session end when it has none), or until the bar after the signal exit when that comes first: df's next
+    opposite `side`, or in search mode the first row whose `side` / `pattern` / date is not the signal's:
     (result, exit_row, exit_px).
     """
     start = df['start_ind'].to_numpy()
@@ -93,7 +105,11 @@ def tick_scan(data, df, row, side, tp, sl, flat_at, freq='1'):
     flat = day.filter(minute + int(freq) > flat_at.hour * 60 + flat_at.minute)['r'].to_list()
     last = day['r'].max()
     end = start[flat[0]] if flat else data[start[last], DAT_COLS.index(f'next_ind_{freq}')]
-    opposite = [r for r in np.flatnonzero(df['side'].to_numpy() == -side) if r > row]
+    same = (df['side'].to_numpy() == side) & (df['date'].to_numpy() == df['date'].to_numpy()[row])
+    if pattern is not None:
+        same &= df[pattern].to_numpy() == df[pattern][row]
+    ends = np.flatnonzero(~same if search else df['side'].to_numpy() == -side)
+    opposite = [r for r in ends if r > row]
     if opposite and opposite[0] + 1 < (flat[0] if flat else last + 1):
         k = opposite[0]
         end = start[k + 1]
@@ -150,7 +166,7 @@ def test_exits_match_a_tick_scan(market, stops, tmp_path, flat_at):
     sl = rng.integers(1, 60, len(df))
     df = df.with_columns(side=pl.Series(side), tp=pl.Series(tp), sl=pl.Series(sl))
 
-    trades = find_exits(stops, df, flat_at=flat_at)
+    trades = find_exits(stops, df, flat_at=flat_at, search_mode=False)
     assert trades['result'].n_unique() == 4  # take-profits, stop-losses, opposite signals and time exits all covered
     assert (trades['entry_ts'].dt.time() < flat_at).all()  # no entry at or after flat_at
     for t in trades.iter_rows(named=True):
@@ -188,7 +204,13 @@ def test_rsi_long_and_short_are_states():
     assert long.signals(df)['side'].to_list() == [0, 1, 1, 0, 1, 0, 0, 0, 0, 0]  # every bar below 10
     assert short.signals(df)['side'].to_list() == [0, 0, 0, 0, 0, -1, -1, 0, -1, 0]  # every bar above 90
     assert (long.name, short.name) == ('rsi_long_1_10', 'rsi_short_1_90')
-    assert long.columns == ('20_sma_rsi_1',) and long.params == {'freq': '1', 'level': 10}
+    # Reversed (momentum): short while below, long while above
+    rev_long, rev_short = rsi_long(freq='1', level=10, reverse=True), rsi_short(freq='1', level=90, reverse=True)
+    assert rev_long.signals(df)['side'].to_list() == [0, -1, -1, 0, -1, 0, 0, 0, 0, 0]
+    assert rev_short.signals(df)['side'].to_list() == [0, 0, 0, 0, 0, 1, 1, 0, 1, 0]
+    assert (rev_long.name, rev_long.side, rev_short.side) == ('rsi_long_1_10_reversed', -1, 1)
+    assert long.columns == ('20_sma_rsi_1',) and long.params == {'freq': '1', 'level': 10, 'reverse': False}
+    assert (long.side, short.side) == (1, -1)
 
 
 def test_expand_and_the_configured_run():
@@ -197,37 +219,149 @@ def test_expand_and_the_configured_run():
     got = expand({rsi_long: {'freq': ['1', '5'], 'params': {'level': [5, 10]}}})
     assert [s.name for s in got] == ['rsi_long_1_5', 'rsi_long_1_10', 'rsi_long_5_5', 'rsi_long_5_10']
     assert got[3].columns == ('20_sma_rsi_5',)
+    grids = expand({rsi_long: [{'freq': ['1'], 'params': {'level': [1]}}, {'freq': ['5'], 'params': {'level': [5, 10]}}]})
+    assert [s.name for s in grids] == ['rsi_long_1_1', 'rsi_long_5_5', 'rsi_long_5_10']
+    both = expand({rsi_long: {'freq': ['5'], 'params': {'level': [5], 'reverse': [False, True]}}})
+    assert [(s.name, s.side) for s in both] == [('rsi_long_5_5', 1), ('rsi_long_5_5_reversed', -1)]
     configured = expand(config.SIGNALS)
     assert configured and all(isinstance(s, Strategy) for s in configured)
     assert len({s.name for s in configured}) == len(configured)
     assert callable(config.ENSEMBLE) and callable(config.STOP)
 
 
-def test_ensemble_function_votes_among_the_active_signals():
+def test_ensemble_function_any_in_search_mode_every_in_normal():
     from backtesting.ensemble import ensemble_function
-    rows = [[1, 1, 1, 0, 0, 0, 0, 0, 0, 0],        # 3 of 3 long: 1
-            [1, 1, -1, -1, 1, 0, 0, 0, 0, 0],      # +1 of 5 active (< 30%): 0
-            [-1, -1, -1, 1, 0, 0, 0, 0, 0, 0],     # -2 of 4: -1
-            [0] * 10,                              # none active: 0
-            [1, -1, 0, 0, 0, 0, 0, 0, 0, 0],       # 0 of 2: 0
-            [1, 1, 1, -1, -1, -1, -1, -1, -1, -1],  # -4 of 10: -1
-            [1, 1, 1, 1, -1, -1, -1, -1, -1, -1]]   # -2 of 10 (> -30%): 0
-    names = [f's{i}' for i in range(10)]
-    df = pl.DataFrame(rows, schema={n: pl.Int8 for n in names}, orient='row')
-    assert df.select(side=ensemble_function(df, names))['side'].to_list() == [1, 0, -1, 0, 0, -1, 0]
+    signals = {'l1': 1, 'l2': 1, 's1': -1, 's2': -1}
+    rows = [[1, 1, 0, 0],    # every long
+            [0, 1, 0, 0],    # one long
+            [0, 0, 0, -1],   # one short
+            [0, 0, -1, -1],  # every short
+            [1, 0, -1, 0],   # one of each: 0 in both modes
+            [0, 0, 0, 0]]
+    df = pl.DataFrame(rows, schema={n: pl.Int8 for n in signals}, orient='row')
+    side = lambda search: df.select(side=ensemble_function(df, signals, search))['side'].to_list()
+    assert side(True) == [1, 1, -1, -1, 0, 0]
+    assert side(False) == [1, 0, 0, -1, 0, 0]
+    # A signal of either side counts for both; no signals of a side: that side never trades
+    both = pl.DataFrame({'e': [1, -1, 0], 'l': [0, 0, 1]}, schema={'e': pl.Int8, 'l': pl.Int8})
+    assert both.select(side=ensemble_function(both, {'e': 0, 'l': 1}, True))['side'].to_list() == [1, -1, 1]
+    assert both.select(side=ensemble_function(both, {'l': 1}, True))['side'].to_list() == [0, 0, 1]
 
 
-def test_ensemble_side_is_the_trigger_bar_only():
+def test_ensemble_side_holds_and_sides_run_separately():
     from backtesting.ensemble import ensemble_function
     from backtesting.strategy import ensemble, rsi_long, rsi_short
     rsi = [50, 9, 5, 8, 50, 9, 95, 91, 50]
     df = pl.DataFrame({'20_sma_rsi_1': [1 - r / 50 for r in rsi]})
-    e = ensemble([rsi_long(freq='1', level=10), rsi_short(freq='1', level=90)], ensemble_function)
+    signals = [rsi_long(freq='1', level=10), rsi_short(freq='1', level=90)]
+    e = ensemble(signals, ensemble_function, search_mode=True)
     out = e.signals(df)
-    assert out['rsi_long_1_10'].to_list() == [0, 1, 1, 1, 0, 1, 0, 0, 0]  # the signals stay states
+    assert out['rsi_long_1_10'].to_list() == [0, 1, 1, 1, 0, 1, 0, 0, 0]  # the signals are states
     assert out['rsi_short_1_90'].to_list() == [0, 0, 0, 0, 0, 0, -1, -1, 0]
-    assert out['side'].to_list() == [0, 1, 0, 0, 0, 1, -1, 0, 0]  # the vote only where it turns 1 / -1
-    assert (e.name, e.columns, e.keep) == ('ensemble_function', ('20_sma_rsi_1',), ('rsi_long_1_10', 'rsi_short_1_90'))
+    assert out['side'].to_list() == [0, 1, 1, 1, 0, 1, -1, -1, 0]  # so is the ensemble: find_exits picks entries
+    assert (e.name, e.columns, e.keep) == ('ensemble_function', ('20_sma_rsi_1',), ('rsi_long_1_10', 'rsi_short_1_90', 'signals'))
+    # Separate sides: each keeps its own side only
+    long, short = ensemble(signals, ensemble_function, 1, True), ensemble(signals, ensemble_function, -1, True)
+    assert long.signals(df)['side'].to_list() == [0, 1, 1, 1, 0, 1, 0, 0, 0]
+    assert short.signals(df)['side'].to_list() == [0, 0, 0, 0, 0, 0, -1, -1, 0]
+    assert (long.name, short.name, long.side, short.side) == ('ensemble_function_long', 'ensemble_function_short', 1, -1)
+    # The label: one digit per signal of the side, 1 where active
+    three = [rsi_long(freq='1', level=lvl) for lvl in (10, 8, 6)] + [rsi_short(freq='1', level=90)]
+    got = ensemble(three, ensemble_function, 1, True).signals(df)
+    assert got['signals'].to_list() == ['000', 'L100', 'L111', 'L100', '000', 'L100', '000', '000', '000']  # 8 is not < 8
+    assert ensemble(three, ensemble_function, 1, False).signals(df)['side'].to_list() == [0, 0, 1, 0, 0, 0, 0, 0, 0]
+    assert ensemble(three, ensemble_function, -1, True).signals(df)['signals'].to_list()[6] == 'S1'
+    assert ensemble(three, ensemble_function, 1).keep[-1] == 'signals'
+
+
+def test_search_mode_one_trade_per_pattern(market, stops, tmp_path):
+    from backtesting.backtest import one_at_a_time
+    df = read_training_data(training(market, tmp_path))
+    side = np.zeros(len(df), np.int8)
+    side[100:131] = 1  # held for 31 bars: pattern a on 100-110, then b on 111-130
+    pattern = np.where(np.arange(len(df)) < 111, 'La', 'Lb')
+    df = df.with_columns(side=pl.Series(side), signals=pl.Series(pattern))
+    wide = df.with_columns(tp=pl.lit(10_000), sl=pl.lit(10_000))  # levels never hit
+    t = one_at_a_time(find_exits(stops, wide, search_mode=True, pattern='signals'))
+    # a: in at 101, out at 112's open (b starts on 111); b: in at 112, out at 132's open (the signal ends on 131)
+    assert t.select('row', 'result', 'exit_row').rows() == [(100, 2, 111), (111, 2, 131)]
+    assert t['exit_ts'].to_list() == [df['ts'][112], df['ts'][132]]
+    assert t['entry_px'][1] == t['exit_px'][0]
+    # Tight levels: after a TP / SL exit, nothing until the next pattern
+    tight = one_at_a_time(find_exits(stops, df.with_columns(tp=pl.lit(2), sl=pl.lit(2)), search_mode=True, pattern='signals'))
+    assert tight['row'].to_list() == [100, 111] and set(tight['result'].to_list()) <= {1, -1}
+    # Normal mode: in where it turns 1, then no signal exit (no opposite) and no second entry
+    normal = one_at_a_time(find_exits(stops, wide, search_mode=False))
+    assert normal.select('row', 'result').rows() == [(100, 0)]
+
+
+def test_search_mode_exits_match_a_tick_scan(market, stops, tmp_path):
+    df = read_training_data(training(market, tmp_path))
+    rng = np.random.default_rng(6)
+    # Runs of 1-20 bars, each a side and a pattern
+    lengths = rng.integers(1, 21, len(df))
+    run = np.repeat(np.arange(len(lengths)), lengths)[:len(df)]
+    side = rng.choice(np.array([-1, 0, 0, 1], np.int8), len(lengths))[run]
+    pattern = rng.choice(np.array(['a', 'b']), len(lengths))[run]
+    df = df.with_columns(side=pl.Series(side), signals=pl.Series(pattern),
+                         tp=pl.Series(rng.integers(1, 60, len(df))), sl=pl.Series(rng.integers(1, 60, len(df))))
+    trades = find_exits(stops, df, search_mode=True, pattern='signals', flat_at=datetime.time(22, 59))
+    assert trades['result'].n_unique() == 4
+    for t in trades.iter_rows(named=True):
+        want = tick_scan(market[0], df, t['row'], t['side'], t['tp'], t['sl'], datetime.time(22, 59), search=True,
+                         pattern='signals')
+        assert (t['result'], t['exit_row'], t['exit_px']) == want, t
+
+
+def test_no_entry_on_a_news_bar(market, stops, tmp_path):
+    df = read_training_data(training(market, tmp_path))
+    side = np.zeros(len(df), np.int8)
+    side[[100, 200, 300]] = 1
+    news = np.zeros(len(df), np.int8)
+    news[[101, 200]] = 1  # the entry bar of the first signal; the signal bar (not the entry) of the second
+    df = df.with_columns(side=pl.Series(side), news_1=pl.Series(news), tp=pl.lit(4), sl=pl.lit(4))
+    assert find_exits(stops, df, no_entry=['news_1'])['row'].to_list() == [200, 300]
+    assert find_exits(stops, df)['row'].to_list() == [100, 200, 300]
+    with pytest.raises(ValueError, match='no_entry columns'):
+        find_exits(stops, df, no_entry=['news_5'])
+
+
+def test_vol_ok_uses_past_sessions_only():
+    from backtesting.backtest import vol_ok
+    d = [datetime.date(2024, 3, 11)] * 5 + [datetime.date(2024, 3, 12)] * 3 + [datetime.date(2024, 3, 13)] * 2
+    df = pl.DataFrame({'date': d, 'v': [1.0, 2, 3, 4, 5, 0, 3, 6, 2, 4]})
+    # Day 2 against day 1's quartiles (2, 4); day 3 against day 2's (1.5, 4.5); day 1 has no history
+    got = vol_ok(df, 'v', (0.25, 0.75), sessions=1).to_list()
+    assert got == [False] * 5 + [False, True, False] + [True, True]
+
+
+def test_entry_ok_skips_signals(market, stops, tmp_path):
+    df = read_training_data(training(market, tmp_path))
+    side = np.zeros(len(df), np.int8)
+    side[[100, 200, 300]] = 1
+    df = df.with_columns(side=pl.Series(side), ok=pl.Series(np.arange(len(df)) != 200), tp=pl.lit(4), sl=pl.lit(4))
+    assert find_exits(stops, df, entry_ok='ok')['row'].to_list() == [100, 300]
+
+
+def test_vol_grid_scales_the_stops():
+    from backtesting.stops import vol_grid
+    signals = pl.DataFrame({'row': [0, 1], 'v': [4.2, 0.3]})
+    got = vol_grid(tp=[1, 2], sl=[3], column='v')(signals)
+    assert got.select('row', 'tp', 'sl', 'stops').rows() == [(0, 5, 13, '1x/3x'), (0, 9, 13, '2x/3x'),
+                                                             (1, 1, 1, '1x/3x'), (1, 1, 1, '2x/3x')]
+
+
+def test_run_grid_in_chunks_equals_one_chunk(market, stops, tmp_path):
+    from backtesting.backtest import run_grid
+    from backtesting.stops import grid
+    df = read_training_data(training(market, tmp_path))
+    side = np.zeros(len(df), np.int8)
+    side[np.random.default_rng(5).choice(len(df), 300, replace=False)] = 1
+    df = df.with_columns(side=pl.Series(side) * np.where(np.arange(len(df)) % 3, 1, -1).astype(np.int8))
+    stop = grid(tp=[4, 16], sl=[8, 40])
+    by_day = run_grid(stops, df, stop=stop, every='1d', freq='1').sort('stops', 'row')  # the two sessions apart
+    whole = run_grid(stops, df, stop=stop, every='1mo', freq='1').sort('stops', 'row')
+    assert df['date'].n_unique() == 2 and len(whole) > 0 and by_day.equals(whole)
 
 
 def test_opposite_signal_exits_at_the_next_open_and_reverses(market, stops, tmp_path):
@@ -237,7 +371,7 @@ def test_opposite_signal_exits_at_the_next_open_and_reverses(market, stops, tmp_
     side[[100, 103]] = 1   # the second long is skipped: the first is still open
     side[105] = -1         # the opposite signal: the long exits at row 106's first tick, the short enters there
     df = df.with_columns(side=pl.Series(side), tp=pl.lit(10_000), sl=pl.lit(10_000))  # levels never hit
-    trades = add_costs(one_at_a_time(find_exits(stops, df)))
+    trades = add_costs(one_at_a_time(find_exits(stops, df, search_mode=False)))
     start = df['start_ind'].to_numpy()
     long, short = trades.row(0, named=True), trades.row(1, named=True)
     assert trades['row'].to_list()[:2] == [100, 105]
@@ -302,7 +436,7 @@ def test_freq_5_exits_match_a_tick_scan(market, stops, tmp_path, flat_at):
     side[pick] = rng.choice([1, -1], len(pick))
     df = df.with_columns(side=pl.Series(side), tp=pl.Series(rng.integers(1, 60, len(df))),
                          sl=pl.Series(rng.integers(1, 60, len(df))))
-    trades = find_exits(stops, df, flat_at=flat_at, freq='5')
+    trades = find_exits(stops, df, flat_at=flat_at, freq='5', search_mode=False)
     assert len(trades) > 0
     for t in trades.iter_rows(named=True):
         result, exit_row, exit_px = tick_scan(market[0], df, t['row'], t['side'], t['tp'], t['sl'], flat_at, freq='5')

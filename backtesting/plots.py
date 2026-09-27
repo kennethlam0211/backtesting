@@ -174,7 +174,7 @@ class BacktestPlots:
         # bins would squeeze into an invisible sliver
         edges = np.histogram_bin_edges(trades['net_usd'].to_numpy(), bins=40) if len(trades) else 40
         for ax, (code, name, color) in zip(axes, [(1, 'Take-profit', SLOT[0]), (-1, 'Stop-loss', SLOT[1]),
-                                                  (2, 'Opposite signal', SLOT[2]),
+                                                  (2, 'Signal exit', SLOT[2]),
                                                   (0, f'Time exit ({FLAT_AT}) / close', SLOT[3])]):
             subset = trades.filter(pl.col('result') == code)['net_usd'].to_numpy()
             if len(subset):

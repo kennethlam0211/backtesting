@@ -48,9 +48,15 @@ from backtesting.plots import (
 from backtesting.stats import BacktestStats
 from params import RESULTS_DIR, TRADES_PATH, TRAINING_DATA_PATH
 
-# Single labels, then each label crossed with the side
-LABELS = [*LABEL_COLS, *[f'{c}_q' for c in LABEL_FEATURES], 'year', 'month', 'side']
-SLICES = [[c] for c in LABELS] + [[c, 'side'] for c in LABELS if c != 'side']
+# Single labels, then each label crossed with the side; not session / rth (on the trades still): hour holds them
+LABELS = [*[c for c in LABEL_COLS if c not in ('session', 'rth')], *[f'{c}_q' for c in LABEL_FEATURES], 'year', 'month',
+          'side']
+# Plus `signals`, the position and pattern of active signals on the signal bar (e.g. 'L110100...'), and every label at
+# once, over all strategies (`signals` holds the position). With year in it, a COMBINED slice is all before or all
+# after SPLIT: it is ranked by its t-stat, not judged on the halves
+COMBINED = [c for c in LABELS if c != 'month'] + ['signals']
+ALL = 'long_short'  # the `strategy` of a COMBINED slice: longs and shorts, told apart by `signals`
+SLICES = [[c] for c in LABELS] + [[c, 'side'] for c in LABELS if c != 'side'] + [['signals'], COMBINED]
 MIN_TRADES = 50  # per half, for a slice to be judged
 
 
@@ -114,16 +120,20 @@ def _stats() -> list[pl.Expr]:
         net.mean().alias('net_per_trade'),
         (net > 0).mean().alias('win_rate'),
         net.sum().alias('net_usd'),
-        (net.mean() / net.std() * pl.len().sqrt()).alias('t_net'),  # mean net per trade in standard errors
+        # mean net per trade in standard errors; none when every trade has the same net (no spread to measure)
+        pl.when(net.std() > 0).then(net.mean() / net.std() * pl.len().sqrt()).alias('t_net'),
     ]
 
 
 def slices(trades: pl.DataFrame, split=SPLIT) -> pl.DataFrame:
-    """One row per strategy x stops x slice (label, value): _stats() plus the halves and the years positive."""
+    """
+    One row per strategy x stops x slice (label, value): _stats() plus the halves and the years positive. The
+    COMBINED slice is over all strategies (`strategy` = ALL): stops x every label.
+    """
     late = pl.col('date') >= datetime.date.fromisoformat(split)
     out = []
     for cols in SLICES:
-        keys = ['strategy', 'stops', *cols]
+        keys = ['stops', *cols] if cols == COMBINED else ['strategy', 'stops', *cols]
         halves = trades.group_by(keys).agg(
             *_stats(),
             trades_before=(~late).sum(), net_before=pl.col('net_usd').filter(~late).sum(),
@@ -132,7 +142,7 @@ def slices(trades: pl.DataFrame, split=SPLIT) -> pl.DataFrame:
         years = (trades.group_by(*dict.fromkeys([*keys, 'year'])).agg(pl.col('net_usd').sum())  # a year slice: once
                  .group_by(keys).agg(years=pl.len(), years_positive=(pl.col('net_usd') > 0).sum()))
         out.append(halves.join(years, on=keys).select(
-            'strategy', 'stops',
+            pl.col('strategy') if 'strategy' in keys else pl.lit(ALL).alias('strategy'), 'stops',
             pl.lit(' x '.join(cols)).alias('label'),
             pl.concat_str([pl.col(c).cast(pl.Utf8) for c in cols], separator=' / ').alias('value'),
             *[c for c in halves.columns if c not in keys], 'years', 'years_positive',
@@ -218,12 +228,11 @@ def plot_hours(p: pl.DataFrame, names, out_dir):
 
 def plot_labels(p: pl.DataFrame, names, out_dir, per_row=6):
     """
-    labels.png: net $ per trade by session, regular hours, news, side, volatility, year and month (stops pooled), per
+    labels.png: net $ per trade by news, side, volatility, year and month (stops pooled), per
     strategy; one row of panels per `per_row` strategies (in the trades' order), each its legend. A panel's width
     follows its number of values.
     """
-    panels = [('session', {1: 'Asia', 2: 'Europe', 3: 'US'}), ('rth', {0: 'outside RTH', 1: 'RTH'}),
-              (f'news_{FREQ}', {0: 'no news', 1: 'news window'}),
+    panels = [(f'news_{FREQ}', {0: 'no news', 1: 'news window'}),
               ('side', {-1: 'short', 1: 'long'}),
               *[(f'{c}_q', {i: f'Q{i}' for i in range(1, n + 1)}) for c, n in LABEL_FEATURES.items()],
               ('year', {y: f"'{y % 100:02d}" for y in sorted(p.filter(pl.col('label') == 'year')['value'].unique())}),
@@ -264,9 +273,11 @@ def plot_stability(s: pl.DataFrame, trades: pl.DataFrame, out_dir, top=6):
     fig.suptitle('Net $ per year: the best slices positive before and after the split', color=TEXT_PRI, fontsize=12,
                  x=0.01, ha='left')
     for ax, row in zip(axes[0], best.iter_rows(named=True)):
-        cond = (pl.col('strategy') == row['strategy']) & (pl.col('stops') == row['stops'])
+        cond = pl.col('stops') == row['stops']
+        if row['strategy'] != ALL:
+            cond &= pl.col('strategy') == row['strategy']
         for col, v in zip(row['label'].split(' x '), row['value'].split(' / ')):
-            cond &= pl.col(col) == int(v)
+            cond &= pl.col(col).cast(pl.Utf8) == v
         y = trades.filter(cond).group_by('year').agg(pl.col('net_usd').sum()).sort('year')
         net = y['net_usd'].to_numpy()
         ax.bar(y['year'].to_list(), net, color=np.where(net >= 0, CATEGORICAL[0], CATEGORICAL[7]), width=0.8, zorder=3)
@@ -280,6 +291,9 @@ def plot_stability(s: pl.DataFrame, trades: pl.DataFrame, out_dir, top=6):
 
 def main():
     trades = load_trades()
+    if trades.is_empty():
+        print(f"no trades in {TRADES_PATH}: nothing to analyse")
+        return
     names = trades['strategy'].unique(maintain_order=True).to_list()
     sessions = sessions_of(trades)
     out_dir = os.path.join(RESULTS_DIR, 'analysis')
@@ -310,6 +324,12 @@ def main():
           f"after {c['positive_after']:,}, both {c['positive_both']:,} (chance alone: {c['expected_both_by_chance']:.0f})")
     print(f"Positive after {SPLIT}: {c['after_share_if_picked_before']:.1%} of the slices positive before it, "
           f"{c['after_share_all']:.1%} of all slices")
+    combined = s.filter((pl.col('label') == ' x '.join(COMBINED)) & (pl.col('trades') >= MIN_TRADES))
+    print(f"\nEvery label at once (stops x {' x '.join(COMBINED)}): {len(combined):,} slices with >= {MIN_TRADES} trades, "
+          f"{(combined['net_usd'] > 0).sum():,} net positive; the best by t-stat:")
+    with pl.Config(tbl_rows=15, tbl_cols=-1, float_precision=1, tbl_width_chars=260, fmt_str_lengths=80):
+        print(combined.filter(pl.col('net_usd') > 0).sort('t_net', descending=True)
+              .select('stops', 'value', 'trades', 'net_per_trade', 'win_rate', 't_net', 'net_usd').head(15))
     with pl.Config(tbl_rows=15, tbl_cols=-1, float_precision=1, tbl_width_chars=220):
         good = s.filter((pl.col('trades_before') >= MIN_TRADES) & (pl.col('trades_after') >= MIN_TRADES)
                         & (pl.col('net_before') > 0) & (pl.col('net_after') > 0))
