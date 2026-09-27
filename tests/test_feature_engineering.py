@@ -302,3 +302,4 @@ def test_build_without_warmup_starts_at_a_session_start(data_dir):
     start = int((full["ts"] == trimmed["ts"].iloc[0]).to_numpy().argmax())
     assert 0 < start  # a real warm-up was dropped
     pd.testing.assert_frame_equal(trimmed, full.iloc[start:].reset_index(drop=True), check_dtype=False)
+

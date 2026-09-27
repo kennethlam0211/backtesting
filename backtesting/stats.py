@@ -7,7 +7,7 @@ Statistics of a backtest's trades (backtesting/backtest.py's output after add_co
     stats.daily()                 # per session: gross / net PnL, cumulative, drawdown
     stats.rolling()               # per session: the last month's (21 sessions) gross / net PnL, Sharpe, win rate
     stats.by_period('month')      # per calendar month (or 'year')
-    stats.by_label('hour')        # per value of a label of the signal bar: session, rth, hour, news_1
+    stats.by_label('hour')        # per value of a label of the entry bar: session, rth, hour, news_1
     BacktestStats.grid(trades)    # summary() of every (tp, sl) pair
 
 Gross is before costs (`gross_usd`), net after slippage and commission (`net_usd`). Anything sequential (equity,

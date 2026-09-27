@@ -187,7 +187,7 @@ class BacktestPlots:
     def grid_heatmap(grid: pl.DataFrame, value: str, out_dir, by=('tp', 'sl'), title: str = '') -> pathlib.Path:
         """
         grid_{value}.png: `value` (a grid() column, e.g. total_net_usd or sharpe) over the first `by` column (y) and the
-        second (x), diverging around 0. Only the best cell is labelled; the grid csv is the table view.
+        second (x), diverging around 0. Only the best cell is labelled; the grid itself is the table view.
         """
         out_dir = pathlib.Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)

@@ -5,9 +5,10 @@ Bar features for the RL agent: the polars version of reference/preprocessing_pan
     python -m data_pipeline.feature_engineering --data-dir data/processed_2024 --out data/features_2024.parquet
 
 Reads {data-dir}/{freq}_ohlcv.parquet for every freq in params.FREQS and adds, per freq (window 20): SMA, std,
-Bollinger bands (2 sigma), ATR, SMA-RSI, FVG, bar-to-bar moves and bar score. Every higher freq is then
+Bollinger bands (2 sigma), ATR, SMA-RSI, FVG and bar-to-bar moves. Every higher freq is then
 joined onto the 1-min bars: a bar appears on the 1-min row during which it closes and stays until the next
-one closes, so a row holds nothing from the future once that 1-min bar has closed.
+one closes, so a row holds nothing from the future once that 1-min bar has closed. Every freq keeps its tick.dat start
+row as `start_ind_{freq}` (start_ind_1, start_ind_5, ...), joined like its open / high / low / close.
 U/D, as the reference: for every freq on the 1-min closes, with that freq's std as the reversal threshold
 (for a higher freq its live std: the last 19 closes shown so far plus the current 1-min close, once 19 have
 closed), with the flag and the last params.UD_PIVOTS pivots. The output starts on the first session that
@@ -23,7 +24,7 @@ import polars as pl
 from numba import njit
 
 from params import DATA_PATH as DATA_DIR
-from params import FEATURES, FREQS, NORM_FACTOR, TRAINING_DATA_PATH, UD_PIVOTS, WINDOW_SIZE, VOL_METHODS
+from params import FEATURES, FREQS, TRAINING_DATA_PATH, UD_PIVOTS, WINDOW_SIZE, VOL_METHODS
 
 # A session is [00:00, 23:00) on the shifted clock (New York + 6h): no bar runs past 23:00
 SESSION_SECONDS = 23 * 3600
@@ -252,15 +253,6 @@ def calc_price_session(lf: pl.LazyFrame) -> pl.LazyFrame:
         (pl.col('close') > pl.col('close').shift(1)).alias('HC')
     ])
 
-def calc_bar_score(lf: pl.LazyFrame) -> pl.LazyFrame:
-    return lf.with_columns([
-        (
-            (pl.max_horizontal(pl.col('high') - pl.col('open'), pl.col('open') - pl.col('low')) -
-             pl.min_horizontal(pl.col('high') - pl.col('open'), pl.col('open') - pl.col('low')) * 2 +
-             (pl.col('close') - pl.col('open')).abs()) / NORM_FACTOR
-        ).alias('bar_score')
-    ])
-
 class DataPreprocessor:
     def __init__(self, data_dir: str):
         self.data_dir = data_dir
@@ -311,7 +303,9 @@ class DataPreprocessor:
 
         # Rename columns to have frequency suffix (except ts and join keys)
         df = lf.collect()
-        rename_dict = {col: f"{col}_{freq}" for col in df.columns if col not in ['ts', 'start_ind', 'rth', 'session', 'hour']}
+        # Every freq's start_ind becomes start_ind_{freq}, the base's too (start_ind_1)
+        keep = ['ts', 'rth', 'session', 'hour']
+        rename_dict = {col: f"{col}_{freq}" for col in df.columns if col not in keep}
         df = df.rename(rename_dict)
 
         return df
@@ -353,7 +347,7 @@ class DataPreprocessor:
 
             # ASOF JOIN: For every base tick, find the MOST RECENT *completed* higher timeframe bar.
             df_base = df_base.join_asof(
-                df_htf.drop(['start_ind', 'rth', 'session', 'hour'], strict=False),
+                df_htf.drop(['rth', 'session', 'hour'], strict=False),
                 on='ts',
                 strategy='backward'
             )

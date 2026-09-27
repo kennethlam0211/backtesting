@@ -3,10 +3,11 @@ import datetime
 import numpy as np
 import pandas as pd
 import polars as pl
+import pyarrow.parquet as pq
 import pytest
 
 from backtesting.backtest import find_exits, read_training_data
-from data_pipeline.to_dat import offset_session, process_session
+from data_pipeline.to_dat import bars_table, offset_session, process_session
 from params import FREQS, UD_PIVOTS, WINDOW_SIZE
 from stop_search import DAT_COLS, StopSearch
 
@@ -31,15 +32,26 @@ def make_session(rng, date):
     return df
 
 
+def appears(b5):
+    """When each 5-min bar shows up in the 1-min table, as feature_engineering joins it: on its last minute."""
+    ts = b5['ts'].astype('datetime64[ms]')
+    close = np.minimum(ts + np.timedelta64(5, 'm'), ts.astype('datetime64[D]') + np.timedelta64(23, 'h'))
+    return close - np.timedelta64(1, 'm')
+
+
 @pytest.fixture(scope='module')
 def market():
-    """tick.dat rows and the matching 1-min training rows (start_ind, ts, open_1, pivots) for two sessions."""
+    """
+    tick.dat rows, the matching 1-min training rows (start_ind, ts, open_1, pivots, and the 5-min start_ind_5 / open_5
+    joined as feature_engineering does) and the 5-min bars (per session, as step 2 writes them) for two sessions.
+    """
     rng = np.random.default_rng(0)
-    blocks, bars, offset = [], [], 0
+    blocks, bars, bars5, offset = [], [], [], 0
     for d in DATES:
         tick_res, res, n = process_session(make_session(rng, d), d)
         blocks.append(offset_session(tick_res, res, offset))
         bars.append(res['1'])
+        bars5.append(res['5'])
         offset += n
     b = np.concatenate(bars)
     df = pl.DataFrame({
@@ -48,7 +60,10 @@ def market():
         'open_1': b['open'],
         **{c: np.ones(len(b)) for c in PIVOTS},
     })
-    return np.concatenate(blocks), df
+    b5 = np.concatenate(bars5)
+    df = df.join_asof(pl.DataFrame({'_ts': appears(b5), 'start_ind_5': b5['start_ind'], 'open_5': b5['open']}),
+                      left_on='ts', right_on='_ts', strategy='backward').drop('_ts')
+    return np.concatenate(blocks), df, bars5
 
 
 @pytest.fixture(scope='module')
@@ -61,20 +76,22 @@ def training(market, tmp_path, warmup=0):
     df = market[1].with_columns([pl.when(pl.int_range(pl.len()) < warmup).then(np.nan).otherwise(pl.col(c)).alias(c)
                                  for c in PIVOTS])
     path = tmp_path / 'training_data.parquet'
-    df.write_parquet(path)
+    df.rename({'start_ind': 'start_ind_1'}).write_parquet(path)  # the file suffixes every freq's start_ind
+    pq.write_table(bars_table(market[2]), tmp_path / '5_ohlcv.parquet')  # its bar file next to it, as step 2 writes it
     return path
 
 
-def tick_scan(data, df, row, side, tp, sl, flat_at):
+def tick_scan(data, df, row, side, tp, sl, flat_at, freq='1'):
     """
-    Expected trade by walking every tick from the entry until the session's first bar at or after flat_at (or the
-    session end when it has none): (result, exit_row, exit_px).
+    Expected trade by walking every tick from the entry until the session's first `freq` bar that ends after flat_at
+    (or the session end when it has none): (result, exit_row, exit_px).
     """
     start = df['start_ind'].to_numpy()
     day = df.with_row_index('r').filter(pl.col('date') == df['date'][row])
-    flat = day.filter(pl.col('ts').dt.time() >= flat_at)['r'].to_list()
+    minute = day['ts'].dt.hour().cast(pl.Int64) * 60 + day['ts'].dt.minute()
+    flat = day.filter(minute + int(freq) > flat_at.hour * 60 + flat_at.minute)['r'].to_list()
     last = day['r'].max()
-    end = start[flat[0]] if flat else data[start[last], DAT_COLS.index('next_ind_1')]
+    end = start[flat[0]] if flat else data[start[last], DAT_COLS.index(f'next_ind_{freq}')]
     e = start[row + 1]
     px = data[e, PRICE_COL]
     up, lo = (px + tp, px - sl) if side == 1 else (px + sl, px - tp)
@@ -157,7 +174,7 @@ def test_rsi_signals_fire_on_the_first_bar_into_a_zone():
     rsi = [50, 9, 5, 11, 8, 95, 91, 89, 92, 50]
     want = [0, 1, 0, 0, 1, -1, 0, 0, -1, 0]  # in, stay, out, in again; the same above 90
     df = pl.DataFrame({'20_sma_rsi_1': [1 - r / 50 for r in rsi]})  # the stored scale: -(RSI / 50 - 1)
-    out = rsi_signals(df, low=10, high=90)
+    out = rsi_signals(df, low=10, high=90, freq='1')
     assert out['side'].to_list() == want
     assert out['rsi_1'].to_list() == pytest.approx(rsi)
 
@@ -165,8 +182,10 @@ def test_rsi_signals_fire_on_the_first_bar_into_a_zone():
 def test_rsi_strategy_and_the_configured_run():
     from backtesting import config
     from backtesting.strategy import Strategy, rsi
-    s = rsi(10, 90)
+    s = rsi(10, 90, freq='1')
     assert s.name == 'rsi_10_90' and s.columns == ('20_sma_rsi_1',)
+    assert (rsi(low=5, freq='1').name, rsi(high=95, freq='1').name) == ('rsi_long_5', 'rsi_short_95')
+    assert rsi(low=5, freq='1').params == {'rsi_low': 5, 'rsi_high': None}
     assert config.STRATEGIES and all(isinstance(s, Strategy) for s in config.STRATEGIES)
 
 
@@ -180,3 +199,47 @@ def test_pairs_in_one_walk_equal_one_walk_per_pair(market, stops, tmp_path):
     each = pl.concat([find_exits(stops, df.with_columns(tp=pl.lit(tp, pl.Int64), sl=pl.lit(sl, pl.Int64)))
                       for tp, sl in pairs]).sort('tp', 'sl', 'row')
     assert len(one) > 0 and one.equals(each)
+
+
+def test_rsi_one_side_only():
+    from backtesting.strategy import rsi_signals
+    rsi = [50, 9, 50, 95, 50]
+    df = pl.DataFrame({'20_sma_rsi_1': [1 - r / 50 for r in rsi]})
+    assert rsi_signals(df, 10, None, '1')['side'].to_list() == [0, 1, 0, 0, 0]
+    assert rsi_signals(df, None, 90, '1')['side'].to_list() == [0, 0, 0, -1, 0]
+
+
+def test_freq_5_rows_are_each_bars_first_appearance(market, tmp_path):
+    path = training(market, tmp_path)
+    pl.read_parquet(path).with_columns(x=pl.int_range(pl.len())).write_parquet(path)  # numbers the 1-min rows
+    df = read_training_data(path, freq='5')
+    b5 = np.concatenate(market[2])
+    # A bar's row is the first 1-min row showing it: its last minute, or later when that minute had no trades
+    first = np.searchsorted(market[1]['ts'].to_numpy(), appears(b5), 'left')
+    seen = first < len(market[1])
+    assert (~seen).sum() <= 1  # only the data's very last bar can go unseen (no minute after its last one)
+    assert df['start_ind'].to_list() == b5['start_ind'][seen].tolist()
+    assert df['open_5'].to_list() == b5['open'][seen].tolist()
+    assert df['ts'].to_list() == pl.Series(b5['ts'][seen].astype('datetime64[ms]')).to_list()  # the bar's own start
+    assert df['x'].to_list() == first[seen].tolist()
+    # The late case is covered: some bars' last minute had no trades, so they first show a minute or more later
+    assert (market[1]['ts'].to_numpy()[first[seen]] > appears(b5)[seen]).sum() > 10
+    assert df.columns[:8] == ['start_ind', 'ts', 'open_5', 'session', 'rth', 'hour', 'news_5', 'date']
+    assert not [c for c in df.columns if c.endswith('_1')]  # the 1-min columns are dropped
+
+
+# 22:59: the flat bar is the 22:55 bar, the one holding 22:59; 12:02: the 12:00 bar
+@pytest.mark.parametrize('flat_at', [datetime.time(22, 59), datetime.time(12, 2)])
+def test_freq_5_exits_match_a_tick_scan(market, stops, tmp_path, flat_at):
+    df = read_training_data(training(market, tmp_path), freq='5')
+    rng = np.random.default_rng(3)
+    side = np.zeros(len(df), np.int8)
+    pick = rng.choice(len(df), 150, replace=False)
+    side[pick] = rng.choice([1, -1], len(pick))
+    df = df.with_columns(side=pl.Series(side), tp=pl.Series(rng.integers(1, 60, len(df))),
+                         sl=pl.Series(rng.integers(1, 60, len(df))))
+    trades = find_exits(stops, df, flat_at=flat_at, freq='5')
+    assert len(trades) > 0
+    for t in trades.iter_rows(named=True):
+        result, exit_row, exit_px = tick_scan(market[0], df, t['row'], t['side'], t['tp'], t['sl'], flat_at, freq='5')
+        assert (t['result'], t['exit_row'], t['exit_px']) == (result, exit_row, exit_px), t

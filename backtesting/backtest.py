@@ -1,5 +1,5 @@
 """
-Backtest on the training data (data_pipeline/feature_engineering.py's output, one row per 1-min bar),
+Backtest on the training data (data_pipeline/feature_engineering.py's output, one row per config.FREQ bar),
 with stop_search deciding which of take-profit / stop-loss a trade hits first. Built step by step:
 
     1. read_training_data   the training parquet, burn-in dropped, optionally one date range
@@ -26,6 +26,8 @@ from backtesting.config import (
     COMMISSION,
     END,
     FLAT_AT,
+    FREQ,
+    LABEL_FEATURES,
     POINT_VALUE,
     SL_GRID,
     SLIPPAGE,
@@ -43,25 +45,37 @@ from params import (
 )
 from stop_search import StopSearch
 
-# Always read: the walk in find_exits needs the tick.dat row of every bar, the session and the entry price
-BASE_COLS = ['start_ind', 'ts', 'open_1']
 # Labels of the entry bar (when the trade is in the market), kept on each trade (when read) for analysis: session block
 # (1 Asia, 2 Europe, 3 US), regular hours, hour of the shifted clock, news (1 inside an FOMC / NFP / CPI / PPI / GDP window)
-LABEL_COLS = ['session', 'rth', 'hour', 'news_1']
+LABEL_COLS = ['session', 'rth', 'hour', f'news_{FREQ}']
 
 
 def _as_date(d):
     return d if d is None or isinstance(d, datetime.date) else datetime.date.fromisoformat(d)
 
 
+def _seconds(freq: str) -> int:
+    """A bar size in seconds: 'day', '<n>s' (seconds) or '<n>' (minutes)."""
+    return 86400 if freq == 'day' else int(freq[:-1]) if freq.endswith('s') else int(freq) * 60
+
+
+def _base_freq() -> str:
+    """The smallest of params.FREQS: the training data has one row per such bar."""
+    return min(FREQS, key=_seconds)
+
+
 def _as_time(t):
     return t if isinstance(t, datetime.time) else datetime.time.fromisoformat(t)
 
 
-def read_training_data(path=TRAINING_DATA_PATH, start=None, end=None, columns=None) -> pl.DataFrame:
+def read_training_data(path=TRAINING_DATA_PATH, start=None, end=None, columns=None, freq=FREQ) -> pl.DataFrame:
     """
-    Step 1: the training data, one row per 1-min bar in time order, plus `date`, the session (the date of the
-    shifted-clock ts).
+    Step 1: the training data as `freq` bars (default config.FREQ), one row per bar in time order, plus `date`, the
+    session (the date of the shifted-clock ts). The training data has one row per base bar (the smallest of
+    params.FREQS); for a larger `freq` the rows are its bars (_freq_bars: each bar's first appearance, the smaller
+    timeframes' columns dropped, its start and labels from its bar file {freq}_ohlcv.parquet next to the training
+    data, joined on start_ind_{freq}): the training data is the playground, any freq can be traded without rerunning
+    feature engineering. `start_ind` is the traded bar's first tick in tick.dat.
 
     The burn-in is dropped as feature_engineering drops it: whole sessions, until one starts with every freq's
     UD_PIVOTS U/D pivots (so a file written with --keep-warmup reads the same as one without; the pivots never
@@ -70,11 +84,17 @@ def read_training_data(path=TRAINING_DATA_PATH, start=None, end=None, columns=No
     Args:
         path: the training parquet (default: feature_engineering's default output).
         start, end: first / last session date, inclusive (datetime.date or 'YYYY-MM-DD'); default: all.
-        columns: feature columns to keep besides start_ind, ts and open_1; default: every column.
+        columns: columns to keep besides start_ind, ts and open_{freq}; default: every column.
+        freq: the bar size traded, one of params.FREQS.
 
     Raises:
         ValueError: no row is left, or the bars are not in tick.dat order.
     """
+    base = _base_freq()
+    # Always read: the walk in find_exits needs the tick.dat row of every bar, the session and the entry price
+    keys = [f'start_ind_{base}', 'ts', f'open_{base}', 'date']
+    if freq != base:  # _freq_bars keeps each freq bar's first appearance and its open
+        keys += [f'start_ind_{freq}', f'open_{freq}']
     start, end = _as_date(start), _as_date(end)
     pivots = [f'{WINDOW_SIZE}_UD_last{UD_PIVOTS}_{f}' for f in FREQS]
     # Pivots are NaN (Float64 files) or null (Int32 files) until filled; cast so both read the same
@@ -87,8 +107,11 @@ def read_training_data(path=TRAINING_DATA_PATH, start=None, end=None, columns=No
     if end is not None:
         lf = lf.filter(pl.col('date') <= end)
     if columns is not None:
-        lf = lf.select(BASE_COLS + ['date'] + [c for c in columns if c not in BASE_COLS + ['date']])
-    df = lf.collect()
+        own = _bar_cols(freq) if freq != base else []  # the freq's bar file gives these
+        lf = lf.select(keys + [c for c in columns if c not in keys + own])
+    df = lf.collect().rename({f'start_ind_{base}': 'start_ind'})
+    if freq != base and not df.is_empty():
+        df = _freq_bars(df, freq, os.path.join(os.path.dirname(path), f'{freq}_ohlcv.parquet'))
 
     if df.is_empty():
         raise ValueError(f"{path}: no rows after the burn-in between {start or 'the start'} and {end or 'the end'}")
@@ -98,18 +121,51 @@ def read_training_data(path=TRAINING_DATA_PATH, start=None, end=None, columns=No
     return df
 
 
-def find_exits(stops, df: pl.DataFrame, flat_at=FLAT_AT, pairs=None) -> pl.DataFrame:
+def _bar_cols(freq: str) -> list[str]:
+    """The columns _freq_bars takes from a `freq` bar file (read_training_data does not read them from the training data)."""
+    return ['ts', 'session', 'rth', 'hour', f'news_{freq}', 'date']
+
+
+def _freq_bars(rows: pl.DataFrame, freq: str, bar_path) -> pl.DataFrame:
+    """
+    One row per `freq` bar from the base rows:
+    - each bar's first appearance (keep first on start_ind_{freq}): its last base bar, or the first later one when that
+      one had no trades. The columns of every timeframe smaller than `freq` are dropped, so a row holds nothing after the
+      bar's close (no bar of `freq` or larger ends inside a late appearance's extra minutes). `start_ind` becomes the
+      bar's first tick, start_ind_{freq}.
+    - ts (the bar's start), session, rth, hour and news_{freq} (any news flag in the bar) from its bar file
+      (`bar_path`, step 2's {freq}_ohlcv.parquet), joined on the bar's first tick: exact for every bar, however late
+      it appears.
+    A bar of an earlier session (seen at the start of the rows) is left out.
+    """
+    key = f'start_ind_{freq}'
+    smaller = tuple(f'_{f}' for f in FREQS if _seconds(f) < _seconds(freq))
+    base_only = ['start_ind', 'ts', 'date', 'session', 'rth', 'hour']
+    first = (rows.filter(pl.col(key).is_not_null())
+             .unique(key, keep='first', maintain_order=True)
+             .select([c for c in rows.columns if c not in base_only and not c.endswith(smaller)]))
+    bars = (pl.read_parquet(bar_path)
+            .select(pl.col('start_ind').alias(key), pl.col('ts').cast(pl.Datetime('ms')), 'session', 'rth', 'hour',
+                    pl.any_horizontal(pl.col('^news_.*$') != 0).cast(pl.Int8).alias(f'news_{freq}'))
+            .with_columns(date=pl.col('ts').dt.date()))
+    out = first.join(bars, on=key, how='inner').filter(pl.col('date').is_in(rows['date'].unique().implode()))
+    lead = ['ts', f'open_{freq}', 'session', 'rth', 'hour', f'news_{freq}', 'date']
+    return out.sort(key).select(pl.col(key).alias('start_ind'), *lead, pl.exclude(key, *lead))
+
+
+def find_exits(stops, df: pl.DataFrame, flat_at=FLAT_AT, pairs=None, freq=FREQ) -> pl.DataFrame:
     """
     Step 2: one trade per row of df whose `side` is 1 (long) or -1 (short); 0 or null = no trade.
     `tp` and `sl` (units, > 0) are the take-profit and stop-loss distances from the entry.
 
-    The signal is known at its bar's close, so the trade enters at the first tick of the next 1-min bar of
+    The signal is known at its bar's close, so the trade enters at the first tick of the next FREQ bar of
     the same session. The bars are then checked one at a time with stops.first_hit_many, for every open trade
     at once, until a level is hit; a hit fills at the level itself (costs come in add_costs).
 
-    Always flat before the next date: a trade still open when the session's first bar at or after `flat_at`
-    starts exits at that bar's first tick, and a signal whose entry would be at or after it is skipped. A
-    session with no bar from `flat_at` on (an early close) exits at its last tick.
+    Always flat before the next date: a trade still open when the flat bar starts (the session's first bar that
+    ends after `flat_at`, i.e. the one holding it; for 1-min bars the bar starting at `flat_at`) exits at that bar's
+    first tick, and a signal whose entry would be at or after it is skipped. A session with no such bar (an early
+    close) exits at its last tick.
 
     Args:
         stops: a StopSearch on the tick.dat the training data was built from.
@@ -117,21 +173,25 @@ def find_exits(stops, df: pl.DataFrame, flat_at=FLAT_AT, pairs=None) -> pl.DataF
         flat_at: time of the shifted clock ('HH:MM' or datetime.time), default config.FLAT_AT.
         pairs: (tp, sl) pairs to run every signal with, all in one walk, instead of df's `tp` / `sl` columns;
             the trades then come signal by signal, each signal's pairs in this order.
+        freq: the bar size of df's rows (read_training_data's `freq`), default config.FREQ.
 
     Returns:
         One row per trade, in signal order: `row` (the signal's row in df), `signal_ts` (the signal bar), `date`,
-        `side`, `tp`, `sl`, `entry_ts` (the entry bar: the trade's time), the entry bar's LABEL_COLS that df has,
+        `side`, `tp`, `sl`, the signal bar's config.LABEL_FEATURES that df has (known when the order goes in),
+        `entry_ts` (the entry bar: the trade's time), the entry bar's LABEL_COLS that df has,
         `entry_ind` (tick.dat row), `entry_px`, `exit_row` (df row of the bar the trade exits in), `exit_ts`,
         `exit_px`, `result` (1 take-profit, -1 stop-loss, 0 flat at `flat_at` or the session end) and `pnl`
         (gross, units).
 
     Raises:
         ValueError: a signal has a missing or non-positive tp / sl, or tick.dat's price at an entry is not
-            the training data's open_1 there (the two files come from different builds).
+            the training data's open_{FREQ} there (the two files come from different builds).
     """
     # Per session: the flat bar (the first at or after flat_at; null after an early close) and the stop row, the
     # first row a trade may not be in (the flat bar, else the row after the session's last bar)
-    flat_bar = pl.when(pl.col('ts').dt.time() >= _as_time(flat_at)).then(pl.col('row')).min().over('date')
+    t = _as_time(flat_at)
+    bar_end_minute = pl.col('ts').dt.hour().cast(pl.Int64) * 60 + pl.col('ts').dt.minute() + _seconds(freq) / 60
+    flat_bar = pl.when(bar_end_minute > t.hour * 60 + t.minute).then(pl.col('row')).min().over('date')
     df = df.with_row_index('row').with_columns(_flat=flat_bar).with_columns(
         _stop=pl.col('_flat').fill_null(pl.col('row').max().over('date') + 1))
     sig = df.filter((pl.col('side').fill_null(0) != 0) & (pl.col('row') + 1 < pl.col('_stop')))
@@ -147,10 +207,10 @@ def find_exits(stops, df: pl.DataFrame, flat_at=FLAT_AT, pairs=None) -> pl.DataF
     sl = sig['sl'].to_numpy()
     entry_row = sig['row'].to_numpy().astype(np.int64) + 1
     entry_px = stops.price(start[entry_row])
-    open_1 = df['open_1'].to_numpy()[entry_row]
-    if (entry_px != open_1).any():
-        i = np.flatnonzero(entry_px != open_1)[0]
-        raise ValueError(f"tick.dat price {entry_px[i]} at row {start[entry_row[i]]} is not open_1 {open_1[i]}: "
+    open_px = df[f'open_{freq}'].to_numpy()[entry_row]
+    if (entry_px != open_px).any():
+        i = np.flatnonzero(entry_px != open_px)[0]
+        raise ValueError(f"tick.dat price {entry_px[i]} at row {start[entry_row[i]]} is not open_{freq} {open_px[i]}: "
                          "training data and tick.dat come from different builds")
 
     upper = np.where(side == 1, entry_px + tp, entry_px + sl)
@@ -162,7 +222,7 @@ def find_exits(stops, df: pl.DataFrame, flat_at=FLAT_AT, pairs=None) -> pl.DataF
     hit = np.zeros(len(sig), dtype=np.int8)
     todo = np.arange(len(sig))
     while todo.size:
-        h = stops.first_hit_many('1', start[bar[todo]], upper[todo], lower[todo])
+        h = stops.first_hit_many(freq, start[bar[todo]], upper[todo], lower[todo])
         closed = (h != 0) | (bar[todo] + 1 == stop[todo])
         hit[todo[closed]] = h[closed]
         todo = todo[~closed]
@@ -172,14 +232,15 @@ def find_exits(stops, df: pl.DataFrame, flat_at=FLAT_AT, pairs=None) -> pl.DataF
     # first tick, or after an early close the session's last tick (the one before the row where its last bar ends)
     flat = df['_flat'].fill_null(-1).to_numpy().astype(np.int64)[entry_row]
     flat_px = stops.price(start[np.maximum(flat, 0)])
-    close_px = stops.price(stops.bar_end('1', start[bar]) - 1)
+    close_px = stops.price(stops.bar_end(freq, start[bar]) - 1)
     time_px = np.where(flat >= 0, flat_px, close_px)
     exit_px = np.where(hit == 1, np.ceil(upper), np.where(hit == -1, np.floor(lower), time_px)).astype(np.int64)
     bar = np.where((hit == 0) & (flat >= 0), flat, bar)
 
     ts = df['ts']
     labels = [c for c in LABEL_COLS if c in df.columns]
-    return sig.select(['row', pl.col('ts').alias('signal_ts'), 'date', 'side', 'tp', 'sl']).with_columns(
+    features = [c for c in LABEL_FEATURES if c in sig.columns]
+    return sig.select(['row', pl.col('ts').alias('signal_ts'), 'date', 'side', 'tp', 'sl', *features]).with_columns(
         entry_ts=ts.gather(entry_row),
         **{c: df[c].gather(entry_row) for c in labels},  # the entry bar's labels
         entry_ind=pl.Series(start[entry_row]),
@@ -239,20 +300,23 @@ def run_grid(stops, df: pl.DataFrame, tp_grid=TP_GRID, sl_grid=SL_GRID) -> pl.Da
 def run_backtest(strategy, stops, start=START, end=END, tp_grid=TP_GRID, sl_grid=SL_GRID) -> pl.DataFrame:
     """
     Step 6: one strategy over every TP x SL pair (sessions, grid and costs default to config.py): reads its columns
-    and LABEL_COLS, makes its signals and returns every pair's trades, with the strategy's name as `strategy`.
+    LABEL_COLS and config.LABEL_FEATURES, makes its signals and returns every pair's trades, with the strategy's
+    name as `strategy` and its params as columns.
     """
-    df = strategy.signals(read_training_data(start=start, end=end, columns=[*strategy.columns, *LABEL_COLS]))
+    df = strategy.signals(read_training_data(start=start, end=end,
+                                             columns=[*strategy.columns, *LABEL_COLS, *LABEL_FEATURES]))
     sessions = df['date'].unique().sort()
     print(f"{strategy.name}: {len(sessions):,} sessions ({sessions[0]} .. {sessions[-1]}), "
           f"{df.filter(pl.col('side') != 0).height:,} signals, {len(tp_grid) * len(sl_grid)} TP x SL pairs")
-    return run_grid(stops, df, tp_grid, sl_grid).select(pl.lit(strategy.name).alias('strategy'), pl.all())
+    return run_grid(stops, df, tp_grid, sl_grid).select(
+        pl.lit(strategy.name).alias('strategy'), *[pl.lit(v).alias(k) for k, v in strategy.params.items()], pl.all())
 
 
 def main():
     """Every strategy in config.STRATEGIES over the TP x SL grid: all their trades in one table, params.TRADES_PATH."""
     t0 = time.time()
     stops = StopSearch.load(TICK_DATA_PATH)
-    trades = pl.concat([run_backtest(s, stops) for s in STRATEGIES])
+    trades = pl.concat([run_backtest(s, stops) for s in STRATEGIES], how='diagonal_relaxed')  # params differ
     os.makedirs(os.path.dirname(TRADES_PATH), exist_ok=True)
     trades.write_parquet(TRADES_PATH)
     print(f"{len(trades):,} trades of {trades.select('strategy', 'tp', 'sl').n_unique()} runs in {TRADES_PATH} "
