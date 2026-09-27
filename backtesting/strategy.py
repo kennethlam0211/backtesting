@@ -1,10 +1,14 @@
 """
 Strategies for backtesting/backtest.py. A Strategy names the training-data columns it reads and adds `side`
-(1 long, -1 short, 0 none) to read_training_data's frame; a signal is known at its bar's close, and find_exits
-enters on the next bar. The backtest runs the ones listed in backtesting/config.py over the TP x SL grid.
+(1 long, -1 short, 0 none) to read_training_data's frame: a state, 1 or -1 on every bar while its condition holds,
+known at the bar's close. ensemble() joins them; its `side` is 1 / -1 only on the bar its rule turns 1 / -1, and
+find_exits holds the trade from the next bar.
 
-To add one: write its signal function and a factory returning a Strategy, then list it in config.STRATEGIES.
+config.SIGNALS lists factories with a `freq` list and a `params` dict of lists; expand() makes one Strategy per
+combination and ensemble() joins them into one `side` with config.ENSEMBLE. To add one: write a factory
+`(freq, **params) -> Strategy` and list it in config.SIGNALS.
 """
+import itertools
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -15,34 +19,63 @@ from params import WINDOW_SIZE
 
 @dataclass(frozen=True)
 class Strategy:
-    name: str                                        # results folder and chart titles
+    name: str                                        # the `strategy` column of its trades, chart titles
     columns: tuple[str, ...]                         # training-data columns signals() reads
     signals: Callable[[pl.DataFrame], pl.DataFrame]  # adds `side`
     params: dict = field(default_factory=dict)       # its settings, written on each of its trades as columns
+    keep: tuple[str, ...] = ()                       # columns signals() adds that each trade keeps from its signal bar
 
 
-def rsi_signals(df: pl.DataFrame, low: float | None, high: float | None, freq: str) -> pl.DataFrame:
+def _rsi(freq: str) -> pl.Expr:
     """
-    Mean reversion on the RSI of `freq` bars: long on the bar the RSI first goes below `low`, short on the bar it
-    first goes above `high`. Bars that stay inside the zone do not signal again. None: that side does not trade.
-
-    The RSI is feature_engineering's `{WINDOW_SIZE}_sma_rsi_{freq}` (e.g. 20_sma_rsi_1): RSI(14) of the close changes with simple 14-bar means
-    (Cutler's RSI, not Wilder's smoothing), stored as -(RSI / 50 - 1) in [-1, 1]. It is turned back into 0-100 and
-    kept as `rsi_{freq}`.
+    The RSI of `freq` bars, 0-100: feature_engineering's `{WINDOW_SIZE}_sma_rsi_{freq}` (e.g. 20_sma_rsi_1), RSI(14)
+    of the close changes with simple 14-bar means (Cutler's RSI, not Wilder's smoothing), stored as -(RSI / 50 - 1)
+    in [-1, 1]. On FREQ rows a larger freq's RSI is its last closed bar's.
     """
-    rsi = pl.col(f'rsi_{freq}')
-    long = (rsi < low) & (rsi.shift(1) >= low) if low is not None else pl.lit(False)
-    short = (rsi > high) & (rsi.shift(1) <= high) if high is not None else pl.lit(False)
-    return df.with_columns(((1 - pl.col(f'{WINDOW_SIZE}_sma_rsi_{freq}')) / 2 * 100).alias(f'rsi_{freq}')).with_columns(
-        side=pl.when(long).then(1).when(short).then(-1).otherwise(0).cast(pl.Int8)
-    )
+    return (1 - pl.col(f'{WINDOW_SIZE}_sma_rsi_{freq}')) / 2 * 100
 
 
-def rsi(low: float | None = None, high: float | None = None, *, freq: str) -> Strategy:
+def _state(name: str, freq: str, cond: pl.Expr, side: int, **params) -> Strategy:
+    return Strategy(f"{name}_{freq}_{'_'.join(str(v) for v in params.values())}".rstrip('_'),
+                    (f'{WINDOW_SIZE}_sma_rsi_{freq}',),
+                    lambda df: df.with_columns(side=pl.when(cond).then(side).otherwise(0).cast(pl.Int8)),
+                    params={'freq': freq, **params})
+
+
+def rsi_long(freq: str, level: float) -> Strategy:
+    """Mean reversion: 1 while the RSI of `freq` bars is below `level`, else 0 (rsi_long_{freq}_{level})."""
+    return _state('rsi_long', freq, _rsi(freq) < level, 1, level=level)
+
+
+def rsi_short(freq: str, level: float) -> Strategy:
+    """Mean reversion: -1 while the RSI of `freq` bars is above `level`, else 0 (rsi_short_{freq}_{level})."""
+    return _state('rsi_short', freq, _rsi(freq) > level, -1, level=level)
+
+
+def expand(signals: dict) -> list[Strategy]:
+    """One Strategy per factory x freq x combination of its params' lists (config.SIGNALS)."""
+    return [factory(freq=f, **dict(zip(grid['params'], combo)))
+            for factory, grid in signals.items()
+            for f in grid['freq']
+            for combo in itertools.product(*grid['params'].values())]
+
+
+def ensemble(strategies: list[Strategy], rule: Callable) -> Strategy:
     """
-    RSI mean reversion (rsi_signals) on `freq` bars: long below `low` and / or short above `high`. A long depends only
-    on `low`, a short only on `high`, so one side alone is the natural unit: rsi_long_{low}, rsi_short_{high}.
+    One Strategy from many: each strategy's `side` becomes a column named after it, then `rule(df, names)` (e.g.
+    backtesting/ensemble.py's ensemble_function) turns them into a state. `side` is that state on the bar it turns
+    1 / -1 (the trigger bar), else 0. Named after the rule; each trade keeps the signal columns of its signal bar.
     """
-    name = f'rsi_long_{low}' if high is None else f'rsi_short_{high}' if low is None else f'rsi_{low}_{high}'
-    return Strategy(name, (f'{WINDOW_SIZE}_sma_rsi_{freq}',), lambda df: rsi_signals(df, low, high, freq),
-                    params={'rsi_low': low, 'rsi_high': high})
+    names = [s.name for s in strategies]
+    if len(set(names)) != len(names):
+        raise ValueError(f"strategy names must be unique: {names}")
+
+    def signals(df: pl.DataFrame) -> pl.DataFrame:
+        df = df.with_columns([s.signals(df)['side'].alias(s.name) for s in strategies])
+        state = pl.col('_state').fill_null(0)
+        return df.with_columns(_state=rule(df, names)).with_columns(
+            side=pl.when((state != 0) & (state != state.shift(fill_value=0))).then(state).otherwise(0).cast(pl.Int8)
+        ).drop('_state')
+
+    columns = tuple(dict.fromkeys(c for s in strategies for c in s.columns))
+    return Strategy(getattr(rule, '__name__', 'ensemble'), columns, signals, keep=tuple(names))

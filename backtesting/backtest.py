@@ -6,14 +6,14 @@ with stop_search deciding which of take-profit / stop-loss a trade hits first. B
     2. find_exits           every signal row -> one trade: entry, exit, result and gross PnL
     3. one_at_a_time        signals while a trade is open are skipped
     4. add_costs            gross and net PnL (slippage and commission), in units and $
-    5. run_grid             steps 2-4 for every TP x SL pair on the same signals
-    6. run_backtest         a strategy (backtesting/strategy.py) over the grid
+    5. run_grid             steps 2-4 for every stops of config.STOP (e.g. every TP x SL pair) on the same signals
+    6. run_backtest         a strategy (backtesting/strategy.py) over the stops
 
-    python -m backtesting.backtest          # every strategy in backtesting/config.py -> one table, results/trades.parquet
+    python -m backtesting.backtest          # config.SIGNALS through config.ENSEMBLE -> one table, results/trades.parquet
     python -m backtesting.analysis          # then: leaderboard, label analysis, the final run's statistics and charts
 
 Prices and PnL are in units of price x4 (like the bar files and tick.dat): 1 unit = 0.25 index point.
-The run (strategy, sessions, grid, costs) is set in backtesting/config.py; paths come from params/params.py.
+The run (signals, ensemble, stops, sessions, costs) is set in backtesting/config.py; paths come from params/params.py.
 """
 import datetime
 import os
@@ -25,16 +25,17 @@ import polars as pl
 from backtesting.config import (
     COMMISSION,
     END,
+    ENSEMBLE,
     FLAT_AT,
     FREQ,
     LABEL_FEATURES,
     POINT_VALUE,
-    SL_GRID,
+    SIGNALS,
     SLIPPAGE,
     START,
-    STRATEGIES,
-    TP_GRID,
+    STOP,
 )
+from backtesting.strategy import ensemble, expand
 from params import (
     FREQS,
     TICK_DATA_PATH,
@@ -153,7 +154,7 @@ def _freq_bars(rows: pl.DataFrame, freq: str, bar_path) -> pl.DataFrame:
     return out.sort(key).select(pl.col(key).alias('start_ind'), *lead, pl.exclude(key, *lead))
 
 
-def find_exits(stops, df: pl.DataFrame, flat_at=FLAT_AT, pairs=None, freq=FREQ) -> pl.DataFrame:
+def find_exits(stops, df: pl.DataFrame, flat_at=FLAT_AT, stop=None, freq=FREQ, keep=()) -> pl.DataFrame:
     """
     Step 2: one trade per row of df whose `side` is 1 (long) or -1 (short); 0 or null = no trade.
     `tp` and `sl` (units, > 0) are the take-profit and stop-loss distances from the entry.
@@ -162,6 +163,9 @@ def find_exits(stops, df: pl.DataFrame, flat_at=FLAT_AT, pairs=None, freq=FREQ) 
     the same session. The bars are then checked one at a time with stops.first_hit_many, for every open trade
     at once, until a level is hit; a hit fills at the level itself (costs come in add_costs).
 
+    A trade also exits on the opposite signal: on the first bar after its signal whose `side` is the other side,
+    known at that bar's close, the trade exits at the next bar's first tick (a market fill).
+
     Always flat before the next date: a trade still open when the flat bar starts (the session's first bar that
     ends after `flat_at`, i.e. the one holding it; for 1-min bars the bar starting at `flat_at`) exits at that bar's
     first tick, and a signal whose entry would be at or after it is skipped. A session with no such bar (an early
@@ -169,18 +173,20 @@ def find_exits(stops, df: pl.DataFrame, flat_at=FLAT_AT, pairs=None, freq=FREQ) 
 
     Args:
         stops: a StopSearch on the tick.dat the training data was built from.
-        df: read_training_data's output plus the `side`, `tp` and `sl` columns.
+        df: read_training_data's output plus the `side` column, and `tp` / `sl` when there is no `stop`.
         flat_at: time of the shifted clock ('HH:MM' or datetime.time), default config.FLAT_AT.
-        pairs: (tp, sl) pairs to run every signal with, all in one walk, instead of df's `tp` / `sl` columns;
-            the trades then come signal by signal, each signal's pairs in this order.
+        stop: a stop function (backtesting/stops.py) giving the signal rows their `tp`, `sl` and `stops`, e.g.
+            every (tp, sl) pair of a grid, all in one walk; None: df's own `tp` / `sl`.
         freq: the bar size of df's rows (read_training_data's `freq`), default config.FREQ.
+        keep: more df columns each trade keeps from its signal bar.
 
     Returns:
         One row per trade, in signal order: `row` (the signal's row in df), `signal_ts` (the signal bar), `date`,
-        `side`, `tp`, `sl`, the signal bar's config.LABEL_FEATURES that df has (known when the order goes in),
-        `entry_ts` (the entry bar: the trade's time), the entry bar's LABEL_COLS that df has,
-        `entry_ind` (tick.dat row), `entry_px`, `exit_row` (df row of the bar the trade exits in), `exit_ts`,
-        `exit_px`, `result` (1 take-profit, -1 stop-loss, 0 flat at `flat_at` or the session end) and `pnl`
+        `side`, `tp`, `sl`, `stops` (with a `stop`), the signal bar's config.LABEL_FEATURES that df has and `keep`
+        (known when the order goes in), `entry_ts` (the entry bar: the trade's time), its `year` and `month`, the
+        entry bar's LABEL_COLS that df has, `entry_ind` (tick.dat row), `entry_px`, `exit_row` (df row of the bar
+        the trade exits in; for an opposite signal that signal's bar), `exit_ts` (when it exits), `exit_px`,
+        `result` (1 take-profit, -1 stop-loss, 2 opposite signal, 0 flat at `flat_at` or the session end) and `pnl`
         (gross, units).
 
     Raises:
@@ -192,12 +198,18 @@ def find_exits(stops, df: pl.DataFrame, flat_at=FLAT_AT, pairs=None, freq=FREQ) 
     t = _as_time(flat_at)
     bar_end_minute = pl.col('ts').dt.hour().cast(pl.Int64) * 60 + pl.col('ts').dt.minute() + _seconds(freq) / 60
     flat_bar = pl.when(bar_end_minute > t.hour * 60 + t.minute).then(pl.col('row')).min().over('date')
+    signal = pl.col('side').fill_null(0)
+    next_row = lambda s: pl.when(signal == s).then(pl.col('row')).shift(-1).backward_fill()  # the next row with side s
     df = df.with_row_index('row').with_columns(_flat=flat_bar).with_columns(
-        _stop=pl.col('_flat').fill_null(pl.col('row').max().over('date') + 1))
-    sig = df.filter((pl.col('side').fill_null(0) != 0) & (pl.col('row') + 1 < pl.col('_stop')))
-    if pairs is not None:
-        levels = pl.DataFrame(list(pairs), schema={'tp': pl.Int64, 'sl': pl.Int64}, orient='row')
-        sig = sig.drop(['tp', 'sl'], strict=False).join(levels, how='cross')
+        _stop=pl.col('_flat').fill_null(pl.col('row').max().over('date') + 1),
+        # The opposite signal after each row: where a trade from it exits (none: past the last row)
+        _change=pl.when(signal == 1).then(next_row(-1)).otherwise(next_row(1)).fill_null(pl.len()),
+    )
+    sig = df.filter((signal != 0) & (pl.col('row') + 1 < pl.col('_stop')))
+    if stop is not None:
+        sig = stop(sig)
+        if 'stops' not in sig.columns:
+            sig = sig.with_columns(stops=pl.lit(getattr(stop, '__name__', 'stop')))
     if sig.select((pl.col('tp').is_null() | pl.col('sl').is_null() | (pl.col('tp') <= 0) | (pl.col('sl') <= 0)).any()).item():
         raise ValueError("every signal needs tp and sl > 0 (units)")
 
@@ -216,39 +228,49 @@ def find_exits(stops, df: pl.DataFrame, flat_at=FLAT_AT, pairs=None, freq=FREQ) 
     upper = np.where(side == 1, entry_px + tp, entry_px + sl)
     lower = np.where(side == 1, entry_px - sl, entry_px - tp)
 
-    # Walk: every open trade checks its current bar; a hit, or the last bar before the stop row, closes it
-    stop = df['_stop'].to_numpy().astype(np.int64)[entry_row]
+    # Walk: every open trade checks its current bar; a hit, or the last bar before its end row, closes it. The end
+    # row: the session's stop row, or the bar after the opposite signal, whichever comes first
+    session_stop = sig['_stop'].to_numpy().astype(np.int64)
+    change = sig['_change'].to_numpy().astype(np.int64)
+    until = np.minimum(session_stop, change + 1)
     bar = entry_row.copy()
     hit = np.zeros(len(sig), dtype=np.int8)
     todo = np.arange(len(sig))
     while todo.size:
         h = stops.first_hit_many(freq, start[bar[todo]], upper[todo], lower[todo])
-        closed = (h != 0) | (bar[todo] + 1 == stop[todo])
+        closed = (h != 0) | (bar[todo] + 1 == until[todo])
         hit[todo[closed]] = h[closed]
         todo = todo[~closed]
         bar[todo] += 1
 
-    # A hit fills at its level (first_hit rounds a float upper up and a float lower down). No hit: the flat bar's
-    # first tick, or after an early close the session's last tick (the one before the row where its last bar ends)
-    flat = df['_flat'].fill_null(-1).to_numpy().astype(np.int64)[entry_row]
+    # A hit fills at its level (first_hit rounds a float upper up and a float lower down). No hit: an opposite signal
+    # before the flat bar -> the first tick of the bar after it (bar + 1); else the flat bar's first tick, or
+    # after an early close the session's last tick (the one before the row where its last bar ends)
+    changed = (hit == 0) & (until < session_stop)
+    change_px = stops.price(start[np.where(changed, bar + 1, 0)])
+    flat = sig['_flat'].fill_null(-1).to_numpy().astype(np.int64)
     flat_px = stops.price(start[np.maximum(flat, 0)])
     close_px = stops.price(stops.bar_end(freq, start[bar]) - 1)
     time_px = np.where(flat >= 0, flat_px, close_px)
-    exit_px = np.where(hit == 1, np.ceil(upper), np.where(hit == -1, np.floor(lower), time_px)).astype(np.int64)
-    bar = np.where((hit == 0) & (flat >= 0), flat, bar)
+    exit_px = np.where(hit == 1, np.ceil(upper), np.where(hit == -1, np.floor(lower),
+                                                           np.where(changed, change_px, time_px))).astype(np.int64)
+    bar = np.where((hit == 0) & ~changed & (flat >= 0), flat, bar)
 
     ts = df['ts']
     labels = [c for c in LABEL_COLS if c in df.columns]
     features = [c for c in LABEL_FEATURES if c in sig.columns]
-    return sig.select(['row', pl.col('ts').alias('signal_ts'), 'date', 'side', 'tp', 'sl', *features]).with_columns(
+    run = ['stops'] if 'stops' in sig.columns else []
+    return sig.select(['row', pl.col('ts').alias('signal_ts'), 'date', 'side', 'tp', 'sl', *run, *features, *keep]).with_columns(
         entry_ts=ts.gather(entry_row),
+        year=ts.gather(entry_row).dt.year(),  # labels of the trade's time (entry_ts) for the analysis
+        month=ts.gather(entry_row).dt.month(),
         **{c: df[c].gather(entry_row) for c in labels},  # the entry bar's labels
         entry_ind=pl.Series(start[entry_row]),
         entry_px=pl.Series(entry_px, dtype=pl.Int64),
         exit_row=pl.Series(bar, dtype=pl.UInt32),
-        exit_ts=ts.gather(bar),
+        exit_ts=ts.gather(np.where(changed, bar + 1, bar)),
         exit_px=pl.Series(exit_px),
-        result=pl.Series(hit * side, dtype=pl.Int8),
+        result=pl.Series(np.where(changed, 2, hit * side), dtype=pl.Int8),
         pnl=pl.Series(side * (exit_px - entry_px)),
     )
 
@@ -257,10 +279,13 @@ def one_at_a_time(trades: pl.DataFrame) -> pl.DataFrame:
     """
     Step 3: one position at a time. Going through find_exits' trades in signal order, a signal while the previous
     kept trade is still open is skipped. A signal on the bar that trade exits in is taken: it is known at that bar's
-    close, after the exit, and enters on the next bar.
+    close, after the exit, and enters on the next bar. After an opposite signal that bar is the signal's own: it
+    enters at the next bar's first tick, where the old trade exits (a reversal).
     """
-    rows = trades['row'].to_numpy()
+    rows = trades['row'].to_numpy().astype(np.int64)
     exits = trades['exit_row'].to_numpy()
+    if (np.diff(rows) < 0).any():
+        raise ValueError("trades must be in signal order (a stop function must keep the signal rows' order)")
     keep = np.zeros(len(trades), dtype=bool)
     free_from = -1  # first row whose signal can be taken
     for i in range(len(trades)):
@@ -274,7 +299,7 @@ def add_costs(trades: pl.DataFrame, point_value=POINT_VALUE, commission=COMMISSI
     """
     Step 4: gross and net PnL. Adds `gross_usd` (the gross `pnl` in $), `net_units` and `net_usd`.
 
-    Slippage is `slippage` units on each market fill: the entry, and a stop-loss or time (flat_at) exit. A take-profit
+    Slippage is `slippage` units on each market fill: the entry, and a stop-loss, opposite-signal or time (flat_at) exit. A take-profit
     is a resting limit order, filled at its level. The TP / SL levels stay measured from the entry's market price.
     Commission is per side, so twice a trade.
     """
@@ -287,39 +312,51 @@ def add_costs(trades: pl.DataFrame, point_value=POINT_VALUE, commission=COMMISSI
     )
 
 
-def run_grid(stops, df: pl.DataFrame, tp_grid=TP_GRID, sl_grid=SL_GRID) -> pl.DataFrame:
+def run_grid(stops, df: pl.DataFrame, stop=STOP, keep=()) -> pl.DataFrame:
     """
-    Step 5: steps 2-4 for every (tp, sl) pair on the same signals (df has `side`). Returns every pair's trades stacked;
-    each pair is its own backtest, told apart by the `tp` / `sl` columns. All pairs share one walk (find_exits
-    with `pairs`): far fewer, larger stop_search calls than one walk per pair.
+    Step 5: steps 2-4 for every `stops` the stop function gives the same signals (df has `side`), e.g. every TP x SL
+    pair of a grid. Returns every stops' trades stacked; each is its own backtest, told apart by `stops`. All share
+    one walk (find_exits with `stop`): far fewer, larger stop_search calls than one walk each.
     """
-    trades = find_exits(stops, df, pairs=[(tp, sl) for tp in tp_grid for sl in sl_grid])
-    return pl.concat([add_costs(one_at_a_time(t)) for _, t in trades.group_by(['tp', 'sl'], maintain_order=True)])
+    trades = find_exits(stops, df, stop=stop, keep=keep)
+    if trades.is_empty():
+        return add_costs(trades)
+    return pl.concat([add_costs(one_at_a_time(t)) for _, t in trades.group_by('stops', maintain_order=True)])
 
 
-def run_backtest(strategy, stops, start=START, end=END, tp_grid=TP_GRID, sl_grid=SL_GRID) -> pl.DataFrame:
+def run_backtest(strategy, stops, start=START, end=END, stop=STOP) -> pl.DataFrame:
     """
-    Step 6: one strategy over every TP x SL pair (sessions, grid and costs default to config.py): reads its columns
-    LABEL_COLS and config.LABEL_FEATURES, makes its signals and returns every pair's trades, with the strategy's
+    Step 6: one strategy over every stops of `stop` (sessions and stops default to config.py): reads its columns,
+    LABEL_COLS and config.LABEL_FEATURES, makes its signals and returns every stops' trades, with the strategy's
     name as `strategy` and its params as columns.
+
+    Raises:
+        ValueError: a column the strategy reads is not in the FREQ-bar frame (a freq below FREQ is dropped).
     """
-    df = strategy.signals(read_training_data(start=start, end=end,
-                                             columns=[*strategy.columns, *LABEL_COLS, *LABEL_FEATURES]))
+    df = read_training_data(start=start, end=end, columns=[*strategy.columns, *LABEL_COLS, *LABEL_FEATURES])
+    missing = [c for c in strategy.columns if c not in df.columns]
+    if missing:
+        raise ValueError(f"{strategy.name}: {missing} not in the {FREQ}-bar training data: a signal's freq must be "
+                         f"config.FREQ ({FREQ}) or larger")
+    df = strategy.signals(df)
     sessions = df['date'].unique().sort()
     print(f"{strategy.name}: {len(sessions):,} sessions ({sessions[0]} .. {sessions[-1]}), "
-          f"{df.filter(pl.col('side') != 0).height:,} signals, {len(tp_grid) * len(sl_grid)} TP x SL pairs")
-    return run_grid(stops, df, tp_grid, sl_grid).select(
+          f"{df.filter(pl.col('side').fill_null(0) != 0).height:,} signals")
+    return run_grid(stops, df, stop, strategy.keep).select(
         pl.lit(strategy.name).alias('strategy'), *[pl.lit(v).alias(k) for k, v in strategy.params.items()], pl.all())
 
 
 def main():
-    """Every strategy in config.STRATEGIES over the TP x SL grid: all their trades in one table, params.TRADES_PATH."""
+    """
+    config.SIGNALS through config.ENSEMBLE as one strategy over config.STOP: all trades in one table,
+    params.TRADES_PATH. One signal alone is an ensemble of one.
+    """
     t0 = time.time()
     stops = StopSearch.load(TICK_DATA_PATH)
-    trades = pl.concat([run_backtest(s, stops) for s in STRATEGIES], how='diagonal_relaxed')  # params differ
+    trades = run_backtest(ensemble(expand(SIGNALS), ENSEMBLE), stops)
     os.makedirs(os.path.dirname(TRADES_PATH), exist_ok=True)
     trades.write_parquet(TRADES_PATH)
-    print(f"{len(trades):,} trades of {trades.select('strategy', 'tp', 'sl').n_unique()} runs in {TRADES_PATH} "
+    print(f"{len(trades):,} trades of {trades.select('strategy', 'stops').n_unique()} runs in {TRADES_PATH} "
           f"({time.time() - t0:.0f}s); next: python -m backtesting.analysis")
 
 

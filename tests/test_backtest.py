@@ -84,7 +84,8 @@ def training(market, tmp_path, warmup=0):
 def tick_scan(data, df, row, side, tp, sl, flat_at, freq='1'):
     """
     Expected trade by walking every tick from the entry until the session's first `freq` bar that ends after flat_at
-    (or the session end when it has none): (result, exit_row, exit_px).
+    (or the session end when it has none), or until the bar after df's next opposite `side` when that comes first:
+    (result, exit_row, exit_px).
     """
     start = df['start_ind'].to_numpy()
     day = df.with_row_index('r').filter(pl.col('date') == df['date'][row])
@@ -92,15 +93,24 @@ def tick_scan(data, df, row, side, tp, sl, flat_at, freq='1'):
     flat = day.filter(minute + int(freq) > flat_at.hour * 60 + flat_at.minute)['r'].to_list()
     last = day['r'].max()
     end = start[flat[0]] if flat else data[start[last], DAT_COLS.index(f'next_ind_{freq}')]
+    opposite = [r for r in np.flatnonzero(df['side'].to_numpy() == -side) if r > row]
+    if opposite and opposite[0] + 1 < (flat[0] if flat else last + 1):
+        k = opposite[0]
+        end = start[k + 1]
+    else:
+        k = None
     e = start[row + 1]
     px = data[e, PRICE_COL]
     up, lo = (px + tp, px - sl) if side == 1 else (px + sl, px - tp)
     p = data[e:end, PRICE_COL]
-    k = np.flatnonzero((p >= up) | (p <= lo))
-    if len(k) == 0:
-        # Flat at the flat bar's first tick, or the session's last tick after an early close
+    hits = np.flatnonzero((p >= up) | (p <= lo))
+    if len(hits) == 0:
+        # The next bar's first tick after an opposite signal; else flat at the flat bar's first tick, or the
+        # session's last tick after an early close
+        if k is not None:
+            return 2, k, data[end, PRICE_COL]
         return (0, flat[0], data[end, PRICE_COL]) if flat else (0, last, p[-1])
-    first = k[0]
+    first = hits[0]
     exit_row = np.searchsorted(start, e + first, 'right') - 1
     return (1 if p[first] >= up else -1) * side, exit_row, up if p[first] >= up else lo
 
@@ -141,7 +151,7 @@ def test_exits_match_a_tick_scan(market, stops, tmp_path, flat_at):
     df = df.with_columns(side=pl.Series(side), tp=pl.Series(tp), sl=pl.Series(sl))
 
     trades = find_exits(stops, df, flat_at=flat_at)
-    assert trades['result'].n_unique() == 3  # take-profits, stop-losses and time exits all covered
+    assert trades['result'].n_unique() == 4  # take-profits, stop-losses, opposite signals and time exits all covered
     assert (trades['entry_ts'].dt.time() < flat_at).all()  # no entry at or after flat_at
     for t in trades.iter_rows(named=True):
         result, exit_row, exit_px = tick_scan(market[0], df, t['row'], t['side'], t['tp'], t['sl'], flat_at)
@@ -157,7 +167,8 @@ def test_no_entry_at_or_after_22_59(market, stops, tmp_path):
     side = np.zeros(len(df), np.int8)
     side[late] = 1
     side[0] = 1
-    trades = find_exits(stops, df.drop('r').with_columns(side=pl.Series(side), tp=pl.lit(40), sl=pl.lit(20)))
+    trades = find_exits(stops, df.drop('r').with_columns(side=pl.Series(side), tp=pl.lit(40), sl=pl.lit(20)),
+                        flat_at=datetime.time(22, 59))
     assert trades['row'].to_list() == [0]
 
 
@@ -169,44 +180,97 @@ def test_bad_levels_and_a_different_build_raise(market, stops, tmp_path):
         find_exits(stops, df.with_columns(pl.col('open_1') + 1))
 
 
-def test_rsi_signals_fire_on_the_first_bar_into_a_zone():
-    from backtesting.strategy import rsi_signals
+def test_rsi_long_and_short_are_states():
+    from backtesting.strategy import rsi_long, rsi_short
     rsi = [50, 9, 5, 11, 8, 95, 91, 89, 92, 50]
-    want = [0, 1, 0, 0, 1, -1, 0, 0, -1, 0]  # in, stay, out, in again; the same above 90
     df = pl.DataFrame({'20_sma_rsi_1': [1 - r / 50 for r in rsi]})  # the stored scale: -(RSI / 50 - 1)
-    out = rsi_signals(df, low=10, high=90, freq='1')
-    assert out['side'].to_list() == want
-    assert out['rsi_1'].to_list() == pytest.approx(rsi)
+    long, short = rsi_long(freq='1', level=10), rsi_short(freq='1', level=90)
+    assert long.signals(df)['side'].to_list() == [0, 1, 1, 0, 1, 0, 0, 0, 0, 0]  # every bar below 10
+    assert short.signals(df)['side'].to_list() == [0, 0, 0, 0, 0, -1, -1, 0, -1, 0]  # every bar above 90
+    assert (long.name, short.name) == ('rsi_long_1_10', 'rsi_short_1_90')
+    assert long.columns == ('20_sma_rsi_1',) and long.params == {'freq': '1', 'level': 10}
 
 
-def test_rsi_strategy_and_the_configured_run():
+def test_expand_and_the_configured_run():
     from backtesting import config
-    from backtesting.strategy import Strategy, rsi
-    s = rsi(10, 90, freq='1')
-    assert s.name == 'rsi_10_90' and s.columns == ('20_sma_rsi_1',)
-    assert (rsi(low=5, freq='1').name, rsi(high=95, freq='1').name) == ('rsi_long_5', 'rsi_short_95')
-    assert rsi(low=5, freq='1').params == {'rsi_low': 5, 'rsi_high': None}
-    assert config.STRATEGIES and all(isinstance(s, Strategy) for s in config.STRATEGIES)
+    from backtesting.strategy import Strategy, expand, rsi_long
+    got = expand({rsi_long: {'freq': ['1', '5'], 'params': {'level': [5, 10]}}})
+    assert [s.name for s in got] == ['rsi_long_1_5', 'rsi_long_1_10', 'rsi_long_5_5', 'rsi_long_5_10']
+    assert got[3].columns == ('20_sma_rsi_5',)
+    configured = expand(config.SIGNALS)
+    assert configured and all(isinstance(s, Strategy) for s in configured)
+    assert len({s.name for s in configured}) == len(configured)
+    assert callable(config.ENSEMBLE) and callable(config.STOP)
 
 
-def test_pairs_in_one_walk_equal_one_walk_per_pair(market, stops, tmp_path):
+def test_ensemble_function_votes_among_the_active_signals():
+    from backtesting.ensemble import ensemble_function
+    rows = [[1, 1, 1, 0, 0, 0, 0, 0, 0, 0],        # 3 of 3 long: 1
+            [1, 1, -1, -1, 1, 0, 0, 0, 0, 0],      # +1 of 5 active (< 30%): 0
+            [-1, -1, -1, 1, 0, 0, 0, 0, 0, 0],     # -2 of 4: -1
+            [0] * 10,                              # none active: 0
+            [1, -1, 0, 0, 0, 0, 0, 0, 0, 0],       # 0 of 2: 0
+            [1, 1, 1, -1, -1, -1, -1, -1, -1, -1],  # -4 of 10: -1
+            [1, 1, 1, 1, -1, -1, -1, -1, -1, -1]]   # -2 of 10 (> -30%): 0
+    names = [f's{i}' for i in range(10)]
+    df = pl.DataFrame(rows, schema={n: pl.Int8 for n in names}, orient='row')
+    assert df.select(side=ensemble_function(df, names))['side'].to_list() == [1, 0, -1, 0, 0, -1, 0]
+
+
+def test_ensemble_side_is_the_trigger_bar_only():
+    from backtesting.ensemble import ensemble_function
+    from backtesting.strategy import ensemble, rsi_long, rsi_short
+    rsi = [50, 9, 5, 8, 50, 9, 95, 91, 50]
+    df = pl.DataFrame({'20_sma_rsi_1': [1 - r / 50 for r in rsi]})
+    e = ensemble([rsi_long(freq='1', level=10), rsi_short(freq='1', level=90)], ensemble_function)
+    out = e.signals(df)
+    assert out['rsi_long_1_10'].to_list() == [0, 1, 1, 1, 0, 1, 0, 0, 0]  # the signals stay states
+    assert out['rsi_short_1_90'].to_list() == [0, 0, 0, 0, 0, 0, -1, -1, 0]
+    assert out['side'].to_list() == [0, 1, 0, 0, 0, 1, -1, 0, 0]  # the vote only where it turns 1 / -1
+    assert (e.name, e.columns, e.keep) == ('ensemble_function', ('20_sma_rsi_1',), ('rsi_long_1_10', 'rsi_short_1_90'))
+
+
+def test_opposite_signal_exits_at_the_next_open_and_reverses(market, stops, tmp_path):
+    from backtesting.backtest import add_costs, one_at_a_time
+    df = read_training_data(training(market, tmp_path))
+    side = np.zeros(len(df), np.int8)
+    side[[100, 103]] = 1   # the second long is skipped: the first is still open
+    side[105] = -1         # the opposite signal: the long exits at row 106's first tick, the short enters there
+    df = df.with_columns(side=pl.Series(side), tp=pl.lit(10_000), sl=pl.lit(10_000))  # levels never hit
+    trades = add_costs(one_at_a_time(find_exits(stops, df)))
+    start = df['start_ind'].to_numpy()
+    long, short = trades.row(0, named=True), trades.row(1, named=True)
+    assert trades['row'].to_list()[:2] == [100, 105]
+    assert (long['result'], long['exit_row'], long['exit_ts']) == (2, 105, df['ts'][106])
+    assert long['exit_px'] == stops.price(start[106]) == short['entry_px']
+    assert long['net_units'] == long['pnl'] - 2  # a market exit: slippage on both fills
+
+
+def test_grid_in_one_walk_equals_one_walk_per_pair(market, stops, tmp_path):
+    from backtesting.stops import grid
     df = read_training_data(training(market, tmp_path))
     side = np.zeros(len(df), np.int8)
     side[np.random.default_rng(2).choice(len(df), 300, replace=False)] = 1
     df = df.with_columns(side=pl.Series(side) * np.where(np.arange(len(df)) % 2, 1, -1).astype(np.int8))
-    pairs = [(4, 8), (16, 4), (40, 40)]
-    one = find_exits(stops, df, pairs=pairs).sort('tp', 'sl', 'row')
+    one = find_exits(stops, df, stop=grid(tp=[4, 16], sl=[8, 40])).sort('tp', 'sl', 'row')
     each = pl.concat([find_exits(stops, df.with_columns(tp=pl.lit(tp, pl.Int64), sl=pl.lit(sl, pl.Int64)))
-                      for tp, sl in pairs]).sort('tp', 'sl', 'row')
-    assert len(one) > 0 and one.equals(each)
+                      .with_columns(stops=pl.lit(f'{tp}/{sl}')) for tp in [4, 16] for sl in [8, 40]])
+    assert len(one) > 0 and one.equals(each.select(one.columns).sort('tp', 'sl', 'row'))
 
 
-def test_rsi_one_side_only():
-    from backtesting.strategy import rsi_signals
-    rsi = [50, 9, 50, 95, 50]
-    df = pl.DataFrame({'20_sma_rsi_1': [1 - r / 50 for r in rsi]})
-    assert rsi_signals(df, 10, None, '1')['side'].to_list() == [0, 1, 0, 0, 0]
-    assert rsi_signals(df, None, 90, '1')['side'].to_list() == [0, 0, 0, -1, 0]
+def test_a_stop_function_is_its_own_run(market, stops, tmp_path):
+    from backtesting.stops import grid
+    df = read_training_data(training(market, tmp_path))
+    side = np.zeros(len(df), np.int8)
+    side[np.random.default_rng(4).choice(len(df), 200, replace=False)] = 1
+    df = df.with_columns(side=pl.Series(side))
+
+    def fixed(signals):
+        return signals.with_columns(tp=pl.lit(8, pl.Int64), sl=pl.lit(4, pl.Int64))
+
+    mine = find_exits(stops, df, stop=fixed)
+    assert mine['stops'].unique().to_list() == ['fixed']
+    assert mine.drop('stops').equals(find_exits(stops, df, stop=grid(tp=[8], sl=[4])).drop('stops'))
 
 
 def test_freq_5_rows_are_each_bars_first_appearance(market, tmp_path):

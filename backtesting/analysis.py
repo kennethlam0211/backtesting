@@ -1,8 +1,8 @@
 """
-Downstream of the backtest: queries its one table of trades (params.TRADES_PATH, every strategy x TP / SL pair) for
-the leaderboard and the label analysis (where the net edge sits: hour, session, regular hours, news, weekday, side,
-volatility, and each label crossed with side; and whether it holds up), then reports the final run with its
-statistics and charts.
+Downstream of the backtest: queries its one table of trades (params.TRADES_PATH, every strategy x stops, e.g. each
+TP / SL pair) for the leaderboard and the label analysis (where the net edge sits: hour, session, regular hours, news,
+side, volatility, year, month, and each label crossed with side; and whether it holds up), then reports the final run
+with its statistics and charts.
 
     python -m backtesting.backtest && python -m backtesting.analysis
         results/analysis/*.png               hours, labels, stability
@@ -10,12 +10,12 @@ statistics and charts.
     and prints the leaderboard, the chance check, the best slices and the final run by side.
 
 No tables are written: they are all queries of the one trades table. For queries of your own:
-    trades = load_trades()                                               # + weekday, year, volatility bucket
-    BacktestStats.grid(trades, by=('strategy', 'tp', 'sl'))              # the leaderboard
+    trades = load_trades()                                               # + volatility bucket
+    BacktestStats.grid(trades, by=('strategy', 'stops'))                 # the leaderboard
     slices(trades), pooled(trades)                                       # per label value
     BacktestStats(trades.filter(...)).by_side() / .by_period('month') / .rolling() / .by_label('hour')
 
-A slice is one strategy x TP/SL pair x label value (e.g. rsi_15_85, TP 40 SL 24, hour 13). Per slice: trades, gross
+A slice is one strategy x stops x label value (e.g. ensemble_function, 40/24, hour 13). Per slice: trades, gross
 and net $ per trade, win rate, the t-stat of the net per trade, the net before / from config.SPLIT and the years it
 was net positive. Thousands of slices are tested, so some look good by chance; the summary compares what passes with
 what chance alone would give, and checks whether slices picked before SPLIT stay positive after it.
@@ -49,20 +49,18 @@ from backtesting.stats import BacktestStats
 from params import RESULTS_DIR, TRADES_PATH, TRAINING_DATA_PATH
 
 # Single labels, then each label crossed with the side
-LABELS = [*LABEL_COLS, *[f'{c}_q' for c in LABEL_FEATURES], 'weekday', 'side']
+LABELS = [*LABEL_COLS, *[f'{c}_q' for c in LABEL_FEATURES], 'year', 'month', 'side']
 SLICES = [[c] for c in LABELS] + [[c, 'side'] for c in LABELS if c != 'side']
 MIN_TRADES = 50  # per half, for a slice to be judged
-WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri']
 
 
 def load_trades(path=TRADES_PATH) -> pl.DataFrame:
     """
-    The backtest's trades (every strategy x TP / SL pair, one table) plus `weekday` (1 Mon .. 5 Fri), `year` and the
-    config.LABEL_FEATURES at the signal bar (raw and as quantile `_q`). Labels and side as Int64.
+    The backtest's trades (every strategy x stops, one table) plus the config.LABEL_FEATURES at the signal bar as
+    quantile `_q`. Labels, year, month and side as Int64.
     """
     trades = pl.read_parquet(path).with_columns(
-        pl.col(LABEL_COLS).cast(pl.Int64), side=pl.col('side').cast(pl.Int64),
-        weekday=pl.col('date').dt.weekday().cast(pl.Int64), year=pl.col('date').dt.year(),
+        pl.col(LABEL_COLS).cast(pl.Int64), pl.col('year', 'month').cast(pl.Int64), side=pl.col('side').cast(pl.Int64),
     )
     # The trades carry each feature from their signal bar (known when the order goes in); here only its bucket
     return trades.with_columns([
@@ -78,21 +76,24 @@ def sessions_of(trades: pl.DataFrame) -> pl.Series:
 
 def final_report(trades: pl.DataFrame, board: pl.DataFrame, sessions, final=FINAL, out_dir=None):
     """
-    The final run: config.FINAL (strategy name, tp, sl), else the leaderboard's best by total net. Draws its charts
-    and its strategy's TP x SL heatmaps in out_dir (default results/final/); returns (strategy, tp, sl) and its
-    BacktestStats for the tables.
+    The final run: config.FINAL (strategy name, stops), else the leaderboard's best by total net. Draws its charts
+    in out_dir (default results/final/), and its strategy's TP x SL heatmaps when every stops of it is one fixed pair
+    (a grid); returns (strategy, stops) and its BacktestStats for the tables.
     """
     out_dir = out_dir or os.path.join(RESULTS_DIR, 'final')
-    strategy, tp, sl = final or board.select('strategy', 'tp', 'sl').row(0)
-    run = trades.filter((pl.col('strategy') == strategy) & (pl.col('tp') == tp) & (pl.col('sl') == sl))
+    strategy, stops = final or board.select('strategy', 'stops').row(0)
+    run = trades.filter((pl.col('strategy') == strategy) & (pl.col('stops') == stops))
     if run.is_empty():
-        raise ValueError(f"no trades for {(strategy, tp, sl)} in {TRADES_PATH}: check config.FINAL")
+        raise ValueError(f"no trades for {(strategy, stops)} in {TRADES_PATH}: check config.FINAL")
     stats = BacktestStats(run, sessions)
-    BacktestPlots(stats, out_dir, title=f'{strategy}, TP {tp} SL {sl}').all()
-    grid = board.filter(pl.col('strategy') == strategy)
-    for value in ('total_net_usd', 'sharpe'):
-        BacktestPlots.grid_heatmap(grid, value, out_dir, title=f'{strategy}: {value} by TP (y) and SL (x)')
-    return (strategy, tp, sl), stats
+    BacktestPlots(stats, out_dir, title=f'{strategy}, stops {stops}').all()
+    pairs = (trades.filter(pl.col('strategy') == strategy).group_by('stops')
+             .agg(pl.col('tp').first(), pl.col('sl').first(), fixed=(pl.col('tp').n_unique() == 1) & (pl.col('sl').n_unique() == 1)))
+    if len(pairs) > 1 and pairs['fixed'].all():
+        grid = board.filter(pl.col('strategy') == strategy).join(pairs.drop('fixed'), on='stops')
+        for value in ('total_net_usd', 'sharpe'):
+            BacktestPlots.grid_heatmap(grid, value, out_dir, title=f'{strategy}: {value} by TP (y) and SL (x)')
+    return (strategy, stops), stats
 
 
 def feature_cuts(features=LABEL_FEATURES) -> dict:
@@ -118,20 +119,20 @@ def _stats() -> list[pl.Expr]:
 
 
 def slices(trades: pl.DataFrame, split=SPLIT) -> pl.DataFrame:
-    """One row per strategy x tp x sl x slice (label, value): _stats() plus the halves and the years positive."""
+    """One row per strategy x stops x slice (label, value): _stats() plus the halves and the years positive."""
     late = pl.col('date') >= datetime.date.fromisoformat(split)
     out = []
     for cols in SLICES:
-        keys = ['strategy', 'tp', 'sl', *cols]
+        keys = ['strategy', 'stops', *cols]
         halves = trades.group_by(keys).agg(
             *_stats(),
             trades_before=(~late).sum(), net_before=pl.col('net_usd').filter(~late).sum(),
             trades_after=late.sum(), net_after=pl.col('net_usd').filter(late).sum(),
         )
-        years = (trades.group_by(*keys, 'year').agg(pl.col('net_usd').sum())
+        years = (trades.group_by(*dict.fromkeys([*keys, 'year'])).agg(pl.col('net_usd').sum())  # a year slice: once
                  .group_by(keys).agg(years=pl.len(), years_positive=(pl.col('net_usd') > 0).sum()))
         out.append(halves.join(years, on=keys).select(
-            'strategy', 'tp', 'sl',
+            'strategy', 'stops',
             pl.lit(' x '.join(cols)).alias('label'),
             pl.concat_str([pl.col(c).cast(pl.Utf8) for c in cols], separator=' / ').alias('value'),
             *[c for c in halves.columns if c not in keys], 'years', 'years_positive',
@@ -140,7 +141,7 @@ def slices(trades: pl.DataFrame, split=SPLIT) -> pl.DataFrame:
 
 
 def pooled(trades: pl.DataFrame) -> pl.DataFrame:
-    """Per strategy x label value, all TP / SL pairs pooled: the label's net edge whatever the exits."""
+    """Per strategy x label value, all stops pooled: the label's net edge whatever the exits."""
     return pl.concat([
         trades.group_by('strategy', label).agg(*_stats()).select(
             'strategy', pl.lit(label).alias('label'), pl.col(label).alias('value'), pl.exclude('strategy', label))
@@ -196,10 +197,10 @@ def _heatmap(ax, matrix, xlabels, ylabels, title):
 
 
 def plot_hours(p: pl.DataFrame, names, out_dir):
-    """hours.png: net $ per trade by hour (pooled over the pairs), one row per strategy, all trades / long / short."""
+    """hours.png: net $ per trade by hour (pooled over the stops), one row per strategy, all trades / long / short."""
     hours = list(range(23))
     fig, axes = plt.subplots(3, 1, figsize=(14, 9), sharex=True)
-    fig.suptitle('Net $ per trade by hour (shifted clock; New York = hour - 6), all TP / SL pairs pooled',
+    fig.suptitle('Net $ per trade by hour (shifted clock; New York = hour - 6), all stops pooled',
                  color=TEXT_PRI, fontsize=12, x=0.01, ha='left')
     for ax, (title, side) in zip(axes, [('All trades', None), ('Long', 1), ('Short', -1)]):
         m = np.full((len(names), len(hours)), np.nan)
@@ -217,16 +218,21 @@ def plot_hours(p: pl.DataFrame, names, out_dir):
 
 def plot_labels(p: pl.DataFrame, names, out_dir, per_row=6):
     """
-    labels.png: net $ per trade by session, regular hours, news, weekday, side and volatility (pairs pooled), per
-    strategy; one row of panels per `per_row` strategies (config order: the longs, then the shorts), each its legend.
+    labels.png: net $ per trade by session, regular hours, news, side, volatility, year and month (stops pooled), per
+    strategy; one row of panels per `per_row` strategies (in the trades' order), each its legend. A panel's width
+    follows its number of values.
     """
     panels = [('session', {1: 'Asia', 2: 'Europe', 3: 'US'}), ('rth', {0: 'outside RTH', 1: 'RTH'}),
-              (f'news_{FREQ}', {0: 'no news', 1: 'news window'}), ('weekday', dict(enumerate(WEEKDAYS, 1))),
+              (f'news_{FREQ}', {0: 'no news', 1: 'news window'}),
               ('side', {-1: 'short', 1: 'long'}),
-              *[(f'{c}_q', {i: f'Q{i}' for i in range(1, n + 1)}) for c, n in LABEL_FEATURES.items()]]
+              *[(f'{c}_q', {i: f'Q{i}' for i in range(1, n + 1)}) for c, n in LABEL_FEATURES.items()],
+              ('year', {y: f"'{y % 100:02d}" for y in sorted(p.filter(pl.col('label') == 'year')['value'].unique())}),
+              ('month', {m: str(m) for m in range(1, 13)})]
     groups = [names[k:k + per_row] for k in range(0, len(names), per_row)]
-    fig, axes = plt.subplots(len(groups), len(panels), figsize=(18, 4.2 * len(groups)), sharey=True, squeeze=False)
-    fig.suptitle('Net $ per trade by label, all TP / SL pairs pooled', color=TEXT_PRI, fontsize=12, x=0.01, ha='left')
+    widths = [len(names_of) + 1 for _, names_of in panels]
+    fig, axes = plt.subplots(len(groups), len(panels), figsize=(max(18, 0.55 * sum(widths)), 4.2 * len(groups)),
+                             sharey=True, squeeze=False, gridspec_kw={'width_ratios': widths})
+    fig.suptitle('Net $ per trade by label, all stops pooled', color=TEXT_PRI, fontsize=12, x=0.01, ha='left')
     for row, group in zip(axes, groups):
         width = 0.8 / len(group)
         for ax, (label, names_of) in zip(row, panels):
@@ -258,14 +264,14 @@ def plot_stability(s: pl.DataFrame, trades: pl.DataFrame, out_dir, top=6):
     fig.suptitle('Net $ per year: the best slices positive before and after the split', color=TEXT_PRI, fontsize=12,
                  x=0.01, ha='left')
     for ax, row in zip(axes[0], best.iter_rows(named=True)):
-        cond = (pl.col('strategy') == row['strategy']) & (pl.col('tp') == row['tp']) & (pl.col('sl') == row['sl'])
+        cond = (pl.col('strategy') == row['strategy']) & (pl.col('stops') == row['stops'])
         for col, v in zip(row['label'].split(' x '), row['value'].split(' / ')):
             cond &= pl.col(col) == int(v)
         y = trades.filter(cond).group_by('year').agg(pl.col('net_usd').sum()).sort('year')
         net = y['net_usd'].to_numpy()
         ax.bar(y['year'].to_list(), net, color=np.where(net >= 0, CATEGORICAL[0], CATEGORICAL[7]), width=0.8, zorder=3)
         ax.axhline(0, color=BASELINE, linewidth=0.8, zorder=2)
-        ax.set_title(f"{row['strategy']} TP {row['tp']} SL {row['sl']}\n{row['label']} = {row['value']}",
+        ax.set_title(f"{row['strategy']} stops {row['stops']}\n{row['label']} = {row['value']}",
                      color=TEXT_SEC, fontsize=9, loc='left')
         _style(ax)
     fig.tight_layout()
@@ -278,7 +284,7 @@ def main():
     sessions = sessions_of(trades)
     out_dir = os.path.join(RESULTS_DIR, 'analysis')
     os.makedirs(out_dir, exist_ok=True)
-    board = BacktestStats.grid(trades, by=('strategy', 'tp', 'sl'), sessions=sessions)
+    board = BacktestStats.grid(trades, by=('strategy', 'stops'), sessions=sessions)
     s = slices(trades)
     p = pooled(trades)
     # pooled() keeps one `value` column; the label x side rows are rebuilt here for the hour chart
@@ -292,13 +298,13 @@ def main():
     plot_hours(both, names, out_dir)
     plot_labels(p, names, out_dir)
     plot_stability(s, trades, out_dir)
-    (strategy, tp, sl), stats = final_report(trades, board, sessions)
+    (strategy, stops), stats = final_report(trades, board, sessions)
 
     c = chance_check(s)
     print(f"{len(trades):,} trades, {len(board)} runs ({TRADES_PATH}); {len(s):,} label slices")
     with pl.Config(tbl_rows=10, tbl_cols=-1, float_precision=1, tbl_width_chars=220):
         print("\nLeaderboard by total net:")
-        print(board.select('strategy', 'tp', 'sl', 'trades', 'win_rate', 'total_gross_usd', 'total_cost_usd',
+        print(board.select('strategy', 'stops', 'trades', 'win_rate', 'total_gross_usd', 'total_cost_usd',
                            'total_net_usd', 'max_drawdown_usd', 'sharpe').head(10))
     print(f"Judged (>= {MIN_TRADES} trades each side of {SPLIT}): {c['slices']:,}; net positive before {c['positive_before']:,}, "
           f"after {c['positive_after']:,}, both {c['positive_both']:,} (chance alone: {c['expected_both_by_chance']:.0f})")
@@ -307,9 +313,9 @@ def main():
     with pl.Config(tbl_rows=15, tbl_cols=-1, float_precision=1, tbl_width_chars=220):
         good = s.filter((pl.col('trades_before') >= MIN_TRADES) & (pl.col('trades_after') >= MIN_TRADES)
                         & (pl.col('net_before') > 0) & (pl.col('net_after') > 0))
-        print(good.select('strategy', 'tp', 'sl', 'label', 'value', 'trades', 'net_per_trade', 'win_rate', 't_net',
+        print(good.select('strategy', 'stops', 'label', 'value', 'trades', 'net_per_trade', 'win_rate', 't_net',
                           'net_before', 'net_after', 'years_positive', 'years').head(15))
-        print(f"\nFinal run {strategy}, TP {tp} SL {sl} ({RESULTS_DIR}/final/):")
+        print(f"\nFinal run {strategy}, stops {stops} ({RESULTS_DIR}/final/):")
         print(stats.by_side().select('side', 'trades', 'win_rate', 'total_gross_usd', 'total_net_usd', 'profit_factor',
                                      'max_drawdown_usd', 'sharpe'))
 

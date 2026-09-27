@@ -21,6 +21,8 @@ import polars as pl
 from matplotlib import ticker
 from matplotlib.colors import LinearSegmentedColormap, Normalize, TwoSlopeNorm
 
+from backtesting.config import FLAT_AT
+
 # Chart chrome and ink
 BG = '#fcfcfb'
 TEXT_PRI = '#0b0b0b'
@@ -30,7 +32,7 @@ GRID = '#e1e0d9'
 BASELINE = '#c3c2b7'
 # Categorical slots, in order: net / take-profit, gross / stop-loss, session end
 CATEGORICAL = ['#2a78d6', '#eb6834', '#1baf7a', '#eda100', '#e87ba4', '#008300', '#4a3aa7', '#e34948']  # fixed order
-SLOT = CATEGORICAL[:3]
+SLOT = CATEGORICAL[:4]
 NET, GROSS = SLOT[0], SLOT[1]
 # Diverging pair around 0
 BLUE, RED, NEUTRAL = '#2a78d6', '#e34948', '#f0efec'
@@ -165,14 +167,15 @@ class BacktestPlots:
     def trade_distribution(self) -> pathlib.Path:
         """trade_pnl.png: histogram of net PnL per trade, one panel per exit type, on a shared $ axis."""
         # Shared $ axis; each panel its own count axis (take-profits can outnumber time exits 100 to 1)
-        fig, axes = plt.subplots(1, 3, figsize=(12, 4), sharex=True)
+        fig, axes = plt.subplots(1, 4, figsize=(16, 4), sharex=True)
         fig.suptitle(self._title('Net PnL per trade, by exit'), color=TEXT_PRI, fontsize=12, x=0.01, ha='left')
         trades = self.stats.trades
-        # One set of bins for the three panels: with fixed TP / SL a panel can hold a single value, which per-panel
+        # One set of bins for the four panels: with fixed TP / SL a panel can hold a single value, which per-panel
         # bins would squeeze into an invisible sliver
         edges = np.histogram_bin_edges(trades['net_usd'].to_numpy(), bins=40) if len(trades) else 40
         for ax, (code, name, color) in zip(axes, [(1, 'Take-profit', SLOT[0]), (-1, 'Stop-loss', SLOT[1]),
-                                                  (0, 'Time exit (22:59) / close', SLOT[2])]):
+                                                  (2, 'Opposite signal', SLOT[2]),
+                                                  (0, f'Time exit ({FLAT_AT}) / close', SLOT[3])]):
             subset = trades.filter(pl.col('result') == code)['net_usd'].to_numpy()
             if len(subset):
                 ax.hist(subset, bins=edges, color=color, edgecolor='none', rwidth=0.8, zorder=3)
