@@ -23,6 +23,9 @@ fonttools==4.66.0
 kiwisolver==1.5.1
 pillow==12.3.0
 pyparsing==3.3.3
+# backtesting/ml_*.py
+lightgbm==4.7.0
+scipy==1.18.1
 
 # utils/ (logging to Mongo, Telegram, ZeroMQ); versions not pinned yet
 pymongo

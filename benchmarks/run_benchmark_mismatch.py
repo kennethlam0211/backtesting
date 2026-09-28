@@ -5,14 +5,14 @@ import numpy as np
 from rich.console import Console
 
 from stop_search import StopSearch
-from benchmarks.benchmark_search import PRICE_COL, make_queries
+from benchmarks.benchmark_search import make_queries
 
 console = Console()
 
 
-def brute_force_search(data: np.ndarray, start_idx: int, end_idx: int, upper: int, lower: int):
+def brute_force_search(prices: np.ndarray, start_idx: int, end_idx: int, upper: int, lower: int):
     for i in range(start_idx, end_idx):
-        price = data[i, PRICE_COL]
+        price = int(prices[i])
         if price >= upper:
             return i, 1
         if price <= lower:
@@ -36,7 +36,7 @@ def main():
     array_sides = stops.first_hit_many(freq, starts, uppers, lowers)
 
     for q, (idx, end_idx, tp, sl) in enumerate(zip(starts.tolist(), ends.tolist(), uppers.tolist(), lowers.tolist())):
-        hit_idx, bf_side = brute_force_search(data, idx, end_idx, tp, sl)
+        hit_idx, bf_side = brute_force_search(data['price'], idx, end_idx, tp, sl)
         single_side = stops.first_hit(freq, idx, tp, sl)
         array_side = int(array_sides[q])
 
@@ -62,7 +62,7 @@ def main():
                 marker = " <-- START" if j == idx else ""
                 if j == hit_idx:
                     marker += " <-- BF FIRST HIT"
-                print(f"{j:<5} | {data[j, PRICE_COL]}{marker}")
+                print(f"{j:<5} | {data['price'][j]}{marker}")
 
             print("="*50 + "\n")
             return

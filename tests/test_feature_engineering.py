@@ -21,7 +21,8 @@ from params import UD_PIVOTS
 from stop_search.params import PARQUET_FREQS
 
 SESSIONS = ["2024-03-04", "2024-03-05", "2024-03-06"]
-FREQS = ["1", "15", "60", "day"]
+FREQS = ["1", "15", "60", "session", "day"]
+LENGTH = {"session": 8 * 3600, "day": 24 * 3600}  # seconds; other freqs are minutes
 
 
 def raw_session(date, rng):
@@ -127,10 +128,10 @@ def test_bollinger_bands_are_2_sigma(data_dir):
         np.testing.assert_allclose(new["20_bband_lower_1"], sma - 2 * std)
 
 
-@pytest.mark.parametrize("freq", ["15", "60", "day"])
+@pytest.mark.parametrize("freq", ["15", "60", "session", "day"])
 def test_higher_freq_bar_appears_when_it_closes(data_dir, merged, freq):
     bars = pd.read_parquet(data_dir / f"{freq}_ohlcv.parquet").sort_values("ts").reset_index(drop=True)
-    length = 24 * 3600 if freq == "day" else int(freq) * 60
+    length = LENGTH.get(freq) or int(freq) * 60
     closes = np.minimum(seconds(bars) + length, seconds(bars) // 86400 * 86400 + 23 * 3600)  # sessions end at 23:00
 
     rows = seconds(merged).to_numpy()
@@ -140,8 +141,26 @@ def test_higher_freq_bar_appears_when_it_closes(data_dir, merged, freq):
     got = merged[f"close_{freq}"].to_numpy(float)
     np.testing.assert_array_equal(got, expected)
 
-    if freq != "day":  # and the join really was tested across gaps: some bars close in a minute without trades
+    if freq not in LENGTH:  # and the join really was tested across gaps: some bars close in a minute without trades
         assert not np.isin(closes - 60, rows).all()
+
+
+def test_session_bars_group_each_date_by_session(data_dir):
+    # One bar per (session date, session): Asia 00-08, Europe 08-16, US 16-23 on the shifted clock
+    bars = pd.read_parquet(data_dir / "session_ohlcv.parquet").sort_values("ts").reset_index(drop=True)
+    ticks = pd.concat(TICKS.values(), ignore_index=True)
+    g = ticks.groupby([ticks["ts"].dt.date, "session"])
+    expected = pd.DataFrame({"open": g["price"].first(), "high": g["price"].max(), "low": g["price"].min(),
+                             "close": g["price"].last(), "volume": g["volume"].sum()}).reset_index()
+    assert len(bars) == 3 * len(SESSIONS) and list(bars["session"]) == list(expected["session"])
+    starts = pd.to_datetime(expected["ts"]) + (expected["session"] - 1) * pd.Timedelta(hours=8)
+    np.testing.assert_array_equal(bars["ts"].to_numpy("datetime64[s]"), starts.to_numpy("datetime64[s]"))
+    for col in ("open", "high", "low", "close", "volume"):
+        np.testing.assert_array_equal(bars[col].to_numpy(np.int64), expected[col].to_numpy(np.int64), err_msg=col)
+    # start_ind: each bar's first tick row within its session (write_bars leaves them local, before tick.dat's offset)
+    row = ticks.groupby(ticks["ts"].dt.date).cumcount()
+    firsts = row[ticks.groupby([ticks["ts"].dt.date, "session"]).cumcount() == 0]
+    np.testing.assert_array_equal(bars["start_ind"].to_numpy(), firsts.to_numpy())
 
 
 def test_day_bar_waits_for_the_session_end(merged):
@@ -161,7 +180,7 @@ def cutoffs():
     ts = TICKS[SESSIONS[1]]["ts"]
     sec = ((ts - ts.dt.normalize()).dt.total_seconds()).astype(int).to_numpy()
     out = []
-    for minutes in (15, 60, 23 * 60):  # the day bar ends with the session at 23:00
+    for minutes in (15, 60, 8 * 60, 23 * 60):  # session bars end at 08:00 and 16:00; the day bar at 23:00
         length = minutes * 60
         last_minute = sec % length >= length - 60
         found = 0

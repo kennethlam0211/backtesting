@@ -9,11 +9,12 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from numba import njit
 from rich.console import Console
 from rich.traceback import install
 
 # Bar sizes and the tick.dat column layout are shared with the reader (stop_search.StopSearch)
-from stop_search.params import FREQS, PARQUET_FREQS, DAT_COLS
+from stop_search.params import DAT_COLS, DAT_DTYPE, ENTRY_COLS, ENTRY_LATENCY_MS, FREQS, PARQUET_FREQS
 from params import DATA_PATH
 
 install()
@@ -32,6 +33,8 @@ BAR_DTYPE = [
     ('session', 'i1'), ('hour', 'i8'),
     ('news_fomc', 'i1'), ('news_nfp', 'i1'), ('news_cpi', 'i1'), ('news_ppi', 'i1'), ('news_gdp', 'i1')
 ]
+# The 1-min bars also carry the limit-entry columns (stop_search.params.ENTRY_COLS)
+BAR_DTYPE_1 = BAR_DTYPE + [(c, 'i8') for c in ENTRY_COLS]
 
 
 def to_unix_epoch(ts: pd.Series) -> pd.Series:
@@ -41,6 +44,44 @@ def to_unix_epoch(ts: pd.Series) -> pd.Series:
     as absolute time for storage.
     """
     return (ts.astype('datetime64[ns]').astype('int64') // 1_000_000_000)
+
+@njit(cache=True)
+def _entry_fills(price, ts_ns, starts, ends, arrive):
+    """
+    Per bar [starts[i], ends[i]): a limit order at the bar's open p reaching the market at arrive[i] (ns), as
+    ENTRY_COLS: the highest / lowest trade before arrive[i] (p when there is none); then for a buy (columns 2-4) and a
+    sell (5-7): the fill (the first trade from arrive[i] if it is at p or better; if it is worse, p when price comes back
+    to p before the bar ends; else 0) and the highest / lowest trade from arrive[i] until that return (the fill itself
+    when at once; to the bar's end when price never comes back; p when no trade comes after arrive[i]).
+    """
+    out = np.zeros((len(starts), 8), dtype=np.int64)
+    for i in range(len(starts)):
+        s, e = starts[i], ends[i]
+        p = price[s]
+        a = s
+        while a < e and ts_ns[a] < arrive[i]:  # the first trade the order can meet
+            a += 1
+        hi = lo = p
+        for t in range(s, a):  # during the latency
+            hi = max(hi, price[t])
+            lo = min(lo, price[t])
+        out[i, 0], out[i, 1] = hi, lo
+        for k in range(2):
+            fill, hi, lo = 0, p, p
+            if a < e:
+                hi = lo = price[a]
+                if (k == 0 and price[a] <= p) or (k == 1 and price[a] >= p):
+                    fill = price[a]  # at once, at this price
+                else:
+                    for t in range(a + 1, e):
+                        if (k == 0 and price[t] <= p) or (k == 1 and price[t] >= p):
+                            fill = p  # back to the open: the limit fills there
+                            break
+                        hi = max(hi, price[t])
+                        lo = min(lo, price[t])
+            out[i, 2 + 3 * k], out[i, 3 + 3 * k], out[i, 4 + 3 * k] = fill, hi, lo
+    return out
+
 
 def process_session(session_df: pd.DataFrame, session_date: datetime.date) -> tuple[pd.DataFrame, dict[str, np.ndarray], int]:
     """
@@ -52,6 +93,8 @@ def process_session(session_df: pd.DataFrame, session_date: datetime.date) -> tu
     """
     # Ticks arrive already merged from step 1, ts in whole seconds; work in ns internally
     merged_ts = session_df['ts'].values.astype('datetime64[ns]').astype(np.int64)
+    # The full ns times (step 1's ts_ns) for the entry columns; a step-1 file without them: whole seconds
+    merged_ts_ns = session_df['ts_ns'].values.astype(np.int64) if 'ts_ns' in session_df.columns else merged_ts
     merged_vol = session_df['volume'].values.astype(np.int64)
 
     # Extract news flags from tick data
@@ -68,7 +111,8 @@ def process_session(session_df: pd.DataFrame, session_date: datetime.date) -> tu
 
     sess_len = len(merged_ts)
 
-    # Price storage: step 1 stores price x4 (0.25-pt ticks) as int32; widened to int64 here for tick.dat.
+    # Price storage: step 1 stores price x4 (0.25-pt ticks) as int32; int64 while processing, uint16 in tick.dat
+    # (offset_session checks it fits).
     # Bar open/high/low/close go back to int32 in the OHLCV parquet files.
     merged_price = session_df['price'].values.astype(np.int64)
 
@@ -91,10 +135,14 @@ def process_session(session_df: pd.DataFrame, session_date: datetime.date) -> tu
         bar_cols[f'low_{freq}'] = np.zeros(sess_len, dtype=np.int64)
         bar_cols[f'next_ind_{freq}'] = np.zeros(sess_len, dtype=np.int64)
 
-    for freq in FREQS:
+    for freq in dict.fromkeys(FREQS + PARQUET_FREQS):  # 'session' is in the bar files only
         if freq == "day":
             bar_key = np.zeros(sess_len, dtype=np.int64)
             f_ns = 24 * 3600 * 1_000_000_000
+        elif freq == "session":
+            # Grouped by the ticks' session within the date: session k covers hours [8(k-1), 8k) (step 1: hour // 8 + 1)
+            bar_key = merged_session.astype(np.int64) - 1
+            f_ns = 8 * 3600 * 1_000_000_000
         elif freq.endswith("s"):  # second bars, e.g. "1s", "15s"
             f_ns = int(freq[:-1]) * 1_000_000_000
             bar_key = (merged_ts - day0) // f_ns
@@ -108,8 +156,9 @@ def process_session(session_df: pd.DataFrame, session_date: datetime.date) -> tu
         ends = np.r_[starts[1:], sess_len]
         num_bars = len(starts)
 
+        dtype = BAR_DTYPE_1 if freq == "1" else BAR_DTYPE
         if num_bars == 0:
-            resampled_res[freq] = np.zeros(0, dtype=BAR_DTYPE)
+            resampled_res[freq] = np.zeros(0, dtype=dtype)
             continue
 
         bar_labels = day0 + bar_key[starts] * f_ns
@@ -152,15 +201,16 @@ def process_session(session_df: pd.DataFrame, session_date: datetime.date) -> tu
 
 
         # Fill the bar columns on each bar's first row (local indices)
-        bar_cols[f'high_{freq}'][starts] = bar_high
-        bar_cols[f'low_{freq}'][starts] = bar_low
-        bar_cols[f'next_ind_{freq}'][starts] = ends # local next_ind
+        if freq in FREQS:
+            bar_cols[f'high_{freq}'][starts] = bar_high
+            bar_cols[f'low_{freq}'][starts] = bar_low
+            bar_cols[f'next_ind_{freq}'][starts] = ends # local next_ind
 
         if freq == "1":
             tick_res.loc[starts, 'start_ind'] = starts # local start_ind
 
         # Create structured array
-        struct_arr = np.zeros(num_bars, dtype=BAR_DTYPE)
+        struct_arr = np.zeros(num_bars, dtype=dtype)
         struct_arr['start_ind'] = starts # local start_ind
         struct_arr['ts'] = bar_labels.astype('datetime64[ns]').astype('datetime64[s]')  # labels are ns
         struct_arr['open'] = bar_open
@@ -177,6 +227,11 @@ def process_session(session_df: pd.DataFrame, session_date: datetime.date) -> tu
         struct_arr['news_cpi'] = bar_cpi
         struct_arr['news_ppi'] = bar_ppi
         struct_arr['news_gdp'] = bar_gdp
+        if freq == "1":
+            # Limit entry at each minute's open, reaching the market ENTRY_LATENCY_MS after the minute starts
+            fills = _entry_fills(merged_price, merged_ts_ns, starts, ends, bar_labels + ENTRY_LATENCY_MS * 1_000_000)
+            for k, col in enumerate(ENTRY_COLS):
+                struct_arr[col] = fills[:, k]
 
         resampled_res[freq] = struct_arr
 
@@ -190,8 +245,12 @@ def process_session(session_df: pd.DataFrame, session_date: datetime.date) -> tu
 
 def offset_session(tick_res: pd.DataFrame, resampled_res: dict[str, np.ndarray], offset: int) -> np.ndarray:
     """
-    One processed session -> its tick.dat rows, with local row numbers moved to global ones by `offset`
-    (the number of rows already in tick.dat). Also offsets the bars' start_ind, in place.
+    One processed session -> its tick.dat rows (a DAT_DTYPE array), with local row numbers moved to global ones by
+    `offset` (the number of rows already in tick.dat). Also offsets the bars' start_ind, in place.
+
+    Raises:
+        ValueError: a value does not fit its column (a price above 65,535 ticks, a row number or ts above 2**32 - 1,
+            or a negative one), instead of wrapping around in the file.
     """
     # start_ind is -1 on rows that do not start a 1-min bar, and next_ind is 0 on rows that do not start a bar
     start_mask = tick_res['start_ind'] != -1
@@ -200,11 +259,19 @@ def offset_session(tick_res: pd.DataFrame, resampled_res: dict[str, np.ndarray],
     for f in FREQS:
         next_col = f'next_ind_{f}'
         tick_res[next_col] = np.where(tick_res[next_col] > 0, tick_res[next_col] + offset, 0)
-        if f in PARQUET_FREQS and len(resampled_res[f]) > 0:
+    for f in PARQUET_FREQS:
+        if len(resampled_res[f]) > 0:
             resampled_res[f]['start_ind'] += offset
-    # tick.dat is plain int64: only here does ts become seconds on the shifted clock (unix-style)
+    # Only here does ts become seconds on the shifted clock (unix-style)
     tick_res['ts'] = to_unix_epoch(tick_res['ts'])
-    return tick_res[DAT_COLS].values.astype(np.int64)
+    rows = np.zeros(len(tick_res), dtype=DAT_DTYPE)
+    for col in DAT_COLS:
+        values = tick_res[col].to_numpy(np.int64)
+        top = np.iinfo(DAT_DTYPE[col]).max
+        if len(values) and (values.min() < 0 or values.max() > top):
+            raise ValueError(f"tick.dat column {col}: values {values.min()} .. {values.max()} do not fit 0 .. {top}")
+        rows[col] = values
+    return rows
 
 
 def bars_table(bars: list[np.ndarray]) -> pa.Table:

@@ -19,8 +19,10 @@ TICK_DATA_PATH = f'{DATA_PATH}/tick.dat'                   # StopSearch.load() d
 TRAINING_DATA_PATH = f'{DATA_PATH}/training_data.parquet'  # feature_engineering output = backtest inpu
 RESULTS_DIR = 'results'                                    # backtest results
 TRADES_PATH = f'{RESULTS_DIR}/trades.parquet'              # every trade of the last backtest run: the analysis input
+ML_DIR = f'{RESULTS_DIR}/ml'                               # backtesting/ml*.py: outcome table, features, predictions
 
-FREQS = ['1','5','10','15','30','60','day']
+# 'session': one bar per session block (Asia 00-08, Europe 08-16, US 16-23 on the shifted clock), 8 hours at most
+FREQS = ['1','5','10','15','30','60','session','day']
 
 BEGIN_DATE = datetime.datetime(2020, 1, 1, 0, 0, 0)
 

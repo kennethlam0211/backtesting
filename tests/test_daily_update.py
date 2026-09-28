@@ -18,12 +18,11 @@ import pytest
 from data_pipeline import daily_update, fake_ib_data, ib_ticks
 from data_pipeline import raw_data_preprocessing as step1
 from data_pipeline import to_dat as step2
-from stop_search.params import DAT_COLS, PARQUET_FREQS
+from stop_search.params import DAT_DTYPE, PARQUET_FREQS, ROW_BYTES
 
 DATES = [datetime.date(2024, 3, d) for d in (4, 5, 6, 7)]  # Mon..Thu, all on ESH4 (instrument 17077)
 A, B, C, D = DATES
 BAR_FILES = [f"{f}_ohlcv.parquet" for f in PARQUET_FREQS]
-ROW_BYTES = len(DAT_COLS) * 8
 
 
 def raw_session(date, seed):
@@ -113,7 +112,7 @@ def snapshot(folder):
 def sessions_in(folder):
     """The session dates in each output: step 1's file, tick.dat, and every bar file."""
     ts = pq.read_table(folder / "data/ES_trades_concat.parquet", columns=["ts"]).column("ts").to_pandas()
-    tick_ts = np.fromfile(folder / "data/processed/tick.dat", dtype=np.int64).reshape(-1, len(DAT_COLS))[:, DAT_COLS.index("ts")]
+    tick_ts = np.fromfile(folder / "data/processed/tick.dat", dtype=DAT_DTYPE)["ts"].astype(np.int64)
     out = {"step1": sorted(set(ts.dt.date)), "tick.dat": sorted(set(pd.to_datetime(tick_ts, unit="s").date))}
     for f in BAR_FILES:
         out[f] = sorted(set(pq.read_table(folder / "data/processed" / f, columns=["ts"]).column("ts").to_pandas().dt.date))

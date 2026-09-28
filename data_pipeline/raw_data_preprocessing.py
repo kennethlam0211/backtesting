@@ -131,10 +131,11 @@ def apply_news_flags(out, session_date):
 
 def to_ticks(table, session_date, pdt_code):
     """One raw single-contract session -> merged ticks with columns ts, price, volume, rth, session,
-    hour and the five news flags.
+    hour, the five news flags and ts_ns.
 
     ts = ts_event (UTC) as New York wall clock + 6h, tz-naive, floored to the second after the
-    merge. price is in 0.25-point ticks (x4). Rows with the same ts (ns) and price are merged,
+    merge; ts_ns = the same time before the floor, int64 ns (to_dat.py's limit-entry columns).
+    price is in 0.25-point ticks (x4). Rows with the same ts (ns) and price are merged,
     summing size into volume, in first-appearance order. Identical raw rows are separate fills,
     so summing (never dropping) keeps the volume exact. pdt_code is the session's contract,
     e.g. ESM4; the caller has already checked it, and it is not written.
@@ -149,7 +150,8 @@ def to_ticks(table, session_date, pdt_code):
     df = pd.DataFrame({'ts': ts, 'price': df['price'], 'size': df['size'].astype('int64')})
     # ES trades in 0.25-point ticks; price x4 is the price in ticks, an exact integer (4000.25 -> 16001).
     # OHLC downstream is built from it, so every price column is in ticks. int32 holds any ES price
-    # (int16 would wrap above 32,767 ticks = 8,191.75 points); to_dat.py widens it to int64 for tick.dat.
+    # (int16 would wrap above 32,767 ticks = 8,191.75 points); to_dat.py stores it as uint16 in tick.dat (up to
+    # 65,535 ticks = 16,383.75 points).
     df['price'] = (df['price'] * 4).astype('int32')
 
     out = df.groupby(['ts', 'price'], sort=False).agg(volume=('size', 'sum')).reset_index()
@@ -169,13 +171,16 @@ def to_ticks(table, session_date, pdt_code):
     # Add hour column directly from the shifted ts
     out['hour'] = out['ts'].dt.hour.astype('int8')
 
-    # Floor to whole seconds, kept as a timestamp (step 2 turns it into integer seconds for tick.dat)
+    # The full time in ns first (the entry columns in to_dat.py need sub-second order latency), then floor ts to whole
+    # seconds, kept as a timestamp (step 2 turns it into integer seconds for tick.dat)
+    out['ts_ns'] = out['ts'].astype('datetime64[ns]').astype('int64')
     out['ts'] = out['ts'].dt.floor('s').astype('datetime64[s]')
 
     # Add news flags
     apply_news_flags(out, session_date)
 
-    cols = ['ts', 'price', 'volume', 'rth', 'session', 'hour', 'news_fomc', 'news_nfp', 'news_cpi', 'news_ppi', 'news_gdp']
+    cols = ['ts', 'price', 'volume', 'rth', 'session', 'hour', 'news_fomc', 'news_nfp', 'news_cpi', 'news_ppi', 'news_gdp',
+            'ts_ns']
     return pa.Table.from_pandas(out[cols], preserve_index=False)
 
 

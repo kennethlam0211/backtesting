@@ -1,17 +1,14 @@
 import os
 import sys
 import datetime
-import multiprocessing
 import subprocess
-import pickle
-from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from data_pipeline.to_dat import offset_session, process_session
-from stop_search import StopSearch, CHILD, DAT_COLS, FREQS
+from stop_search import StopSearch, CHILD, DAT_COLS, DAT_DTYPE, FREQS
 
 PRICE_COL = DAT_COLS.index('price')
 
@@ -36,14 +33,27 @@ def make_session(rng, date):
     return df
 
 
+def table(rows):
+    """tick.dat rows (DAT_DTYPE) as an int64 table, columns in DAT_COLS order: what the references below read."""
+    return np.stack([rows[c].astype(np.int64) for c in DAT_COLS], axis=1)
+
+
+def pack(tab):
+    """An int64 table (DAT_COLS order) back to tick.dat rows (DAT_DTYPE): what StopSearch reads."""
+    rows = np.zeros(len(tab), dtype=DAT_DTYPE)
+    for k, c in enumerate(DAT_COLS):
+        rows[c] = tab[:, k]
+    return rows
+
+
 def build_dat(rng, dates):
-    """tick.dat rows for consecutive sessions, offset to global row numbers as to_dat does."""
+    """tick.dat rows for consecutive sessions, offset to global row numbers as to_dat does, as an int64 table."""
     blocks, offset = [], 0
     for d in dates:
         tick_res, bars, n = process_session(make_session(rng, d), d)
         blocks.append(offset_session(tick_res, bars, offset))
         offset += n
-    return np.concatenate(blocks)
+    return table(np.concatenate(blocks))
 
 
 def tick_scan(data, i, end, hi, lo):
@@ -62,7 +72,7 @@ def data():
 
 @pytest.fixture(scope='module')
 def stops(data):
-    return StopSearch(data)
+    return StopSearch(pack(data))
 
 
 def test_child_bars_tile_their_parent(data):
@@ -128,7 +138,7 @@ def test_inconsistent_summaries_raise(data):
     p0 = bad[i, PRICE_COL]
     bad[i, HIGH['1']], bad[i, LOW['1']] = p0 + 4000, p0 - 4000
     with pytest.raises(ValueError):
-        StopSearch(bad).first_hit('1', i, p0 + 2000, p0 - 2000)
+        StopSearch(pack(bad)).first_hit('1', i, p0 + 2000, p0 - 2000)
 
 
 @pytest.mark.parametrize('freq', list(CHILD))
@@ -165,15 +175,15 @@ def test_arrays_reject_bad_starts_and_broken_summaries(stops, data):
     i = starts[10]
     bad[i, HIGH['1']], bad[i, LOW['1']] = p0[10] + 4000, p0[10] - 4000
     with pytest.raises(ValueError):
-        StopSearch(bad).first_hit_many('1', starts, p0 + 2000, p0 - 2000)
+        StopSearch(pack(bad)).first_hit_many('1', starts, p0 + 2000, p0 - 2000)
 
 
 def test_load_reads_to_dat_layout(data, tmp_path):
     path = tmp_path / 'tick.dat'
-    data.tofile(path)
+    pack(data).tofile(path)
     mm = StopSearch.load(path)
-    assert mm.data.shape == data.shape
-    i = int(mm.bar_starts('60')[3])
+    assert mm.data.shape == (len(data),)
+    i = int(np.flatnonzero(data[:, NEXT['60']])[3])
     p0 = mm.price(i)
     assert mm.first_hit('60', i, p0 + 100, p0 - 100) == tick_scan(data, i, data[i, NEXT['60']], p0 + 100, p0 - 100)
 
@@ -190,68 +200,20 @@ def test_zero_d_arrays_count_as_one_entry(stops, data):
     assert type(side) is int and side == stops.first_hit('5', i, int(p0) + 100, int(p0) - 100)
 
 
-class Backtester:
-    """Stand-in for the class that owns a StopSearch."""
-
-    def __init__(self, ticks):
-        self.ticks = ticks
-
-    def label(self, freq, tp, sl):
-        starts = self.ticks.bar_starts(freq)
-        entry = self.ticks.price(starts)
-        return self.ticks.first_hit_many(freq, starts, entry + tp, entry - sl)
-
-
-def _label_in_worker(bt, freq):
-    return bt.label(freq, 40, 20)
-
-
-@pytest.fixture(scope='module')
-def dat_file(data, tmp_path_factory):
-    path = tmp_path_factory.mktemp('dat') / 'tick.dat'
-    data.tofile(path)
-    return path
-
-
-def test_stopsearch_bar_helpers(data):
-    ticks = StopSearch(data)
-    assert len(ticks) == len(data)
+def test_price_and_bar_end_read_the_rows_as_int64(data):
+    ticks = StopSearch(pack(data))
     for freq in CHILD:
-        starts = ticks.bar_starts(freq)
-        assert np.array_equal(starts, np.flatnonzero(data[:, NEXT[freq]]))
-        assert ticks.bar_starts(freq) is starts  # cached
+        starts = np.flatnonzero(data[:, NEXT[freq]])
         assert np.array_equal(ticks.bar_end(freq, starts), data[starts, NEXT[freq]])
         assert np.array_equal(ticks.price(starts), data[starts, PRICE_COL])
+    assert ticks.price(starts).dtype == np.int64 and ticks.bar_end(freq, starts).dtype == np.int64
 
 
 def test_stopsearch_rejects_child_tables_that_do_not_tile(data):
     with pytest.raises(ValueError):
-        StopSearch(data, child={**CHILD, '15': '10'})
+        StopSearch(pack(data), child={**CHILD, '15': '10'})
     with pytest.raises(ValueError):
-        StopSearch(data, child={**CHILD, '5': '2'})
-
-
-def test_stopsearch_pickles_by_path(data, dat_file):
-    ticks = StopSearch.load(dat_file)
-    ticks.bar_starts('1')
-    blob = pickle.dumps(Backtester(ticks))
-    assert len(blob) < 10_000 < data.nbytes  # the path, not the ticks
-    bt = pickle.loads(blob)
-    assert isinstance(bt.ticks.data, np.memmap)
-    assert np.array_equal(bt.label('1', 40, 20), Backtester(StopSearch(data)).label('1', 40, 20))
-
-
-def test_in_memory_stopsearch_pickles_with_its_ticks(data):
-    ticks = pickle.loads(pickle.dumps(StopSearch(data)))
-    assert np.array_equal(ticks.data, data)
-
-
-def test_owner_class_works_in_worker_processes(dat_file):
-    bt = Backtester(StopSearch.load(dat_file))
-    with ProcessPoolExecutor(max_workers=2, mp_context=multiprocessing.get_context('spawn')) as pool:
-        results = list(pool.map(_label_in_worker, [bt, bt], ['1', '15']))
-    assert np.array_equal(results[0], bt.label('1', 40, 20))
-    assert np.array_equal(results[1], bt.label('15', 40, 20))
+        StopSearch(pack(data), child={**CHILD, '5': '2'})
 
 
 def test_float_levels_are_exact(stops, data):
@@ -280,53 +242,24 @@ def test_cut_or_negative_rows_raise_instead_of_reading_outside(stops, data):
     cut = data[:day1 - 100]  # ends inside the first session: its day bar points past the end
     p0 = data[day0, PRICE_COL]
     with pytest.raises(ValueError):
-        StopSearch(cut).first_hit('day', int(day0), int(p0) + 10**7, int(p0) - 10**7)
+        StopSearch(pack(cut)).first_hit('day', int(day0), int(p0) + 10**7, int(p0) - 10**7)
     with pytest.raises(ValueError):
-        StopSearch(cut).first_hit_many('day', np.array([day0]), p0 + 10**7, p0 - 10**7)
+        StopSearch(pack(cut)).first_hit_many('day', np.array([day0]), p0 + 10**7, p0 - 10**7)
     with pytest.raises(ValueError):
         stops.first_hit('1', -1, int(p0) + 100, int(p0) - 100)
     with pytest.raises(ValueError):
         stops.first_hit_many('1', np.array([-1, 0]), p0 + 100, p0 - 100)
 
 
-def test_bar_starts_cache_is_read_only(data):
-    starts = StopSearch(data).bar_starts('1')
-    with pytest.raises(ValueError):
-        starts += 1
-
-
 def test_child_table_cycles_raise(data):
     for bad in ({**CHILD, '1s': '1s'}, {**CHILD, '5': '5'}):
         with pytest.raises(ValueError):
-            StopSearch(data, child=bad)
+            StopSearch(pack(data), child=bad)
 
 
 def test_params_import_does_not_load_numba():
     code = "import sys; from stop_search.params import FREQS, DAT_COLS; assert 'numba' not in sys.modules"
     subprocess.run([sys.executable, '-c', code], check=True, cwd=os.path.join(os.path.dirname(__file__), '..'))
-
-
-def test_pickle_uses_absolute_path_and_memmap_file(data, dat_file, tmp_path, monkeypatch):
-    monkeypatch.chdir(dat_file.parent)
-    ticks = StopSearch.load(dat_file.name)  # relative path
-    assert os.path.isabs(ticks.path)
-    monkeypatch.chdir(tmp_path)  # a worker with another working directory
-    assert np.array_equal(pickle.loads(pickle.dumps(ticks)).data, data)
-    # built from the memmap itself: it knows its file, so pickling still carries only the path
-    mm = StopSearch.load(dat_file).data
-    assert len(pickle.dumps(StopSearch(mm))) < 10_000
-    # a slice of the memmap is not the whole file: pickled with its ticks
-    part = mm[:100]
-    assert np.array_equal(pickle.loads(pickle.dumps(StopSearch(part))).data, part)
-
-
-def test_unpickle_refuses_a_changed_file(data, tmp_path):
-    path = tmp_path / 'tick.dat'
-    data.tofile(path)
-    blob = pickle.dumps(StopSearch.load(path))
-    data[:10].tofile(path)  # to_dat.py wrote a new tick.dat
-    with pytest.raises(ValueError):
-        pickle.loads(blob)
 
 
 def test_each_call_rejects_the_other_kind_of_input(stops, data):
@@ -348,7 +281,6 @@ def test_unknown_bar_size_raises_a_clear_error(stops, data):
     for bad in (15, '2', None):
         for call in (lambda: stops.first_hit(bad, i, p0 + 40, p0 - 20),
                      lambda: stops.first_hit_many(bad, [i], p0 + 40, p0 - 20),
-                     lambda: stops.bar_starts(bad),
                      lambda: stops.bar_end(bad, i)):
             with pytest.raises(ValueError, match="unknown bar size"):
                 call()
@@ -358,9 +290,9 @@ def test_load_defaults_to_params_dat_path(data, tmp_path, monkeypatch):
     from stop_search import DAT_PATH
     monkeypatch.chdir(tmp_path)
     os.makedirs(os.path.dirname(DAT_PATH))
-    data.tofile(DAT_PATH)
+    pack(data).tofile(DAT_PATH)
     stops = StopSearch.load()
-    assert stops.path == os.path.abspath(DAT_PATH) and stops.data.shape == data.shape
+    assert stops.data.filename == os.path.abspath(DAT_PATH) and stops.data.shape == (len(data),)
 
 
 def test_paths_come_from_params_and_are_relative():

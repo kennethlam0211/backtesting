@@ -164,7 +164,7 @@ python -m data_pipeline.raw_data_preprocessing --start 2024-01-01 --end 2024-12-
 | | |
 |---|---|
 | Reads | `raw_data/ES_*_trades_<date>.parquet` (one per session), `raw_data/roll_open_blocks/ES_c_1_open_block_<date>.parquet`, `raw_data/pdt_codes.csv`, `params/news_events.yaml` |
-| Writes | `--out` (default set in the script): one row per merged tick with `ts`, `price` (ticks, x4), `volume`, `rth`, `session`, `hour`, `news_*` |
+| Writes | `--out` (default set in the script): one row per merged tick with `ts`, `price` (ticks, x4), `volume`, `rth`, `session`, `hour`, `news_*`, `ts_ns` (the time before the floor to seconds, ns) |
 | Options | `--start`, `--end`: first / last session date, inclusive (default: all sessions) |
 | Notes | Creates the output's folder if missing |
 
@@ -182,11 +182,12 @@ python -m data_pipeline.to_dat --limit 5 --out data/processed_test              
 | | |
 |---|---|
 | Reads | `--src` (default: step 1's default output) |
-| Writes | into `--out` (default set in the script, created if missing): `tick.dat` (all ticks with their bar summaries, int64, columns = `stop_search.DAT_COLS`; its `ts` is seconds on the shifted clock) and `{freq}_ohlcv.parquet` for `1 5 10 15 30 60 day` (`ts` is the bar's start on the shifted clock, a timestamp like step 1's `ts`: whole seconds, since step 1 floors to seconds after its merge. Parquet has no seconds unit, so it is stored and read back in milliseconds, always `.000`; `df.ts.astype('datetime64[s]')` gives the seconds without loss) |
+| Writes | into `--out` (default set in the script, created if missing): `tick.dat` (all ticks with their bar summaries, packed 92-byte rows of `stop_search.DAT_DTYPE`: uint32 row numbers and `ts`, uint16 prices, see `docs/to_dat.md`; its `ts` is seconds on the shifted clock) and `{freq}_ohlcv.parquet` for `1 5 10 15 30 60 day session` (`session`: one bar per session block of each date, Asia 00–08, Europe 08–16, US 16–23 on the shifted clock; not in `tick.dat`) (`ts` is the bar's start on the shifted clock, a timestamp like step 1's `ts`: whole seconds, since step 1 floors to seconds after its merge. Parquet has no seconds unit, so it is stored and read back in milliseconds, always `.000`; `df.ts.astype('datetime64[s]')` gives the seconds without loss) |
 | Options | `--limit N`: only the first N sessions; `--start YYYY-MM-DD`: skip sessions before that date (default: all sessions) |
-| Notes | Runs sessions in parallel (up to 24 processes). `tick.dat` is written as `tick.dat.tmp` and renamed only when the run finishes, so an existing `tick.dat` is always complete; the bar files are written in place |
+| 1-min only | The limit-entry columns `pre_high_1`, `pre_low_1` and, per side, `fill_px`, `after_high`, `after_low` (`stop_search.params.ENTRY_COLS`): a limit at the minute's open reaching the market 300 ms in. Execution data for `backtesting/entry.py`, not features |
+| Notes | Runs sessions in parallel (up to 24 processes). `tick.dat` is written as `tick.dat.tmp` and renamed only when the run finishes, so an existing `tick.dat` is always complete; the bar files are written in place. **A run first deletes every `*.parquet`, `*.dat` and `*.tmp` in `--out`** except `--src` and `training_data.parquet` |
 
-Bar sizes and the `tick.dat` layout come from `stop_search/params.py`. Changing `FREQS` there changes
+Full details: [`docs/to_dat.md`](../docs/to_dat.md). Bar sizes and the `tick.dat` layout come from `stop_search/params.py`. Changing `FREQS` there changes
 the file layout: rerun this step before using `stop_search` again. The default output folder, `tick.dat`,
 `training_data.parquet` and `results/` are set in `params/params.py`, relative to the repo root;
 `StopSearch.load()`, `feature_engineering.py` and the backtest follow it by themselves.
@@ -200,7 +201,7 @@ python -m data_pipeline.feature_engineering --data-dir data/processed_2024 --out
 
 | | |
 |---|---|
-| Reads | `{--data-dir}/{freq}_ohlcv.parquet` for every freq in `params.FREQS` (default folder: step 2's default output) |
+| Reads | `{--data-dir}/{freq}_ohlcv.parquet` for every freq in `params.FREQS` (default folder: step 2's default output), without `hl` and the 1-min limit-entry columns (not features) |
 | Writes | `--out` (default `training_data.parquet` in `--data-dir`): one row per 1-min bar, with every freq's bars and features as columns suffixed `_{freq}`. `ts` is exactly the 1-min bar file's `ts`: the bar's start on the shifted clock, a timestamp without a time zone (so no viewer shifts it to local time). It starts on the first session that begins with every freq's 5 U/D pivots, never partway through a session (the warm-up is dropped, as the reference's `take_away_burnout_period`); `--keep-warmup` keeps those rows |
 | Features | Per freq, window 20: SMA, std, Bollinger bands (2 sigma), ATR (Wilder, 14), SMA-RSI (14), FVG, bar-to-bar moves `HO HH HL HC`, and U/D (below). Each freq also keeps its bars' tick.dat start row, `start_ind_{freq}` (`start_ind_1`, `start_ind_5`, ...) |
 | U/D | For every freq (1, 15, 60, day), as the reference: a zigzag on the **1-min closes**, reversing when price moves more than that freq's std from the last extreme. For a higher freq that is its live std, `20_std_live_{freq}`: the last 19 closes shown so far plus the current 1-min close, so the levels move every minute. It needs a full window: NaN until 19 bars have closed (the 1-min std needs 20 closes), so no pivot forms on a too-small std at the start. Columns `20_U_{freq}`, `20_D_{freq}` (the level on the bar where it is confirmed, else NaN), `20_UD_flag_{freq}`, and the last `params.UD_PIVOTS` (5) pivots, U and D in one sequence: `20_UD_last1_{freq}` (newest) … `20_UD_last5_{freq}`, in ticks, NaN until there are enough |
@@ -222,8 +223,8 @@ The polars version of `reference/preprocessing_pandas.py`. It gives the same val
   sessions than that) stops with an error unless `--keep-warmup`.
 
 **No look-ahead.** A higher-freq bar appears on the 1-min row during which it closes, and stays until the
-next one closes. The 15-min bar 10:00–10:14:59 appears on the 10:14 row, and the day bar on the session's
-last minute, 22:59. So a row holds nothing that happens after that 1-min bar closes: use it at the row's
+next one closes. The 15-min bar 10:00–10:14:59 appears on the 10:14 row, the session bars on the 07:59, 15:59
+and 22:59 rows, and the day bar on the session's last minute, 22:59. So a row holds nothing that happens after that 1-min bar closes: use it at the row's
 close, and enter on the next bar. The join is on time, not row order, so minutes without trades change
 nothing. The test cuts the data off at many times T, including inside a bar's last minute, rebuilds
 everything, and checks that every row that ended by T is unchanged.
@@ -231,16 +232,17 @@ everything, and checks that every row that ended by T is unchanged.
 ## Using the output
 
 ```python
+import polars as pl
 from stop_search import StopSearch
 
 stops = StopSearch.load()                                            # step 2's default tick.dat (params.DAT_PATH)
-starts = stops.bar_starts('1')                                       # first tick of every 1-min bar
+starts = pl.read_parquet('data/processed/1_ohlcv.parquet')['start_ind'].to_numpy()  # first tick of every 1-min bar
 entry = stops.price(starts)
 sides = stops.first_hit_many('1', starts, entry + 40, entry - 20)    # 1 upper first, -1 lower first, 0 neither
 ```
 
 Pass a path to load another run, e.g. `StopSearch.load('data/processed_2024/tick.dat')`.
-Prices are in ticks (x4): 10 points = 40.
+Prices are in ticks (x4): 10 points = 40. The backtester built on these outputs: [`docs/backtesting.md`](../docs/backtesting.md).
 
 ## Checking the output
 

@@ -5,19 +5,18 @@ import time
 import numpy as np
 from rich.console import Console
 
-from stop_search import StopSearch, DAT_COLS
-
-PRICE_COL = DAT_COLS.index('price')
+from stop_search import StopSearch
 
 console = Console()
 
 
-def brute_force_search(data: np.ndarray, start_idx: int, end_idx: int, upper: int, lower: int):
+def brute_force_search(prices: np.ndarray, start_idx: int, end_idx: int, upper: int, lower: int):
     """
-    Naive tick-by-tick scan of the same bar. Simulates a traditional backtester stepping through every row.
+    Naive tick-by-tick scan of the same bar over tick.dat's price column. Simulates a traditional backtester
+    stepping through every row.
     """
     for i in range(start_idx, end_idx):
-        price = data[i, PRICE_COL]
+        price = int(prices[i])
         if price >= upper:
             return 1
         if price <= lower:
@@ -31,11 +30,11 @@ def make_queries(data, freq, num_queries=10_000, seed=42):
     from the entry price (price is x4, in 0.25-pt ticks: 40 to 200 ticks). Shared with run_benchmark_mismatch.py so both scripts check
     exactly the same queries. Returns (starts, bar ends, uppers, lowers).
     """
-    next_col = DAT_COLS.index(f'next_ind_{freq}')
+    next_ind = data[f'next_ind_{freq}']
     rng = np.random.default_rng(seed)
-    starts = rng.choice(np.flatnonzero(data[:, next_col]), size=num_queries)
-    ends = data[starts, next_col]
-    prices = data[starts, PRICE_COL]
+    starts = rng.choice(np.flatnonzero(next_ind), size=num_queries)
+    ends = next_ind[starts].astype(np.int64)
+    prices = data['price'][starts].astype(np.int64)  # uint16 in tick.dat: widen before subtracting
     return starts, ends, prices + rng.integers(40, 200, num_queries), prices - rng.integers(40, 200, num_queries)
 
 
@@ -58,7 +57,8 @@ def main():
 
     console.print(f"\n[yellow]Running {NUM_QUERIES:,} Brute Force tick-by-tick searches on {freq} bars...[/yellow]")
     t0 = time.perf_counter()
-    bf_results = [brute_force_search(data, s, e, h, l) for s, e, h, l in zip(start_indices, end_indices, uppers, lowers)]
+    bf_results = [brute_force_search(data['price'], s, e, h, l)
+                  for s, e, h, l in zip(start_indices, end_indices, uppers, lowers)]
     bf_time = time.perf_counter() - t0
     console.print(f"Brute Force took: [red]{bf_time:.4f} seconds[/red] ({(bf_time/NUM_QUERIES)*1000:.3f} ms per query)")
 

@@ -2,8 +2,8 @@
 
 Turns the raw Databento ES trade files (one per session) into **one clean, time-ordered tick file**
 with one contract per session, prices in ticks, and a clock that looks the same in summer and winter.
-Step 2 (`data_pipeline/to_dat.py`) reads its output and writes `tick.dat` (for the stop search, `stop_search.StopSearch`)
-and the OHLCV bar files (`open`/`high`/`low`/`close` in ticks, int32, like `price` here).
+Step 2 (`data_pipeline/to_dat.py`, [`docs/to_dat.md`](to_dat.md)) reads its output and writes `tick.dat` (for the stop
+search, `stop_search.StopSearch`) and the OHLCV bar files (`open`/`high`/`low`/`close` in ticks, int32, like `price` here).
 
 ```bash
 python -m data_pipeline.raw_data_preprocessing                      # all sessions -> data/ES_trades_concat.parquet
@@ -15,7 +15,8 @@ Run from the repo root: `raw_data/` and the output path are relative to it; the 
 history come from MongoDB with `python -m data_pipeline.daily_update append`, through the same `to_ticks`
 (see *Daily sessions from IB* below, and `data_pipeline/README.md`).
 
-Full run: 1,737 sessions (2020-01-02 → 2026-09-18) in about 3 minutes; about 1 GB of RAM.
+Full run: 1,737 sessions (2020-01-02 → 2026-09-18), about 1 GB of RAM. It took about 3 minutes before `ts_ns` was
+added; the rebuild with `ts_ns` (2026-09, 4.25 GB output) took about 45 minutes, not yet timed on its own.
 
 ## Output
 
@@ -30,9 +31,12 @@ Full run: 1,737 sessions (2020-01-02 → 2026-09-18) in about 3 minutes; about 1
 | `session` | int8 | 8-hour block of `ts`: `1` Asia = `ts` 00–07 (NY 18:00–02:00), `2` Europe = 08–15 (NY 02:00–10:00), `3` US = 16–22 (NY 10:00–17:00). The first 30 min of RTH are `2` |
 | `hour` | int8 | Hour of `ts` (shifted clock, 0–22): `0` = NY 18:00, `15` = NY 09:00 |
 | `news_fomc`, `news_nfp`, `news_cpi`, `news_ppi`, `news_gdp` | int8 | `1` if the tick is in `[event - 5m, event + 5m)`, else `0` (see *News flags*) |
+| `ts_ns` | int64 | The same time as `ts` before the floor, in ns (shifted clock). Step 2 uses it for the 1-min bars' limit-entry columns (`stop_search.params.ENTRY_COLS`: 300 ms order latency); `tick.dat` keeps whole seconds |
 
 The contract code (`pdt_code`) is looked up and checked for every session but not written.
-Every other raw column (`ts_recv`, `instrument_id`, `side`, `sequence`, …) is dropped.
+Every other raw column (`ts_recv`, `instrument_id`, `side`, `sequence`, …) is dropped. `side` is the aggressor
+(`A` a seller hit the bid, `B` a buyer lifted the ask); keeping it would allow a stricter limit-fill rule in step 2
+(see *Limit-entry columns* in [`docs/to_dat.md`](to_dat.md)).
 
 ## Inputs
 
@@ -63,7 +67,7 @@ Only top-level `raw_data/ES_*_trades_*.parquet` files are read, minus `*_partial
 8. **Merge** — rows with the same **nanosecond** `ts` and the same price become one row,
    `volume = sum(size)`, kept in first-traded order. Check: total volume unchanged.
 9. **Labels** — `rth`, `session` and `hour` from the (still nanosecond) `ts`.
-10. **Floor to seconds** — after the merge, `ts` is floored to the second.
+10. **Floor to seconds** — after the merge, `ts` is floored to the second; the full time stays in `ts_ns`.
 11. **News flags** — see *News flags*.
 12. **Write** to the output file.
 
@@ -197,4 +201,4 @@ Commands, cron and the MongoDB settings: `data_pipeline/README.md`.
   calendar spread (2024: +61 to +75 points). Fine for day trades closed at the session end; adjust before
   using indicators that span several sessions.
 - **Holiday sessions** (e.g. July 4, Thanksgiving) are open but very thin.
-- Sub-second timing is gone from the output (`raw_data` keeps the nanoseconds).
+- `ts` is whole seconds; the nanoseconds are in `ts_ns` (sessions appended from IB have whole seconds only).

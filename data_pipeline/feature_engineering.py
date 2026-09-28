@@ -25,6 +25,7 @@ from numba import njit
 
 from params import DATA_PATH as DATA_DIR
 from params import FEATURES, FREQS, TRAINING_DATA_PATH, UD_PIVOTS, WINDOW_SIZE, VOL_METHODS
+from stop_search.params import ENTRY_COLS
 
 # A session is [00:00, 23:00) on the shifted clock (New York + 6h): no bar runs past 23:00
 SESSION_SECONDS = 23 * 3600
@@ -32,6 +33,8 @@ SESSION_SECONDS = 23 * 3600
 def freq_to_seconds(f: str) -> int:
     if f == 'day':
         return 24 * 3600
+    if f == 'session':  # 8-hour blocks from the session open; the last one closes with the session at 23:00
+        return 8 * 3600
     elif f.endswith('s'):
         return int(f[:-1])
     return int(f) * 60
@@ -279,7 +282,8 @@ class DataPreprocessor:
     def process_frequency(self, freq: str) -> pl.DataFrame:
         """Load and process a single timeframe."""
         file_path = os.path.join(self.data_dir, f'{freq}_ohlcv.parquet')
-        lf = pl.scan_parquet(file_path).drop(['hl'], strict=False)
+        # Not features: hl, and the 1-min bars' limit-entry columns (backtesting/entry.py reads them)
+        lf = pl.scan_parquet(file_path).drop(['hl', *ENTRY_COLS], strict=False)
         # The bar files store ts as the shifted-clock timestamp; everything here works in its whole seconds
         # (bar files written before that already hold the seconds)
         if lf.collect_schema()['ts'].is_temporal():
@@ -332,7 +336,7 @@ class DataPreprocessor:
             if freq == base_freq:
                 continue
 
-            print(f"Processing and joining {freq if freq == 'day' else freq + 'm'} data...")
+            print(f"Processing and joining {freq if freq in ('day', 'session') else freq + 'm'} data...")
             df_htf = self.process_frequency(freq)
 
             # Drop original news columns from higher frequencies

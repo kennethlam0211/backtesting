@@ -48,3 +48,7 @@ How it all works: [README.md](README.md).
       longer as the history grows. If it gets slow, split step 1's output into one file per session or
       month.
 - [ ] A past session cannot be changed in place: rerun `init`, then `append`.
+- [x] **Smaller `tick.dat`** (done 2026-09-28): packed 92-byte rows, uint32 row numbers and `ts`, uint16 prices
+      (`stop_search.params.DAT_DTYPE`, see `docs/to_dat.md`): 190 GB -> 66 GB, fits in RAM. Checked value by value
+      against the int64 file, bar files identical, a full `ud_range` sweep gives identical trades. Sweeps did not get
+      faster (975 s before and after: they are compute-bound). Limit: prices up to 16,383.75 points (ES only, not NQ).

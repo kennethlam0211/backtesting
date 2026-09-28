@@ -32,7 +32,7 @@ import pyarrow.parquet as pq
 from data_pipeline import ib_ticks
 from data_pipeline import raw_data_preprocessing as step1
 from data_pipeline import to_dat as step2
-from stop_search.params import DAT_COLS, PARQUET_FREQS
+from stop_search.params import DAT_DTYPE, PARQUET_FREQS, ROW_BYTES
 
 INIT_FIRST = "build the data first with `python -m data_pipeline.daily_update init`"
 
@@ -95,23 +95,21 @@ def step1_append(path, days):
 # ---------------------------------------------------------------- step 2's folder (tick.dat and the bar files)
 
 def _read_row(dat_path, i):
-    """Row i of tick.dat (its DAT_COLS values), or an empty array past the end."""
-    row_bytes = len(DAT_COLS) * 8
+    """Row i of tick.dat (a DAT_DTYPE record array of length 1), or an empty one past the end."""
     with open(dat_path, 'rb') as f:
-        f.seek(i * row_bytes)
-        return np.frombuffer(f.read(row_bytes), dtype=np.int64)
+        f.seek(i * ROW_BYTES)
+        return np.frombuffer(f.read(ROW_BYTES), dtype=DAT_DTYPE)
 
 
 def step2_last_session(out_dir):
     """Session date of the last row in out_dir/tick.dat, or None if the file is empty."""
     dat_path = os.path.join(out_dir, 'tick.dat')
-    row_bytes = len(DAT_COLS) * 8
     size = os.path.getsize(dat_path)
-    if size % row_bytes:
-        raise ValueError(f"{dat_path}: {size} bytes is not a whole number of {len(DAT_COLS)}-column rows")
+    if size % ROW_BYTES:
+        raise ValueError(f"{dat_path}: {size} bytes is not a whole number of {ROW_BYTES}-byte rows")
     if size == 0:
         return None
-    last_ts = int(_read_row(dat_path, size // row_bytes - 1)[DAT_COLS.index('ts')])
+    last_ts = int(_read_row(dat_path, size // ROW_BYTES - 1)['ts'][0])
     # ts is the shifted clock stored as if UTC, so its calendar date is the session
     return datetime.datetime.fromtimestamp(last_ts, datetime.timezone.utc).date()
 
@@ -125,7 +123,7 @@ def step2_committed_rows(out_dir):
     if len(day) == 0:
         return 0
     row = _read_row(os.path.join(out_dir, 'tick.dat'), int(day[-1].as_py()))  # first row of the last session
-    return int(row[DAT_COLS.index('next_ind_day')]) if len(row) else -1
+    return int(row['next_ind_day'][0]) if len(row) else -1
 
 
 def step2_append(out_dir=step2.DEFAULT_OUT, src=step2.DEFAULT_SRC):
@@ -139,7 +137,7 @@ def step2_append(out_dir=step2.DEFAULT_OUT, src=step2.DEFAULT_SRC):
     start = None if last is None else last + datetime.timedelta(days=1)
     dat_path = os.path.join(out_dir, 'tick.dat')
     size = os.path.getsize(dat_path)
-    n_rows = size // (len(DAT_COLS) * 8)
+    n_rows = size // ROW_BYTES
     if step2_committed_rows(out_dir) != n_rows:
         raise ValueError(f"{dat_path} holds rows the bar files do not (an append was cut off?); "
                          f"rebuild step 2 from step 1's file with `python -m data_pipeline.to_dat`")

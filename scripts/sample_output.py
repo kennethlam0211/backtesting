@@ -3,19 +3,15 @@ import numpy as np
 import os
 import sys
 
-# Get DAT_COLS dynamically
+# tick.dat's row layout
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from stop_search.params import DAT_COLS
+from stop_search.params import DAT_DTYPE
 
 def convert_dat_to_excel(dat_path, excel_path, limit=1000):
     print(f"Reading {dat_path}...")
 
-    # Build the numpy dtype from DAT_COLS. All columns are 'i8' (int64)
-    # based on the stop_search/params.py documentation.
-    dat_dtype = [(col, 'i8') for col in DAT_COLS]
-
-    # Read the .dat file
-    data = np.fromfile(dat_path, dtype=dat_dtype)
+    # Read the .dat file: packed rows of stop_search.params.DAT_DTYPE (uint32 / uint16 columns)
+    data = np.fromfile(dat_path, dtype=DAT_DTYPE)
 
     # Limit rows
     if limit is not None:
@@ -24,7 +20,7 @@ def convert_dat_to_excel(dat_path, excel_path, limit=1000):
     print(f"Loaded {len(data)} rows from dat. Converting to Excel without formatting ts...")
 
     # Convert to pandas dataframe
-    df = pd.DataFrame(data)
+    df = pd.DataFrame(data).drop(columns='_pad')
 
     # Note: Intentionally NOT converting 'ts' to datetime here
     # to preserve raw unix timestamps.

@@ -26,7 +26,9 @@ from backtesting.config import (
     COMMISSION,
     END,
     ENSEMBLE,
+    ENTRY,
     FLAT_AT,
+    FLAT_ON,
     FREQ,
     LABEL_FEATURES,
     NO_ENTRY,
@@ -40,6 +42,7 @@ from backtesting.config import (
     VOL_COLUMN,
     VOL_SESSIONS,
 )
+from backtesting.entry import default_entries, get_entry_many
 from backtesting.strategy import ensemble, expand
 from params import (
     FREQS,
@@ -61,8 +64,12 @@ def _as_date(d):
 
 
 def _seconds(freq: str) -> int:
-    """A bar size in seconds: 'day', '<n>s' (seconds) or '<n>' (minutes)."""
-    return 86400 if freq == 'day' else int(freq[:-1]) if freq.endswith('s') else int(freq) * 60
+    """A bar size in seconds: 'day', 'session' (8 hours), '<n>s' (seconds) or '<n>' (minutes)."""
+    if freq == 'day':
+        return 86400
+    if freq == 'session':
+        return 8 * 3600
+    return int(freq[:-1]) if freq.endswith('s') else int(freq) * 60
 
 
 def _base_freq() -> str:
@@ -136,9 +143,10 @@ def _freq_bars(rows: pl.DataFrame, freq: str, bar_path) -> pl.DataFrame:
     """
     One row per `freq` bar from the base rows:
     - each bar's first appearance (keep first on start_ind_{freq}): its last base bar, or the first later one when that
-      one had no trades. The columns of every timeframe smaller than `freq` are dropped, so a row holds nothing after the
-      bar's close (no bar of `freq` or larger ends inside a late appearance's extra minutes). `start_ind` becomes the
-      bar's first tick, start_ind_{freq}.
+      one had no trades; it gives the columns of `freq` and larger (no bar of `freq` or larger ends inside a late
+      appearance's extra minutes). `start_ind` becomes the bar's first tick, start_ind_{freq}.
+    - the columns of every timeframe smaller than `freq` as of the bar's close: from the last base row that starts
+      before the close (the base bar ending at it, else the latest before), never from after it.
     - ts (the bar's start), session, rth, hour and news_{freq} (any news flag in the bar) from its bar file
       (`bar_path`, step 2's {freq}_ohlcv.parquet), joined on the bar's first tick: exact for every bar, however late
       it appears.
@@ -147,14 +155,21 @@ def _freq_bars(rows: pl.DataFrame, freq: str, bar_path) -> pl.DataFrame:
     key = f'start_ind_{freq}'
     smaller = tuple(f'_{f}' for f in FREQS if _seconds(f) < _seconds(freq))
     base_only = ['start_ind', 'ts', 'date', 'session', 'rth', 'hour']
+    small = [c for c in rows.columns if c not in base_only and c.endswith(smaller)]
     first = (rows.filter(pl.col(key).is_not_null())
              .unique(key, keep='first', maintain_order=True)
-             .select([c for c in rows.columns if c not in base_only and not c.endswith(smaller)]))
+             .select([c for c in rows.columns if c not in base_only and c not in small]))
     bars = (pl.read_parquet(bar_path)
             .select(pl.col('start_ind').alias(key), pl.col('ts').cast(pl.Datetime('ms')), 'session', 'rth', 'hour',
                     pl.any_horizontal(pl.col('^news_.*$') != 0).cast(pl.Int8).alias(f'news_{freq}'))
             .with_columns(date=pl.col('ts').dt.date()))
     out = first.join(bars, on=key, how='inner').filter(pl.col('date').is_in(rows['date'].unique().implode()))
+    if small:
+        last_base = pl.col('ts') + pl.duration(seconds=_seconds(freq) - _seconds(_base_freq()))  # the base bar ending at the close
+        out = (out.with_columns(_close=last_base).sort('_close')
+               .join_asof(rows.select(pl.col('ts').alias('_base_ts'), *small).sort('_base_ts'), left_on='_close',
+                          right_on='_base_ts', strategy='backward')
+               .drop('_close', '_base_ts'))
     lead = ['ts', f'open_{freq}', 'session', 'rth', 'hour', f'news_{freq}', 'date']
     return out.sort(key).select(pl.col(key).alias('start_ind'), *lead, pl.exclude(key, *lead))
 
@@ -177,7 +192,8 @@ def vol_ok(df: pl.DataFrame, column=VOL_COLUMN, band=VOL_BAND, sessions=VOL_SESS
 
 
 def find_exits(stops, df: pl.DataFrame, flat_at=FLAT_AT, stop=None, freq=FREQ, keep=(),
-               search_mode=SEARCH_MODE, no_entry=(), pattern=None, entry_ok=None) -> pl.DataFrame:
+               search_mode=SEARCH_MODE, no_entry=(), pattern=None, entry_ok=None, signal_exit=True,
+               entry=ENTRY, entries=None, flat_on=FLAT_ON) -> pl.DataFrame:
     """
     Step 2: `side` is a state, 1 (long) or -1 (short) while its signal holds, 0 or null = none. One trade per signal:
     - normal mode: where `side` turns 1 / -1 (from 0, or the other side; a session's first bar counts). The trade
@@ -209,8 +225,19 @@ def find_exits(stops, df: pl.DataFrame, flat_at=FLAT_AT, stop=None, freq=FREQ, k
         keep: more df columns each trade keeps from its signal bar.
         search_mode: signals and signal exits as above, default config.SEARCH_MODE.
         no_entry: df columns (0 / 1); a signal whose entry bar has any of them 1 is skipped (e.g. config.NO_ENTRY).
+        flat_on: df columns (0 / 1), e.g. config.FLAT_ON's news window; a trade still open when a bar with any of them
+            1 starts exits at that bar's first tick, like the flat bar, and a signal whose entry bar has one is
+            skipped.
         pattern: in search mode, the df column that tells signals of the same side apart.
         entry_ok: a df column (bool); a signal whose own bar has it False is skipped (e.g. vol_ok).
+        signal_exit: False: no signal exit, a trade exits only by TP / SL / flat_at (e.g. the ML outcome table, whose
+            trades must not depend on any signal's future).
+        entry: 'market' (at the entry bar's first tick, with slippage in add_costs) or 'limit' (backtesting/entry.py:
+            a limit at the entry bar's open with order latency, filled at a better price or at the open; a limit run
+            pays no slippage on its entry or its exits (add_costs);
+            a signal that never fills, or whose TP / SL level is reached before the fill, is skipped. The TP / SL
+            levels stay measured from the open), default config.ENTRY.
+        entries: the limit entries' minute data (backtesting.entry.Entries), default the 1-min bar file next to tick.dat.
 
     Returns:
         One row per trade, in signal order: `row` (the signal's row in df), `signal_ts` (the signal bar), `date`,
@@ -218,16 +245,17 @@ def find_exits(stops, df: pl.DataFrame, flat_at=FLAT_AT, stop=None, freq=FREQ, k
         (known when the order goes in), `entry_ts` (the entry bar: the trade's time), its `year` and `month`, the
         entry bar's LABEL_COLS that df has, `entry_ind` (tick.dat row), `entry_px`, `exit_row` (df row of the bar
         the trade exits in; for a signal exit the bar where it happens), `exit_ts` (when it exits), `exit_px`,
-        `result` (1 take-profit, -1 stop-loss, 2 signal exit, 0 flat at `flat_at` or the session end) and `pnl`
+        `result` (1 take-profit, -1 stop-loss, 2 signal exit, 0 flat at `flat_at`, a `flat_on` bar or the session
+        end) and `pnl`
         (gross, units).
 
     Raises:
         ValueError: a signal has a missing or non-positive tp / sl, a `no_entry` column is not in df, or tick.dat's
             price at an entry is not the training data's open_{FREQ} there (the two files come from different builds).
     """
-    missing = [c for c in no_entry if c not in df.columns]
+    missing = [c for c in (*no_entry, *flat_on) if c not in df.columns]
     if missing:
-        raise ValueError(f"no_entry columns {missing} are not in df")
+        raise ValueError(f"no_entry / flat_on columns {missing} are not in df")
     # Per session: the flat bar (the first at or after flat_at; null after an early close) and the stop row, the
     # first row a trade may not be in (the flat bar, else the row after the session's last bar)
     t = _as_time(flat_at)
@@ -248,8 +276,15 @@ def find_exits(stops, df: pl.DataFrame, flat_at=FLAT_AT, stop=None, freq=FREQ, k
         starts = signal != signal.shift(fill_value=0).over('date')
         next_row = lambda s: pl.when(signal == s).then(pl.col('row')).shift(-1).backward_fill()  # the next row with side s
         change = pl.when(signal == 1).then(next_row(-1)).otherwise(next_row(1)).fill_null(pl.len())
+    if not signal_exit:
+        change = pl.len()  # past the last row: never
     df = df.with_row_index('row').with_columns(_flat=flat_bar).with_columns(
         _stop=pl.col('_flat').fill_null(pl.col('row').max().over('date') + 1), _start=starts, _change=change)
+    if flat_on:
+        # Per signal row: the session's first flat_on bar from its entry bar (the next row) on; null: none
+        flagged = pl.any_horizontal([pl.col(c) == 1 for c in flat_on])
+        df = df.with_columns(_on=pl.when(flagged).then(pl.col('row')).backward_fill().shift(-1).over('date'))
+    no_entry = (*no_entry, *flat_on)
     blocked = pl.any_horizontal([pl.col(c).shift(-1) == 1 for c in no_entry]).fill_null(False) if no_entry else pl.lit(False)
     allowed = pl.col(entry_ok) if entry_ok is not None else pl.lit(True)
     sig = df.filter((signal != 0) & pl.col('_start') & allowed & ~blocked & (pl.col('row') + 1 < pl.col('_stop')))
@@ -271,13 +306,29 @@ def find_exits(stops, df: pl.DataFrame, flat_at=FLAT_AT, stop=None, freq=FREQ, k
         i = np.flatnonzero(entry_px != open_px)[0]
         raise ValueError(f"tick.dat price {entry_px[i]} at row {start[entry_row[i]]} is not open_{freq} {open_px[i]}: "
                          "training data and tick.dat come from different builds")
-
+    # The TP / SL levels are measured from the entry bar's open
     upper = np.where(side == 1, entry_px + tp, entry_px + sl)
     lower = np.where(side == 1, entry_px - sl, entry_px - tp)
+    if entry == 'limit':
+        # Limit entry with order latency, from the 1-min data: the fill price (a better one, or the open), or no trade
+        # (never filled, or a level reached before the fill). Before the fill no level was reached, so the walk below
+        # still starts at the entry bar's first tick
+        fill_px = get_entry_many(entries or default_entries(), start[entry_row], side, tp, sl)
+        filled = fill_px > 0
+        sig = sig.filter(pl.Series(filled))
+        side, tp, sl, entry_row = side[filled], tp[filled], sl[filled], entry_row[filled]
+        upper, lower, entry_px = upper[filled], lower[filled], fill_px[filled]
+    elif entry != 'market':
+        raise ValueError(f"entry must be 'market' or 'limit', not {entry!r}")
 
     # Walk: every open trade checks its current bar; a hit, or the last bar before its end row, closes it. The end
     # row: the session's stop row, or the bar after the signal exit, whichever comes first
     session_stop = sig['_stop'].to_numpy().astype(np.int64)
+    flat = sig['_flat'].fill_null(-1).to_numpy().astype(np.int64)
+    if flat_on:  # a flat_on bar before the flat bar ends the trade there instead, at its first tick
+        on = sig['_on'].fill_null(-1).to_numpy().astype(np.int64)
+        first = (on >= 0) & (on < session_stop)
+        session_stop, flat = np.where(first, on, session_stop), np.where(first, on, flat)
     change = sig['_change'].to_numpy().astype(np.int64)
     until = np.minimum(session_stop, change + 1)
     bar = entry_row.copy()
@@ -295,7 +346,6 @@ def find_exits(stops, df: pl.DataFrame, flat_at=FLAT_AT, stop=None, freq=FREQ, k
     # after an early close the session's last tick (the one before the row where its last bar ends)
     changed = (hit == 0) & (until < session_stop)
     change_px = stops.price(start[np.where(changed, bar + 1, 0)])
-    flat = sig['_flat'].fill_null(-1).to_numpy().astype(np.int64)
     flat_px = stops.price(start[np.maximum(flat, 0)])
     close_px = stops.price(stops.bar_end(freq, start[bar]) - 1)
     time_px = np.where(flat >= 0, flat_px, close_px)
@@ -314,6 +364,7 @@ def find_exits(stops, df: pl.DataFrame, flat_at=FLAT_AT, stop=None, freq=FREQ, k
         **{c: df[c].gather(entry_row) for c in labels},  # the entry bar's labels
         entry_ind=pl.Series(start[entry_row]),
         entry_px=pl.Series(entry_px, dtype=pl.Int64),
+        market_entry=pl.lit(int(entry == 'market'), dtype=pl.Int8),  # add_costs: slippage in a market run only
         exit_row=pl.Series(bar, dtype=pl.UInt32),
         exit_ts=ts.gather(np.where(changed, bar + 1, bar)),
         exit_px=pl.Series(exit_px),
@@ -346,11 +397,14 @@ def add_costs(trades: pl.DataFrame, point_value=POINT_VALUE, commission=COMMISSI
     """
     Step 4: gross and net PnL. Adds `gross_usd` (the gross `pnl` in $), `net_units` and `net_usd`.
 
-    Slippage is `slippage` units on each market fill: the entry, and a stop-loss, signal or time (flat_at) exit. A take-profit
-    is a resting limit order, filled at its level. The TP / SL levels stay measured from the entry's market price.
-    Commission is per side, so twice a trade.
+    Slippage is `slippage` units on each market fill. A market run (`market_entry` 1; 1 when the column is missing)
+    fills its entry and its stop-loss, signal and time (flat_at) exits at market; only the take-profit is a limit. A
+    limit run (entry='limit', `market_entry` 0) uses limit orders throughout, so no slippage: the entry, the
+    take-profit, the stop-loss as a stop-limit at its level, and the signal and time exits at the next bar's open.
+    The TP / SL levels stay measured from the entry bar's open. Commission is per side, so twice a trade.
     """
-    fills = pl.when(pl.col('result') == 1).then(1).otherwise(2)
+    market_entry = pl.col('market_entry') if 'market_entry' in trades.columns else pl.lit(1)
+    fills = market_entry.cast(pl.Int64) * (1 + pl.when(pl.col('result') == 1).then(0).otherwise(1))
     return trades.with_columns(
         gross_usd=pl.col('pnl') * point_value,
         net_units=pl.col('pnl') - slippage * fills,
@@ -360,7 +414,7 @@ def add_costs(trades: pl.DataFrame, point_value=POINT_VALUE, commission=COMMISSI
 
 
 def run_grid(stops, df: pl.DataFrame, stop=STOP, keep=(), search_mode=SEARCH_MODE, every='1mo',
-             no_entry=(), pattern=None, freq=FREQ, entry_ok=None) -> pl.DataFrame:
+             no_entry=(), pattern=None, freq=FREQ, entry_ok=None, entry=ENTRY, flat_on=FLAT_ON) -> pl.DataFrame:
     """
     Step 5: steps 2-4 for every `stops` the stop function gives the same signals (df has `side`), e.g. every TP x SL
     pair of a grid. Returns every stops' trades stacked; each is its own backtest, told apart by `stops`. All share
@@ -371,7 +425,7 @@ def run_grid(stops, df: pl.DataFrame, stop=STOP, keep=(), search_mode=SEARCH_MOD
     for chunk in df.with_columns(_period=pl.col('date').dt.truncate(every)).partition_by('_period', maintain_order=True,
                                                                                          include_key=False):
         trades = find_exits(stops, chunk, stop=stop, keep=keep, search_mode=search_mode, no_entry=no_entry,
-                            pattern=pattern, freq=freq, entry_ok=entry_ok)
+                            pattern=pattern, freq=freq, entry_ok=entry_ok, entry=entry, flat_on=flat_on)
         parts += [add_costs(one_at_a_time(t)).with_columns(pl.col('row', 'exit_row') + offset)
                   for _, t in trades.group_by('stops', maintain_order=True)]
         offset += len(chunk)
@@ -390,7 +444,7 @@ def run_backtest(strategy, stops, start=START, end=END, stop=STOP) -> pl.DataFra
     """
     df = read_training_data(start=start, end=end,
                             columns=list(dict.fromkeys([*strategy.columns, *LABEL_COLS, *LABEL_FEATURES, *NO_ENTRY,
-                                                        VOL_COLUMN])))
+                                                        *FLAT_ON, VOL_COLUMN])))
     missing = [c for c in strategy.columns if c not in df.columns]
     if missing:
         raise ValueError(f"{strategy.name}: {missing} not in the {FREQ}-bar training data: a signal's freq must be "
@@ -403,7 +457,8 @@ def run_backtest(strategy, stops, start=START, end=END, stop=STOP) -> pl.DataFra
     entry_ok = None
     if VOL_BAND is not None:
         df, entry_ok = df.with_columns(_vol_ok=vol_ok(df)), '_vol_ok'
-    return run_grid(stops, df, stop, strategy.keep, no_entry=NO_ENTRY, pattern=pattern, entry_ok=entry_ok).select(
+    return run_grid(stops, df, stop, strategy.keep, no_entry=NO_ENTRY, pattern=pattern, entry_ok=entry_ok,
+                    flat_on=FLAT_ON).select(
         pl.lit(strategy.name).alias('strategy'), *[pl.lit(v).alias(k) for k, v in strategy.params.items()], pl.all())
 
 
